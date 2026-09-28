@@ -24,7 +24,22 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
+
+# The self test prints UTF-8, but PowerShell 5.1 decodes native command output using
+# the system ANSI code page (GBK on this machine), which turns Chinese punctuation into
+# mojibake. Tell it to decode as UTF-8 so the captured text is actually readable.
+# (We no longer *parse* Chinese -- see the SELFTEST_RESULT line below -- but the failure
+# dump printed on a regression is useless if it comes out garbled.)
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+
+# This script lives in tools\, but every path it touches (src\, dist\) is one level
+# up. Resolve the project root rather than assuming the script sits next to them.
+$root = Split-Path -Parent $PSScriptRoot
+if (-not (Test-Path (Join-Path $root 'src'))) {
+    # Fallback: also works if someone runs a copy from the project root.
+    if (Test-Path (Join-Path $PSScriptRoot 'src')) { $root = $PSScriptRoot }
+    else { throw ("project root not found (no src\ under {0} or its parent)" -f $PSScriptRoot) }
+}
 Set-Location $root
 
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
@@ -52,32 +67,40 @@ while ($true) {
     $run++
     $stamp = Get-Date -Format 'HH:mm:ss'
     $output = & $selftest 2>&1 | Out-String
+    $exit = $LASTEXITCODE
 
-    $passed = 0
-    $failed = 0
-
-    # Take the LAST "N <word>, M <word>" pair: the self test prints its summary at the very end,
-    # and earlier lines can contain similar number pairs (which is why a first match reported 0/0).
-    $all = [regex]::Matches($output, '(\d+)\s*\S+\s*[,\uFF0C]\s*(\d+)\s*\S+')
-    $match = if ($all.Count -gt 0) { $all[$all.Count - 1] } else { $null }
-    if ($match -ne $null) {
-        $passed = [int]$match.Groups[1].Value
-        $failed = [int]$match.Groups[2].Value
+    # The exit code is the authority on pass/fail: it is a process-level signal and
+    # cannot be corrupted by console encoding. The parsed numbers are only for display
+    # (and for noticing "the check count dropped", which means assertions were lost).
+    $passed = -1
+    $failed = -1
+    $warned = -1
+    $m = [regex]::Match($output, 'SELFTEST_RESULT pass=(\d+) fail=(\d+) warn=(\d+)')
+    if ($m.Success) {
+        $passed = [int]$m.Groups[1].Value
+        $failed = [int]$m.Groups[2].Value
+        $warned = [int]$m.Groups[3].Value
     }
 
-    if ($match -eq $null) {
-        Write-Host ("[{0}] run {1}: could not parse the summary line -- stopped" -f $stamp, $run) -ForegroundColor Red
-        Write-Host $output
-        exit 2
-    }
-
-    if ($failed -gt 0) {
-        Write-Host ("[{0}] run {1}: {2} passed, {3} FAILED -- stopped" -f $stamp, $run, $passed, $failed) -ForegroundColor Red
+    if ($exit -ne 0) {
+        $label = if ($m.Success) { ("{0} passed, {1} FAILED" -f $passed, $failed) } else { ("exit code {0}" -f $exit) }
+        Write-Host ("[{0}] run {1}: {2} -- stopped" -f $stamp, $run, $label) -ForegroundColor Red
         ($output -split "`r?`n") | Where-Object { $_ -match 'FAIL' } | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
         exit 3
     }
 
-    Write-Host ("[{0}] run {1}: {2} passed, 0 failed" -f $stamp, $run, $passed) -ForegroundColor Green
+    if (-not $m.Success) {
+        # Exit code says OK but there is no machine-readable summary. This script compiles
+        # the exe itself, so the usual cause is that src\Diagnostics\SelfTest.cs no longer
+        # prints SELFTEST_RESULT (source older than this script expects, or the line was
+        # removed). Do not just print "0 passed" and move on -- that hid a real bug once.
+        Write-Host ("[{0}] run {1}: exit 0 but no SELFTEST_RESULT line -- stopped" -f $stamp, $run) -ForegroundColor Red
+        Write-Host "    src\Diagnostics\SelfTest.cs does not print SELFTEST_RESULT; this script cannot read the counts."
+        Write-Host $output
+        exit 2
+    }
+
+    Write-Host ("[{0}] run {1}: {2} passed, 0 failed, {3} hints" -f $stamp, $run, $passed, $warned) -ForegroundColor Green
 
     if ($Probe) {
         try {

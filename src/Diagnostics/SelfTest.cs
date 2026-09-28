@@ -105,6 +105,18 @@ namespace MoTrainer.Diagnostics
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
                 " 结果：{0} 项通过，{1} 项失败，{2} 项提示", _pass, _fail, _warn));
+
+            // 机器可读的 ASCII 汇总行，专供脚本解析。
+            //
+            // 为什么必须有这一行：本程序把标准输出设成 UTF-8，而 PowerShell 5.1 抓取
+            // 子进程输出时按系统 ANSI 代码页（本机 GBK）解码，中文标点会变成乱码 ——
+            // 于是"用正则匹配「149 项通过」"这种写法会失配，转而去匹配日志里的十六进制
+            // 地址串（真实踩过：脚本一直报 0 通过 0 失败）。
+            // 而 .ps1 自身又必须保持纯 ASCII（写了中文会让解析器直接报错），
+            // 所以两侧只能靠纯 ASCII 的标记行对接。**改动本行会同时影响 tools\selfcheck-loop.ps1。**
+            Write(string.Format(CultureInfo.InvariantCulture,
+                "SELFTEST_RESULT pass={0} fail={1} warn={2}", _pass, _fail, _warn));
+
             Write(" 日志：" + Logger.CurrentFile);
             Write("=================================================");
 
