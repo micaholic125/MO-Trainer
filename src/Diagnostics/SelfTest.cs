@@ -101,6 +101,14 @@ namespace MoTrainer.Diagnostics
             CheckLogHeaderDocking();
             CheckLabelClamp();
 
+            // S6 的批量操作是**唯一会一次性改写大量游戏状态**的代码（秒杀会写下上百个对象），
+            // 一旦判据出错就是把自己的部队一起清空。所以这一节的重点不是"能跑通"，
+            // 而是"该拒绝的时候一定拒绝、该跳过的一定跳过"。
+            Section("12. 对象遍历与批量操作（S6 模块）");
+            CheckTechnoWalker();
+            CheckTechnoArrayFinder();
+            CheckTechnoOps();
+
             Write("");
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
@@ -2169,6 +2177,549 @@ namespace MoTrainer.Diagnostics
             catch
             {
                 return false;
+            }
+        }
+
+        // ============================================================ S6 模块
+
+        /// <summary>
+        /// S6 三项批量操作共用的合成场景：三块 RW 内存分别冒充
+        /// "游戏模块映像 / 游戏堆 / 游戏数据段"，于是整套对象遍历与批量操作
+        /// 都能在没有游戏的情况下跑通。
+        ///
+        /// 为什么连"模块区间"都要造假：遍历器唯一的硬判据就是
+        /// "对象头 4 字节必须落在模块区间内"。不造出这个区间，
+        /// **"名单地址找错时能不能识破"**这条最关键的断言就无从验证 ——
+        /// 而那正是"往错误内存反复写值"这类事故的第一道防线。
+        /// </summary>
+        private sealed class TechnoScene : IDisposable
+        {
+            /// <summary>对象内字段偏移，与真机 profile 的取值一致，让测试贴近实际。</summary>
+            public const uint OwnerOffset = 0xF0;
+            public const uint HealthOffset = 0x6C;
+            public const uint ProgressOffset = 0x100;
+
+            /// <summary>
+            /// 假模块区间取 16MB。必须大到能容下一个"4 字节全是可打印字符"的值
+            /// （见 <see cref="AsciiVTable"/>），否则"文本被当成类型表"那条判据永远走不到。
+            /// </summary>
+            public const uint FakeModuleSize = 0x1000000;
+
+            /// <summary>「一大批对象」用的紧凑布局：步长 0x80，字段偏移相应缩小。</summary>
+            public const uint CrowdOwnerOffset = 0x40;
+            public const uint CrowdHealthOffset = 0x6C;
+            public const int CrowdCount = 300;
+
+            public MemoryIO Io;
+            public uint ModuleBase;
+            public uint ModuleSize;
+            public uint Heap;
+            public uint Arrays;
+
+            /// <summary>两个"阵营对象"的地址。真实引擎里同一阵营的所有单位都指向同一处。</summary>
+            public uint MyOwner;
+            public uint EnemyOwner;
+
+            /// <summary>六个正常对象：0/1 属我方，2/3/4 属敌方，5 的阵营字段读不出来。</summary>
+            public uint[] Team = new uint[6];
+
+            /// <summary>类型表只被自己引用的对象 —— 用来验证"孤例类型被当作假对象剔除"。</summary>
+            public uint RareObject;
+
+            public uint CrowdArray;
+            public uint CrowdOwner;
+
+            private readonly List<IntPtr> _blocks = new List<IntPtr>();
+            private IntPtr _handle;
+
+            /// <summary>
+            /// 一个"落在模块区间内、4 字节又全是可打印字符"的值 —— 真机实测抓到过
+            /// `0x00747261` 这种（ASCII 就是 "art"），是普通数据不是类型表。
+            ///
+            /// **必须相对模块基址算，不能写死 0x20202020**：分配到的基址是哪一块
+            /// 取决于哪块内存当时空闲，写死只在基址恰好是 0x20000000 时才成立。
+            /// </summary>
+            public uint AsciiVTable
+            {
+                get { return (ModuleBase & 0xFF000000) | 0x00202020; }
+            }
+
+            public static TechnoScene Create(SelfHandle self)
+            {
+                if (self == null || !self.IsReady) { return null; }
+
+                IntPtr moduleBlock = AllocLowBlock(self.Handle);
+                IntPtr heapBlock = AllocLowBlock(self.Handle);
+                IntPtr arrayBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero || arrayBlock == IntPtr.Zero)
+                {
+                    return null;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock) || !IsLowAddress(arrayBlock))
+                {
+                    return null;
+                }
+
+                TechnoScene scene = new TechnoScene();
+                scene._handle = self.Handle;
+                scene._blocks.Add(moduleBlock);
+                scene._blocks.Add(heapBlock);
+                scene._blocks.Add(arrayBlock);
+                scene.Io = new MemoryIO(self);
+
+                scene.ModuleBase = (uint)moduleBlock.ToInt64();
+                scene.ModuleSize = FakeModuleSize;
+                scene.Heap = (uint)heapBlock.ToInt64();
+                scene.Arrays = (uint)arrayBlock.ToInt64();
+
+                // 阵营对象：只是被比较的"标签值"，不会被解引用，所以随便放一块安全地址即可。
+                scene.MyOwner = scene.Heap + 0xF000;
+                scene.EnemyOwner = scene.Heap + 0xF400;
+                scene.CrowdOwner = scene.Heap + 0xF800;
+
+                uint vtableA = scene.ModuleBase + 0x2000;      // 被 4 个对象共用
+                uint vtableB = scene.ModuleBase + 0x3000;      // 被 2 个对象共用
+                uint vtableRare = scene.ModuleBase + 0x4000;   // 只被 1 个对象引用
+
+                // 对象按 0x200 间隔摆放，留出 +0xF0 / +0x100 这些字段的位置。
+                for (int i = 0; i < 6; i++) { scene.Team[i] = scene.Heap + (uint)(0x200 + i * 0x200); }
+                scene.RareObject = scene.Heap + 0xE00;
+
+                scene.WriteObject(scene.Team[0], vtableA, scene.MyOwner, 100);
+                scene.WriteObject(scene.Team[1], vtableA, scene.MyOwner, 100);
+                scene.WriteObject(scene.Team[2], vtableA, scene.EnemyOwner, 100);
+                scene.WriteObject(scene.Team[3], vtableA, scene.EnemyOwner, 100);
+                scene.WriteObject(scene.Team[4], vtableB, scene.EnemyOwner, 100);
+                scene.WriteObject(scene.Team[5], vtableB, 0, 100);   // 阵营读不出来
+                scene.WriteObject(scene.RareObject, vtableRare, scene.EnemyOwner, 100);
+
+                scene.WriteArray(scene.Arrays, new uint[]
+                {
+                    scene.Team[0], scene.Team[1], scene.Team[2],
+                    scene.Team[3], scene.Team[4], scene.Team[5], scene.RareObject
+                });
+
+                return scene;
+            }
+
+            /// <summary>主名单的地址（就是上面那 7 项）。</summary>
+            public uint ArrayMain { get { return Arrays; } }
+
+            public void WriteObject(uint address, uint vtable, uint owner, uint health)
+            {
+                Io.WriteUInt32(address, vtable);
+                Io.WriteUInt32(address + OwnerOffset, owner);
+                Io.WriteUInt32(address + HealthOffset, health);
+            }
+
+            public void WriteArray(uint address, uint[] entries)
+            {
+                byte[] buffer = new byte[entries.Length * 4];
+                for (int i = 0; i < entries.Length; i++)
+                {
+                    uint value = entries[i];
+                    buffer[i * 4] = (byte)(value & 0xFF);
+                    buffer[i * 4 + 1] = (byte)((value >> 8) & 0xFF);
+                    buffer[i * 4 + 2] = (byte)((value >> 16) & 0xFF);
+                    buffer[i * 4 + 3] = (byte)((value >> 24) & 0xFF);
+                }
+                Io.Write(address, buffer, 0, buffer.Length);
+            }
+
+            /// <summary>读一个字段。读不到返回 0xFFFFFFFF（调用方的断言会因此失败，正是想要的效果）。</summary>
+            public uint ReadField(uint address, uint offset)
+            {
+                uint value;
+                if (!Io.ReadUInt32(address + offset, out value)) { return 0xFFFFFFFF; }
+                return value;
+            }
+
+            /// <summary>把一批对象的血量加起来 —— 用来证明"一个字节都没被写过"。</summary>
+            public uint SumHealth(uint[] addresses)
+            {
+                uint sum = 0;
+                for (int i = 0; i < addresses.Length; i++)
+                {
+                    uint value;
+                    if (Io.ReadUInt32(addresses[i] + HealthOffset, out value)) { sum += value; }
+                }
+                return sum;
+            }
+
+            /// <summary>摆 300 个同阵营对象，用来验证"单拍写入有上限"。</summary>
+            public uint[] PlantCrowd()
+            {
+                uint vtable = ModuleBase + 0x6000;
+                uint[] addresses = new uint[CrowdCount];
+                for (int i = 0; i < CrowdCount; i++)
+                {
+                    addresses[i] = Heap + 0x2000 + (uint)(i * 0x80);
+                    Io.WriteUInt32(addresses[i], vtable);
+                    Io.WriteUInt32(addresses[i] + CrowdOwnerOffset, CrowdOwner);
+                    Io.WriteUInt32(addresses[i] + CrowdHealthOffset, 100);
+                }
+                CrowdArray = Arrays + 0x7000;
+                WriteArray(CrowdArray, addresses);
+                return addresses;
+            }
+
+            public void Dispose()
+            {
+                for (int i = 0; i < _blocks.Count; i++)
+                {
+                    Win32Api.VirtualFreeEx(_handle, _blocks[i], IntPtr.Zero, MEM_RELEASE);
+                }
+                _blocks.Clear();
+            }
+        }
+
+        private static void CheckTechnoWalker()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("对象遍历", false, "OpenProcess 失败"); return; }
+
+            TechnoScene scene = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("对象遍历测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+                TechnoWalkResult walk = TechnoWalker.WalkArray(
+                    io, scene.ArrayMain, 7, scene.ModuleBase, scene.ModuleSize);
+
+                Check("对象遍历：认得出全部真对象，并剔掉孤例类型",
+                    walk.Ok && walk.Scanned == 7 && walk.Count == 6
+                        && walk.RareTypeRemoved == 1 && walk.Skipped == 0,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "扫 {0}｜认 {1}｜跳过 {2}｜孤例剔除 {3}｜重复 {4}",
+                        walk.Scanned, walk.Count, walk.Skipped, walk.RareTypeRemoved, walk.Duplicates));
+
+                List<KeyValuePair<uint, int>> groups =
+                    TechnoWalker.GroupByOwner(io, walk.Objects, TechnoScene.OwnerOffset);
+                Check("对象遍历：按阵营分组，人数最多的排第一（阵营读不出的不计入）",
+                    groups.Count == 2
+                        && groups[0].Key == scene.EnemyOwner && groups[0].Value == 3
+                        && groups[1].Key == scene.MyOwner && groups[1].Value == 2,
+                    string.Format(CultureInfo.InvariantCulture, "{0} 个阵营｜首位 {1} 个",
+                        groups.Count, groups.Count > 0 ? groups[0].Value : 0));
+
+                // ---- 「名单地址找错」——整个 S6 最危险的失败模式 ----
+                // 造一块**可读、但内容不是对象指针**的内存当名单。必须被全部识破：
+                // 只要放过去一个，秒杀就会往那儿写血量。
+                uint decoy = scene.Heap + 0x7000;
+                io.WriteUInt32(decoy, 0x00000001);
+                uint arrayWrong = scene.Arrays + 0x0400;
+                uint[] wrong = new uint[64];
+                for (int i = 0; i < wrong.Length; i++) { wrong[i] = decoy; }
+                scene.WriteArray(arrayWrong, wrong);
+
+                TechnoWalkResult bad = TechnoWalker.WalkArray(
+                    io, arrayWrong, 64, scene.ModuleBase, scene.ModuleSize);
+                Check("对象遍历：名单地址找错时一个都不认（不会拿垃圾当单位）",
+                    bad.Ok && bad.Count == 0 && bad.Skipped == 64,
+                    string.Format(CultureInfo.InvariantCulture, "认 {0}｜跳过 {1}", bad.Count, bad.Skipped));
+
+                // ---- 三条"假类型表"判据，逐条单独触发 ----
+                uint objText = scene.Heap + 0x1000;
+                uint objUnaligned = scene.Heap + 0x1200;
+                uint objLowVtable = scene.Heap + 0x1400;
+                scene.WriteObject(objText, scene.AsciiVTable, scene.EnemyOwner, 100);
+                scene.WriteObject(objUnaligned, scene.ModuleBase + 0x2002, scene.EnemyOwner, 100);
+                scene.WriteObject(objLowVtable, scene.ModuleBase + 0x800, scene.EnemyOwner, 100);
+
+                uint arrayFilter = scene.Arrays + 0x0800;
+                scene.WriteArray(arrayFilter, new uint[] { objText, objUnaligned, objLowVtable });
+                TechnoWalkResult filtered = TechnoWalker.WalkArray(
+                    io, arrayFilter, 3, scene.ModuleBase, scene.ModuleSize);
+                Check("对象遍历：文本 / 未对齐 / 落在模块头部的假类型表全部被剔",
+                    filtered.Ok && filtered.Count == 0 && filtered.Skipped == 3,
+                    string.Format(CultureInfo.InvariantCulture, "认 {0}｜跳过 {1}",
+                        filtered.Count, filtered.Skipped));
+
+                uint arrayDup = scene.Arrays + 0x0900;
+                scene.WriteArray(arrayDup, new uint[] { scene.Team[0], scene.Team[0], scene.Team[1] });
+                TechnoWalkResult dup = TechnoWalker.WalkArray(
+                    io, arrayDup, 3, scene.ModuleBase, scene.ModuleSize);
+                Check("对象遍历：同一对象重复出现只算一次",
+                    dup.Ok && dup.Count == 2 && dup.Duplicates == 1,
+                    string.Format(CultureInfo.InvariantCulture, "认 {0}｜重复 {1}", dup.Count, dup.Duplicates));
+
+                // ---- 拒绝路径：失败必须"说得出原因"，不能静默返回空名单 ----
+                TechnoWalkResult errZero = TechnoWalker.WalkArray(
+                    io, scene.ArrayMain, 0, scene.ModuleBase, scene.ModuleSize);
+                Check("对象遍历：数量为 0 时明确报错（不是静默当成「没有单位」）",
+                    !errZero.Ok && errZero.Error.Length > 0, errZero.Error);
+
+                TechnoWalkResult errModule = TechnoWalker.WalkArray(
+                    io, scene.ArrayMain, 7, scene.ModuleBase, 0);
+                Check("对象遍历：不知道模块区间时拒绝（没有判据就不能认对象）",
+                    !errModule.Ok && errModule.Error.Length > 0, errModule.Error);
+
+                TechnoWalkResult errAddr = TechnoWalker.WalkArray(
+                    io, 0, 7, scene.ModuleBase, scene.ModuleSize);
+                Check("对象遍历：名单地址无效时拒绝",
+                    !errAddr.Ok && errAddr.Error.Length > 0, errAddr.Error);
+
+                TechnoWalkResult huge = TechnoWalker.WalkArray(
+                    io, scene.ArrayMain, 999999, scene.ModuleBase, scene.ModuleSize);
+                Check("对象遍历：数量异常巨大时被截断（不会去读天文数字）",
+                    huge.Scanned == TechnoWalker.MaxObjects,
+                    string.Format(CultureInfo.InvariantCulture, "实际扫 {0}（上限 {1}）",
+                        huge.Scanned, TechnoWalker.MaxObjects));
+            }
+            catch (Exception ex)
+            {
+                Check("对象遍历", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        private static void CheckTechnoArrayFinder()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("自动查找总名单", false, "OpenProcess 失败"); return; }
+
+            TechnoScene scene = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("自动查找总名单测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+
+                // 摆三张名单，看查找器挑哪张：
+                //   选中名单（线索来源，必须被排除）、含选中单位的总名单（应排第一）、
+                //   不含选中单位的名单（应排在后面）
+                uint slotSelected = scene.Arrays + 0x2000;
+                uint arraySelected = scene.Arrays + 0x3000;
+                uint slotTotal = scene.Arrays + 0x2100;
+                uint arrayTotal = scene.Arrays + 0x4000;
+                uint slotDecoy = scene.Arrays + 0x5100;
+                uint arrayDecoy = scene.Arrays + 0x5000;
+
+                io.WriteUInt32(slotSelected, arraySelected);
+                io.WriteUInt32(slotTotal, arrayTotal);
+                io.WriteUInt32(slotDecoy, arrayDecoy);
+
+                scene.WriteArray(arraySelected, new uint[] { scene.Team[0] });
+                scene.WriteArray(arrayTotal, new uint[]
+                {
+                    scene.Team[0], scene.Team[1], scene.Team[2],
+                    scene.Team[3], scene.Team[4], scene.Team[5]
+                });
+                scene.WriteArray(arrayDecoy, new uint[] { scene.Team[1], scene.Team[2], scene.Team[3] });
+
+                List<uint> hints = new List<uint>();
+                hints.Add(scene.Team[0]);
+
+                List<TechnoArrayCandidate> found = TechnoArrayFinder.Find(
+                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints);
+
+                Check("自动查找总名单：含选中单位的那张排第一，有效对象数也对",
+                    found.Count > 0 && found[0].ArrayAddress == arrayTotal
+                        && found[0].HintHits == 1 && found[0].ValidObjects == 6,
+                    found.Count > 0 ? found[0].Describe() : "一个候选都没有");
+
+                bool excludesSelf = true;
+                for (int i = 0; i < found.Count; i++)
+                {
+                    if (found[i].SlotAddress == slotSelected) { excludesSelf = false; }
+                }
+                Check("自动查找总名单：不会把「选中名单自己」当成总名单",
+                    excludesSelf && found.Count >= 2,
+                    string.Format(CultureInfo.InvariantCulture, "{0} 个候选", found.Count));
+            }
+            catch (Exception ex)
+            {
+                Check("自动查找总名单", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        private static void CheckTechnoOps()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("批量操作", false, "OpenProcess 失败"); return; }
+
+            TechnoScene scene = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("批量操作测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+                TechnoWalkResult walk = TechnoWalker.WalkArray(
+                    io, scene.ArrayMain, 7, scene.ModuleBase, scene.ModuleSize);
+                uint healthAll = scene.SumHealth(scene.Team);   // 6 个对象 × 100
+
+                // ================= 秒杀敌人 =================
+                //
+                // 这一组是整个 S6 最重要的断言：**该拒绝时必须拒绝，而且一个字节都不能写**。
+                // 秒杀写的是血量，判据没校准就执行 = 把自己的部队一起清空。
+
+                TechnoOpResult noOwner = TechnoOps.KillEnemies(
+                    io, walk.Objects, 0, TechnoScene.HealthOffset, scene.MyOwner);
+                Check("秒杀：未校准「阵营」偏移时拒绝执行，且一个字节都没写",
+                    !noOwner.Ok && noOwner.Blocked.Length > 0
+                        && scene.SumHealth(scene.Team) == healthAll,
+                    noOwner.Summary);
+
+                TechnoOpResult noHealth = TechnoOps.KillEnemies(
+                    io, walk.Objects, TechnoScene.OwnerOffset, 0, scene.MyOwner);
+                Check("秒杀：未校准「血量」偏移时拒绝执行，且一个字节都没写",
+                    !noHealth.Ok && scene.SumHealth(scene.Team) == healthAll,
+                    noHealth.Summary);
+
+                TechnoOpResult noMine = TechnoOps.KillEnemies(
+                    io, walk.Objects, TechnoScene.OwnerOffset, TechnoScene.HealthOffset, 0);
+                Check("秒杀：认不出自己的阵营时拒绝执行，且一个字节都没写",
+                    !noMine.Ok && scene.SumHealth(scene.Team) == healthAll,
+                    noMine.Summary);
+
+                TechnoOpResult kill = TechnoOps.KillEnemies(
+                    io, walk.Objects, TechnoScene.OwnerOffset, TechnoScene.HealthOffset, scene.MyOwner);
+
+                uint mine = scene.ReadField(scene.Team[0], TechnoScene.HealthOffset)
+                          + scene.ReadField(scene.Team[1], TechnoScene.HealthOffset);
+                uint enemy = scene.ReadField(scene.Team[2], TechnoScene.HealthOffset)
+                           + scene.ReadField(scene.Team[3], TechnoScene.HealthOffset)
+                           + scene.ReadField(scene.Team[4], TechnoScene.HealthOffset);
+                uint unknown = scene.ReadField(scene.Team[5], TechnoScene.HealthOffset);
+
+                Check("秒杀：只清敌方，我方血量一点没动",
+                    kill.Written == 3 && enemy == 0 && mine == 200,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "写入 {0}｜跳过 {1}｜我方剩 {2}｜敌方剩 {3}",
+                        kill.Written, kill.Skipped, mine, enemy));
+
+                Check("秒杀：阵营读不出来的对象按「归属不明」跳过，绝不冒险",
+                    unknown == 100,
+                    string.Format(CultureInfo.InvariantCulture, "剩余血量 {0}", unknown));
+
+                // ================= 瞬间建造 =================
+
+                io.WriteUInt32(scene.Team[0] + TechnoScene.ProgressOffset, 500);
+                io.WriteUInt32(scene.Team[1] + TechnoScene.ProgressOffset, 600);
+                io.WriteUInt32(scene.Team[2] + TechnoScene.ProgressOffset, 700);
+
+                TechnoOpResult noProg = TechnoOps.InstantBuild(
+                    io, walk.Objects, TechnoScene.OwnerOffset, 0, scene.MyOwner);
+                Check("瞬间建造：未校准「生产进度」偏移时拒绝执行",
+                    !noProg.Ok && scene.ReadField(scene.Team[0], TechnoScene.ProgressOffset) == 500,
+                    noProg.Summary);
+
+                TechnoOpResult build = TechnoOps.InstantBuild(
+                    io, walk.Objects, TechnoScene.OwnerOffset, TechnoScene.ProgressOffset, scene.MyOwner);
+                Check("瞬间建造：只清自己的进度，敌方进度一点没动",
+                    build.Written == 2
+                        && scene.ReadField(scene.Team[0], TechnoScene.ProgressOffset) == 0
+                        && scene.ReadField(scene.Team[1], TechnoScene.ProgressOffset) == 0
+                        && scene.ReadField(scene.Team[2], TechnoScene.ProgressOffset) == 700,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "写入 {0}｜跳过 {1}｜敌方进度 {2}",
+                        build.Written, build.Skipped,
+                        scene.ReadField(scene.Team[2], TechnoScene.ProgressOffset)));
+
+                TechnoOpResult again = TechnoOps.InstantBuild(
+                    io, walk.Objects, TechnoScene.OwnerOffset, TechnoScene.ProgressOffset, scene.MyOwner);
+                Check("瞬间建造：进度本来就是 0 的对象不重复写",
+                    again.Written == 0,
+                    string.Format(CultureInfo.InvariantCulture, "第二次写入 {0}", again.Written));
+
+                // ================= 全图视野 =================
+
+                uint shroud = scene.Arrays + 0x1000;
+                uint shroudSize = 0x4000;
+                uint chunk = 0x1000;
+                byte[] fill = new byte[shroudSize];
+                for (int i = 0; i < fill.Length; i++) { fill[i] = 0xFF; }
+                io.Write(shroud, fill, 0, fill.Length);
+
+                uint cursor = 0;
+                TechnoOpResult noShroud = TechnoOps.RevealMap(io, 0, shroudSize, chunk, ref cursor);
+                Check("全图视野：未校准位图地址时拒绝执行，且一个字节都没写",
+                    !noShroud.Ok && scene.ReadField(shroud, 0) == 0xFFFFFFFF, noShroud.Blocked);
+
+                TechnoOpResult noShroudSize = TechnoOps.RevealMap(io, shroud, 0, chunk, ref cursor);
+                Check("全图视野：未校准位图大小时拒绝执行，且一个字节都没写",
+                    !noShroudSize.Ok && scene.ReadField(shroud, 0) == 0xFFFFFFFF, noShroudSize.Blocked);
+
+                cursor = 0;
+                TechnoOps.RevealMap(io, shroud, shroudSize, chunk, ref cursor);
+                Check("全图视野：一次只写一片（不会一口气写几 MB 把游戏卡住）",
+                    cursor == chunk
+                        && scene.ReadField(shroud, 0x800) == 0
+                        && scene.ReadField(shroud, 0x1800) == 0xFFFFFFFF,
+                    string.Format(CultureInfo.InvariantCulture, "写完一片后游标 0x{0:X}", cursor));
+
+                TechnoOps.RevealMap(io, shroud, shroudSize, chunk, ref cursor);
+                TechnoOps.RevealMap(io, shroud, shroudSize, chunk, ref cursor);
+                TechnoOps.RevealMap(io, shroud, shroudSize, chunk, ref cursor);
+                Check("全图视野：铺满一轮后游标归零（下一拍从头再铺）",
+                    cursor == 0,
+                    string.Format(CultureInfo.InvariantCulture, "游标 0x{0:X}", cursor));
+
+                bool allZero = true;
+                for (uint offset = 0; offset < shroudSize; offset += 4)
+                {
+                    if (scene.ReadField(shroud, offset) != 0) { allZero = false; break; }
+                }
+                Check("全图视野：整块位图确实被清成 0", allZero,
+                    string.Format(CultureInfo.InvariantCulture, "{0} 字节", shroudSize));
+
+                // ================= 可信度判定（所有写操作的最后一道闸）=================
+
+                string reasonOk;
+                Check("可信度判定：正常名单放行",
+                    TechnoOps.IsTrustworthy(walk, out reasonOk), "6 个对象");
+
+                uint arrayTiny = scene.Arrays + 0x6000;
+                scene.WriteArray(arrayTiny, new uint[] { scene.Team[0], scene.Team[1], scene.Team[2] });
+                TechnoWalkResult tiny = TechnoWalker.WalkArray(
+                    io, arrayTiny, 3, scene.ModuleBase, scene.ModuleSize);
+                string reasonTiny;
+                Check("可信度判定：只数出 3 个对象时判定为不可信，并说明原因",
+                    !TechnoOps.IsTrustworthy(tiny, out reasonTiny) && reasonTiny.Length > 0, reasonTiny);
+
+                string reasonBroken;
+                TechnoWalkResult broken = TechnoWalker.WalkArray(
+                    io, scene.ArrayMain, 0, scene.ModuleBase, scene.ModuleSize);
+                Check("可信度判定：遍历本身报错时不可信，并原样带出错误原因",
+                    !TechnoOps.IsTrustworthy(broken, out reasonBroken) && reasonBroken.Length > 0,
+                    reasonBroken);
+
+                // ================= 单拍写入上限 =================
+
+                scene.PlantCrowd();
+                TechnoWalkResult crowd = TechnoWalker.WalkArray(
+                    io, scene.CrowdArray, TechnoScene.CrowdCount, scene.ModuleBase, scene.ModuleSize);
+                TechnoOpResult capped = TechnoOps.KillEnemies(
+                    io, crowd.Objects, TechnoScene.CrowdOwnerOffset, TechnoScene.CrowdHealthOffset,
+                    scene.MyOwner);
+                Check("秒杀：单拍写入数量有上限（不会一口气写穿，把游戏卡住）",
+                    crowd.Count == TechnoScene.CrowdCount
+                        && capped.Written == TechnoOps.MaxWritesPerTick,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "名单 {0} 个｜本拍写入 {1}（上限 {2}）",
+                        crowd.Count, capped.Written, TechnoOps.MaxWritesPerTick));
+            }
+            catch (Exception ex)
+            {
+                Check("批量操作", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
             }
         }
 
