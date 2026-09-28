@@ -2408,17 +2408,26 @@ namespace MoTrainer.Diagnostics
                 // 造一块**可读、但内容不是对象指针**的内存当名单。必须被全部识破：
                 // 只要放过去一个，秒杀就会往那儿写血量。
                 uint decoy = scene.Heap + 0x7000;
-                io.WriteUInt32(decoy, 0x00000001);
+                // 两种假值交替出现，各自堵住一条路 —— 真机里"找错的名单"里本来就是一堆杂值：
+                //   ① 落在模块**起点之前**的（对齐、非文本、非 0，只能靠"落在模块区间内"拦下）
+                //   ② 落在模块**末尾之后**的（同上，专门覆盖区间的上边界）
+                // 这两条是逐个改坏验证过的：删掉区间检查，下面这条断言立刻转红。
+                // （早先只放了 ①，而且取的值还更小，被"跳过模块头部"那条先拦下了 ——
+                //   结果是删掉区间检查也照样全绿，等于没测。）
+                io.WriteUInt32(decoy, 0x00004000);
+                io.WriteUInt32(decoy + 4, scene.ModuleBase + scene.ModuleSize + 0x1000);
                 uint arrayWrong = scene.Arrays + 0x0400;
                 uint[] wrong = new uint[64];
-                for (int i = 0; i < wrong.Length; i++) { wrong[i] = decoy; }
+                for (int i = 0; i < wrong.Length; i++) { wrong[i] = decoy + (uint)((i % 2) * 4); }
                 scene.WriteArray(arrayWrong, wrong);
 
                 TechnoWalkResult bad = TechnoWalker.WalkArray(
                     io, arrayWrong, 64, scene.ModuleBase, scene.ModuleSize);
                 Check("对象遍历：名单地址找错时一个都不认（不会拿垃圾当单位）",
                     bad.Ok && bad.Count == 0 && bad.Skipped == 64,
-                    string.Format(CultureInfo.InvariantCulture, "认 {0}｜跳过 {1}", bad.Count, bad.Skipped));
+                    string.Format(CultureInfo.InvariantCulture,
+                        "扫 {0}｜认 {1}｜跳过 {2}｜孤例剔除 {3}｜重复 {4}",
+                        bad.Scanned, bad.Count, bad.Skipped, bad.RareTypeRemoved, bad.Duplicates));
 
                 // ---- 三条"假类型表"判据，逐条单独触发 ----
                 uint objText = scene.Heap + 0x1000;
@@ -2434,8 +2443,9 @@ namespace MoTrainer.Diagnostics
                     io, arrayFilter, 3, scene.ModuleBase, scene.ModuleSize);
                 Check("对象遍历：文本 / 未对齐 / 落在模块头部的假类型表全部被剔",
                     filtered.Ok && filtered.Count == 0 && filtered.Skipped == 3,
-                    string.Format(CultureInfo.InvariantCulture, "认 {0}｜跳过 {1}",
-                        filtered.Count, filtered.Skipped));
+                    string.Format(CultureInfo.InvariantCulture,
+                        "扫 {0}｜认 {1}｜跳过 {2}｜孤例剔除 {3}",
+                        filtered.Scanned, filtered.Count, filtered.Skipped, filtered.RareTypeRemoved));
 
                 uint arrayDup = scene.Arrays + 0x0900;
                 scene.WriteArray(arrayDup, new uint[] { scene.Team[0], scene.Team[0], scene.Team[1] });
