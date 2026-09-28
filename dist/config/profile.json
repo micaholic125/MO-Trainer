@@ -1,0 +1,259 @@
+﻿{
+  "version": 1,
+  "gameVersion": "",
+  "engineExe": "gamemd.exe",
+  "exeCrc32": "",
+  "moduleBase": "0x00400000",
+  "moduleSize": "0x00793000",
+  "createdAt": "2026-09-21 11:02:04",
+  "updatedAt": "2026-09-27 17:41:02",
+  "notes": "powerOutput 由 2026-09-21 11:57 真机报告回填（金钱链 + 相对偏移 0x5098 推导）",
+  "locators": {
+    "money": {
+      "chain": [
+        "0x683D4C",
+        "0x30C"
+      ],
+      "chains": [
+        [
+          "0x683D4C",
+          "0x30C"
+        ],
+        [
+          "0x4B4244",
+          "0x14C",
+          "0x30C"
+        ],
+        [
+          "0x4B424C",
+          "0x1A4",
+          "0x30C"
+        ],
+        [
+          "0x4B4264",
+          "0x14C",
+          "0x30C"
+        ],
+        [
+          "0x4B426C",
+          "0x148",
+          "0x30C"
+        ],
+        [
+          "0x68022C",
+          "0x0",
+          "0x30C"
+        ],
+        [
+          "0x680314",
+          "0x14C",
+          "0x30C"
+        ],
+        [
+          "0x68031C",
+          "0x1A4",
+          "0x30C"
+        ]
+      ],
+      "chainCount": 8,
+      "depth": 1,
+      "fingerprint": "测试值 61845 已验证（消费检验通过）",
+      "note": "静态根 0x00A83D4C，1 层，共保留 8 条候选链（原找到 32 条）",
+      "valueWidth": 4,
+      "valueScale": 1,
+      "hasStaticAddress": false,
+      "staticAddress": "",
+      "calibrated": true
+    },
+    "powerOutput": {
+      "chain": [
+        "0x683D4C",
+        "0x53A4"
+      ],
+      "chains": [
+        [
+          "0x683D4C",
+          "0x53A4"
+        ],
+        [
+          "0x4B4244",
+          "0x14C",
+          "0x53A4"
+        ],
+        [
+          "0x4B424C",
+          "0x1A4",
+          "0x53A4"
+        ],
+        [
+          "0x4B4264",
+          "0x14C",
+          "0x53A4"
+        ],
+        [
+          "0x4B426C",
+          "0x148",
+          "0x53A4"
+        ],
+        [
+          "0x68022C",
+          "0x0",
+          "0x53A4"
+        ],
+        [
+          "0x680314",
+          "0x14C",
+          "0x53A4"
+        ],
+        [
+          "0x68031C",
+          "0x1A4",
+          "0x53A4"
+        ]
+      ],
+      "chainCount": 8,
+      "depth": 1,
+      "fingerprint": "读数核对值 460（4 字节）",
+      "note": "全内存精确值匹配定位（4 字节）。与金钱同属一个对象、相距 0x5098 字节；直接回溯 0 命中（对象内偏移超出回溯上限 0x400），改由金钱链加该相对偏移推导，共 8 条候选链",
+      "valueWidth": 4,
+      "valueScale": 1,
+      "hasStaticAddress": false,
+      "staticAddress": "",
+      "calibrated": true
+    },
+    "powerDrain": {
+      "chain": [
+        "0x683D4C",
+        "0x53A8"
+      ],
+      "chains": [
+        [
+          "0x683D4C",
+          "0x53A8"
+        ],
+        [
+          "0x4B4244",
+          "0x14C",
+          "0x53A8"
+        ],
+        [
+          "0x4B424C",
+          "0x1B4",
+          "0x53A8"
+        ],
+        [
+          "0x4B4264",
+          "0x14C",
+          "0x53A8"
+        ],
+        [
+          "0x4B426C",
+          "0x148",
+          "0x53A8"
+        ],
+        [
+          "0x4B476C",
+          "0x21C",
+          "0x53A8"
+        ],
+        [
+          "0x4B476C",
+          "0x14C",
+          "0x53A8"
+        ],
+        [
+          "0x4B4798",
+          "0x21C",
+          "0x53A8"
+        ]
+      ],
+      "chainCount": 8,
+      "depth": 1,
+      "fingerprint": "读数核对值 200（4 字节）",
+      "note": "全内存精确值匹配定位（4 字节）。与金钱同属一个对象、相距 0x509C 字节；直接回溯 0 命中（对象内偏移超出回溯上限 0x400），改由金钱链加该相对偏移推导，共 8 条候选链",
+      "valueWidth": 4,
+      "valueScale": 1,
+      "hasStaticAddress": false,
+      "staticAddress": "",
+      "calibrated": true
+    },
+    "selectedCount": {
+      "chain": [],
+      "chains": [],
+      "chainCount": 0,
+      "depth": 0,
+      "fingerprint": "",
+      "note": "由「单位校准」页定位。数量字段的数值等于当前选中的单位个数。（目标 0x00A8ECC8 位于游戏模块内，判定为全局变量：直接用「模块基址 + 偏移 0x68ECC8」定位，跨会话恒定，无需指针链）",
+      "valueWidth": 4,
+      "valueScale": 1,
+      "hasStaticAddress": true,
+      "staticAddress": "0x68ECC8",
+      "calibrated": true
+    },
+    "selectedList": {
+      "chain": [],
+      "chains": [],
+      "chainCount": 0,
+      "depth": 0,
+      "fingerprint": "",
+      "note": "由「单位校准」页定位。该位置存放的是「选中对象指针数组」的起始地址；引擎会按上面「选中数量」读到的个数，从数组里依次取出对象指针。（目标 0x00A8ECA4 位于游戏模块内，判定为全局变量：直接用「模块基址 + 偏移 0x68ECA4」定位，跨会话恒定，无需指针链）",
+      "valueWidth": 4,
+      "valueScale": 1,
+      "hasStaticAddress": true,
+      "staticAddress": "0x68ECA4",
+      "calibrated": true
+    },
+    "technoArray": {
+      "chain": [],
+      "chains": [],
+      "chainCount": 0,
+      "depth": 0,
+      "fingerprint": "",
+      "note": "",
+      "valueWidth": 4,
+      "valueScale": 1,
+      "hasStaticAddress": true,
+      "staticAddress": "0x37A4E8",
+      "calibrated": true
+    },
+    "technoArrayCount": {
+      "chain": [],
+      "chains": [],
+      "chainCount": 0,
+      "depth": 0,
+      "fingerprint": "",
+      "note": "",
+      "valueWidth": 4,
+      "valueScale": 1,
+      "hasStaticAddress": false,
+      "staticAddress": "",
+      "calibrated": false
+    },
+    "mapShroud": {
+      "chain": [],
+      "chains": [],
+      "chainCount": 0,
+      "depth": 0,
+      "fingerprint": "",
+      "note": "",
+      "valueWidth": 4,
+      "valueScale": 1,
+      "hasStaticAddress": false,
+      "staticAddress": "",
+      "calibrated": false
+    }
+  },
+  "fieldOffsets": {
+    "technoOwner": "0x000000F0",
+    "technoHealth": "0x0000006C",
+    "technoIronCurtain": "0x00000000",
+    "productionTimer": "0x00000000",
+    "technoMaxHealth": "0x0000007D"
+  },
+  "map": {
+    "shroudSize": "0x00000000"
+  },
+  "preferences": {
+    "defaultMoney": 100000
+  }
+}

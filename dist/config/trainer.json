@@ -1,0 +1,17 @@
+﻿{
+  "version": 1,
+  "features": {
+    "money": {
+      "enabled": false,
+      "value": "0x186A0"
+    },
+    "powerOutput": {
+      "enabled": false,
+      "value": "0x7530"
+    },
+    "selectedInvincible": {
+      "enabled": true,
+      "value": "0x0"
+    }
+  }
+}
