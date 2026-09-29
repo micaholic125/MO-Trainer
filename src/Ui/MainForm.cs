@@ -669,6 +669,8 @@ namespace MoTrainer.Ui
             // 必须挂上：这一页的按钮可用状态取决于"游戏是否已连接"，而附加是异步完成的。
             // 漏掉它会让整页按钮在首次打开时全是灰的（真机踩过）。
             _unitPage.TickRefresh();
+            // 高级功能页同理：漏掉它会让那一页的按钮在"先开修改器、后开游戏"时永远是灰的。
+            _advancedPage.TickRefresh();
         }
 
         /// <summary>校准完成：刷新状态条，并把新的定位信息接到功能项上。</summary>

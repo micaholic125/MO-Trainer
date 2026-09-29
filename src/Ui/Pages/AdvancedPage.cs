@@ -38,6 +38,10 @@ namespace MoTrainer.Ui.Pages
         private readonly Button _scanButton;
         private readonly Button _findButton;
         private readonly Button _shroudButton;
+        private readonly Button _harvestButton;
+        private readonly Label _harvestStatus;
+        private readonly Timer _harvestTimer;
+        private HarvestSession _harvest;
         private readonly TextBox _output;
 
         public AdvancedPage(ICalibrationTarget target, CalibrationProfile profile, ProfileStore store)
@@ -71,7 +75,7 @@ namespace MoTrainer.Ui.Pages
             sub.AutoSize = false;
             sub.Font = Theme.Body;
             sub.ForeColor = Theme.Text2;
-            sub.Text = "秒杀敌人 / 瞬间建造 / 全图视野 —— 当前阶段只提供「对象扫描」用于校准验证，不会写入任何内存。";
+            sub.Text = "秒杀敌人 / 瞬间建造 / 全图视野 —— 当前阶段本页只读不写；下方「一键采集」是把后续要用的数据一次收齐的校准辅助工具。";
             sub.Location = new Point(24, 56);
             sub.Size = new Size(760, 22);
             Controls.Add(sub);
@@ -115,6 +119,34 @@ namespace MoTrainer.Ui.Pages
             hint.Size = new Size(760, 20);
             Controls.Add(hint);
 
+            // ---- 一键采集 ----
+            //
+            // 存在的意义：本项目的瓶颈是"每要一个数据就得让用户开一局游戏"。
+            // 有了它，用户只操作一次（开局 → 点开始 → 随便玩几分钟 → 点停止），
+            // 期间程序自己按秒采样，把后面几轮要用的数据一次收齐。
+            //
+            // 它是**校准辅助**，不属于面向玩家的产品功能；S8 交付前应连同本页的其它
+            // 调试按钮一起评估去留（见 docs/04 的 S8）。
+            _harvestButton = UiFactory.MakePrimaryButton("开始采集（3 分钟）", 180);
+            _harvestButton.Location = new Point(24, 156);
+            _harvestButton.Click += OnHarvestClick;
+            Controls.Add(_harvestButton);
+
+            _harvestStatus = new Label();
+            _harvestStatus.AutoSize = false;
+            _harvestStatus.Font = Theme.Small;
+            _harvestStatus.ForeColor = Theme.Text2;
+            _harvestStatus.Text = "采集期间你只需要在游戏里正常玩：选几个单位、造点东西、让单位挨点打。程序自己记录。";
+            _harvestStatus.Location = new Point(216, 162);
+            _harvestStatus.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            _harvestStatus.Size = new Size(560, 20);
+            Controls.Add(_harvestStatus);
+
+            // 每秒刷新一次状态文字。用界面线程的 Timer，避免后台线程碰控件。
+            _harvestTimer = new Timer();
+            _harvestTimer.Interval = 1000;
+            _harvestTimer.Tick += OnHarvestTick;
+
             _output = new TextBox();
             _output.Multiline = true;
             _output.ReadOnly = true;
@@ -124,22 +156,128 @@ namespace MoTrainer.Ui.Pages
             _output.ForeColor = Theme.Text0;
             _output.Font = Theme.Mono;
             _output.BorderStyle = BorderStyle.FixedSingle;
-            _output.Location = new Point(24, 158);
+            _output.Location = new Point(24, 190);
             _output.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
             Controls.Add(_output);
 
             SizeChanged += delegate { LayoutOutput(); };
             LayoutOutput();
             RefreshUi();
+            UpdateHarvestUi();
+
+            // 离线提示只在构造时给一次。放进 RefreshUi 会让它每秒重写输出框，
+            // 把用户正在看的内容冲掉。
+            if (_target == null || !_target.IsReady)
+            {
+                SetOutput("游戏未连接。请先启动游戏并让修改器附加成功，再点扫描。");
+            }
+        }
+
+        /// <summary>页面被销毁时收尾：采集线程仍在跑的话，先把报告落盘再退出，别让用户白等一场。</summary>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (_harvestTimer != null)
+                {
+                    try { _harvestTimer.Stop(); } catch { }
+                    try { _harvestTimer.Dispose(); } catch { }
+                }
+                if (_harvest != null)
+                {
+                    try { _harvest.Stop(); } catch { }
+                    try { _harvest.Dispose(); } catch { }
+                    _harvest = null;
+                }
+            }
+            base.Dispose(disposing);
         }
 
         private void LayoutOutput()
         {
             int width = ClientSize.Width - 48;
-            int height = ClientSize.Height - 182;
+            int height = ClientSize.Height - 214;
             if (width < 200) { width = 200; }
             if (height < 120) { height = 120; }
             _output.Size = new Size(width, height);
+        }
+
+        // ============================================================ 一键采集
+
+        private void OnHarvestClick(object sender, EventArgs e)
+        {
+            if (_harvest != null && _harvest.IsRunning)
+            {
+                string path = _harvest.Stop();
+                _harvestTimer.Stop();
+                SetOutput(BuildHarvestDoneText(path));
+                UpdateHarvestUi();
+                return;
+            }
+
+            HarvestSession session = new HarvestSession(_target, _profile, _store);
+            string refusal = session.Start(180, 1000);
+            if (refusal.Length > 0)
+            {
+                // 缺什么就说什么，绝不"按钮能点、程序悄悄什么都不做"
+                session.Dispose();
+                SetOutput(refusal);
+                return;
+            }
+
+            _harvest = session;
+            _harvestTimer.Start();
+            SetOutput("采集已开始。\n\n"
+                + "现在可以切回游戏，正常玩 3 分钟：\n"
+                + "  1. 选中几个自己的单位（最好包含一座发电厂或兵营）\n"
+                + "  2. 造点东西，让金钱发生变化\n"
+                + "  3. 让某个单位挨点打\n"
+                + "  4. 想取消选中就取消，程序会继续跟踪它\n\n"
+                + "3 分钟到会自动结束；想提前结束就再点一次这个按钮。");
+            UpdateHarvestUi();
+        }
+
+        private void OnHarvestTick(object sender, EventArgs e)
+        {
+            if (_harvest == null) { _harvestTimer.Stop(); return; }
+
+            if (!_harvest.IsRunning)
+            {
+                // 到时间自动结束（或采样线程意外退出）：把报告落盘，一次都不落下
+                _harvestTimer.Stop();
+                string path = _harvest.Stop();
+                SetOutput(BuildHarvestDoneText(path));
+            }
+            UpdateHarvestUi();
+        }
+
+        private void UpdateHarvestUi()
+        {
+            bool running = _harvest != null && _harvest.IsRunning;
+            _harvestButton.Text = running ? "停止并保存报告" : "开始采集（3 分钟）";
+
+            if (running)
+            {
+                _harvestStatus.Text = string.Format(CultureInfo.InvariantCulture,
+                    "采集中… {0:0} / {1} 秒｜已采 {2} 次｜跟踪 {3} 个对象（现在可以切回游戏了）",
+                    _harvest.ElapsedSeconds, _harvest.PlannedSeconds,
+                    _harvest.SampleCount, _harvest.TrackedCount);
+            }
+            else if (_harvest != null && _harvest.ReportPath.Length > 0)
+            {
+                _harvestStatus.Text = "采集完成，报告已保存。";
+            }
+        }
+
+        private static string BuildHarvestDoneText(string path)
+        {
+            if (path.Length == 0)
+            {
+                return "采集已结束，但报告写入失败。请查看日志（点主窗口日志区的「导出日志」）了解原因。";
+            }
+            return "采集完成，报告已保存到：\n" + path + "\n\n"
+                 + "把这个文件发给我即可。报告里已经包含了时间线、房子数值、\n"
+                 + "全场对象名单，以及你选中过的每个对象的完整字节变化。";
         }
 
         private void RefreshUi()
@@ -147,10 +285,21 @@ namespace MoTrainer.Ui.Pages
             bool ready = _target != null && _target.IsReady;
             _scanButton.Enabled = ready;
             _findButton.Enabled = ready;
-            if (!ready)
-            {
-                SetOutput("游戏未连接。请先启动游戏并让修改器附加成功，再点扫描。");
-            }
+            _harvestButton.Enabled = ready;
+            _shroudButton.Enabled = ready;
+        }
+
+        /// <summary>
+        /// 由主窗口每秒调用一次：按"游戏是否已连接"刷新按钮可用状态。
+        ///
+        /// **必须挂上。** 附加是异步完成的，如果只在构造时判定一次，
+        /// 而用户先开修改器、后开游戏（很常见的顺序），这一页的按钮就会**永远是灰的**。
+        /// `UnitPage` 真机踩过同一个坑（见 `MainForm` 里那句注释），本页当时漏了。
+        /// </summary>
+        public void TickRefresh()
+        {
+            RefreshUi();
+            UpdateHarvestUi();
         }
 
         /// <summary>

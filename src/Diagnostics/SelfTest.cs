@@ -109,6 +109,13 @@ namespace MoTrainer.Diagnostics
             CheckTechnoArrayFinder();
             CheckTechnoOps();
 
+            // 这一条格外重要：采集要靠**用户开一局游戏**才能跑，
+            // 而用户的时间是本项目最稀缺的东西。采集本身若有 bug，
+            // 用户白开一局、白等三分钟，还会以为"数据本来就是这样"。
+            // 所以必须在没有游戏的情况下先证明它整条链路都通。
+            Section("13. 一键采集（校准辅助）");
+            CheckHarvestSession();
+
             Write("");
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
@@ -2729,6 +2736,183 @@ namespace MoTrainer.Diagnostics
             finally
             {
                 if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        // ============================================================ 采集（S6/S4 校准辅助）
+
+        /// <summary>
+        /// 「一键采集」的端到端自检：在合成内存上完整跑一遍
+        /// **启动 → 拒绝路径 → 采样 → 改字段 → 发现变化 → 出报告**。
+        ///
+        /// 为什么要端到端而不是只测单个函数：采集的价值全在"用户只操作一次"，
+        /// 中间的定时、线程、报告落盘任何一环断了，用户的这一次操作就白费。
+        /// 只测"某个方法返回对不对"是发现不了这种断裂的。
+        /// </summary>
+        private static void CheckHarvestSession()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("一键采集", false, "OpenProcess 失败"); return; }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            string reportPath = "";
+            HarvestSession session = null;
+            uint savedBase = SelectionProbe.ModuleBaseHint;
+            uint savedSize = SelectionProbe.ModuleSizeHint;
+
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("一键采集测试内存块", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("一键采集", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = 0x1000000;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                const uint OwnerOffset = 0xF0;
+                const uint HealthOffset = 0x6C;
+                uint vtable = moduleBase + 0x2000;
+                uint owner = heap + 0xF000;
+
+                // 三个同类型对象（同类型表 —— 遍历器的"孤例类型剔除"要求它们至少两个共用一张表）
+                uint[] objects = new uint[3];
+                for (int i = 0; i < 3; i++)
+                {
+                    objects[i] = heap + 0x2000 + (uint)(i * 0x100);
+                    io.WriteUInt32(objects[i], vtable);
+                    io.WriteUInt32(objects[i] + OwnerOffset, owner);
+                    io.WriteUInt32(objects[i] + HealthOffset, 100);
+                }
+
+                // 全对象名单：格子 → 数组
+                uint rosterSlot = heap + 0x5000;
+                uint rosterArray = heap + 0x4000;
+                io.WriteUInt32(rosterSlot, rosterArray);
+                for (int i = 0; i < 3; i++) { io.WriteUInt32(rosterArray + (uint)(i * 4), objects[i]); }
+
+                // 选中名单：数量字段 + 紧邻的数组指针槽（真机的 DynamicVectorClass 就是这个样子）
+                uint countAddress = heap + 0x1040;
+                uint selectedArray = heap + 0x1080;
+                io.WriteUInt32(countAddress, 3);
+                io.WriteUInt32(countAddress + 8, selectedArray);
+                for (int i = 0; i < 3; i++) { io.WriteUInt32(selectedArray + (uint)(i * 4), objects[i]); }
+
+                // 让选中探测走**真机路径**（带"对象头必须是模块内类型表"那条硬校验）
+                SelectionProbe.ModuleBaseHint = moduleBase;
+                SelectionProbe.ModuleSizeHint = moduleSize;
+
+                CalibrationProfile profile = new CalibrationProfile();
+                profile.ModuleBase = moduleBase;
+                profile.ModuleSize = moduleSize;
+                profile.TechnoArray.SetStaticAddress(rosterSlot - moduleBase);
+                profile.SelectedCount.SetStaticAddress(countAddress - moduleBase);
+                profile.OffsetTechnoOwner = OwnerOffset;
+                profile.OffsetTechnoHealth = HealthOffset;
+
+                List<MemoryRegion> regions = new List<MemoryRegion>();
+                regions.Add(MakeRegion(moduleBase, TestBlockSize));
+                regions.Add(MakeRegion(heap, TestBlockSize));
+                SyntheticTarget target = new SyntheticTarget(io, moduleBase, moduleSize, regions, regions);
+
+                // 报告落到 dist\reports\（与非自检运行时同一处），跑完删掉
+                ProfileStore store = new ProfileStore(AppDomain.CurrentDomain.BaseDirectory);
+
+                // ---- 拒绝路径：缺什么必须说什么，且不能有线程被启动 ----
+                HarvestSession noTarget = new HarvestSession(null, profile, store);
+                string refusalTarget = noTarget.Start(10, 500);
+                Check("一键采集：游戏未连接时拒绝启动（不会静默失败）",
+                    refusalTarget.Length > 0 && !noTarget.IsRunning, refusalTarget);
+                noTarget.Dispose();
+
+                CalibrationProfile bare = new CalibrationProfile();
+                HarvestSession noCalib = new HarvestSession(target, bare, store);
+                string refusalCalib = noCalib.Start(10, 500);
+                Check("一键采集：缺「全对象名单」校准时拒绝启动，并说明缺哪一项",
+                    refusalCalib.Length > 0
+                        && refusalCalib.IndexOf("全对象名单", StringComparison.Ordinal) >= 0
+                        && !noCalib.IsRunning,
+                    refusalCalib.Length > 0
+                        ? refusalCalib
+                        : "启动没有被拒绝（本该返回一句说明，而且不该把线程拉起来）");
+                noCalib.Dispose();
+
+                // ---- 正常路径：端到端跑一遍 ----
+                session = new HarvestSession(target, profile, store);
+                string started = session.Start(60, 200);
+                Check("一键采集：校准齐全时能启动", started.Length == 0,
+                    started.Length > 0 ? started : "已启动");
+
+                int n0 = session.SampleCount;
+                WaitUntil(delegate { return session.SampleCount > n0; }, 3000);
+
+                // 让被跟踪对象的血量变一次 —— 采集的核心价值就是抓到这种变化
+                io.WriteUInt32(objects[0] + HealthOffset, 87);
+                int n1 = session.SampleCount;
+                WaitUntil(delegate { return session.SampleCount > n1; }, 3000);
+
+                io.WriteUInt32(objects[0] + HealthOffset, 100);
+                int n2 = session.SampleCount;
+                WaitUntil(delegate { return session.SampleCount > n2; }, 3000);
+
+                int taken = session.SampleCount;
+                int tracked = session.TrackedCount;
+                reportPath = session.Stop();
+
+                Check("一键采集：采样按时钟持续推进", taken >= 3, taken + " 次");
+                Check("一键采集：把选中的对象收进了跟踪集合", tracked == 3, tracked + " 个");
+                Check("一键采集：报告落盘且非空",
+                    reportPath.Length > 0 && File.Exists(reportPath)
+                        && new FileInfo(reportPath).Length > 0,
+                    reportPath);
+
+                string text = (reportPath.Length > 0 && File.Exists(reportPath))
+                    ? File.ReadAllText(reportPath, Encoding.UTF8) : "";
+
+                Check("一键采集：报告含时间线、跟踪段、全对象名单三段",
+                    text.IndexOf("一、时间线", StringComparison.Ordinal) >= 0
+                        && text.IndexOf("二、被跟踪对象", StringComparison.Ordinal) >= 0
+                        && text.IndexOf("三、全对象名单", StringComparison.Ordinal) >= 0,
+                    text.Length + " 字符");
+
+                // 核心断言：血量 100 → 87 这次改动必须被记下来。
+                // 用完整的一对值来匹配，避免"恰好命中文档里的偏移对照表"这种假通过。
+                Check("一键采集：抓到了血量字段的变化（100 → 87）",
+                    text.IndexOf("0x00000064 → 0x00000057", StringComparison.Ordinal) >= 0,
+                    text.IndexOf("0x00000064 → 0x00000057", StringComparison.Ordinal) >= 0
+                        ? "已记录" : "报告里找不到这次变化");
+
+                Check("一键采集：报告里能看出那 3 个对象属于同一个阵营",
+                    text.IndexOf("0x" + owner.ToString("X8"), StringComparison.Ordinal) >= 0,
+                    "阵营 0x" + owner.ToString("X8"));
+            }
+            catch (Exception ex)
+            {
+                Check("一键采集", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (session != null) { try { session.Dispose(); } catch { } }
+                SelectionProbe.ModuleBaseHint = savedBase;
+                SelectionProbe.ModuleSizeHint = savedSize;
+                if (reportPath.Length > 0 && File.Exists(reportPath))
+                {
+                    try { File.Delete(reportPath); } catch (Exception) { }
+                }
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
                 self.Dispose();
             }
         }
