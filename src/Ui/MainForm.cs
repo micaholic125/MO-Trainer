@@ -667,6 +667,13 @@ namespace MoTrainer.Ui
             _statusStrip.UpdateStatus(
                 stateText, Theme.StateColor(state), baseText, calibrationText, "模式 单人");
 
+            // 选中探测的"对象头必须是模块内类型表"这条硬校验，依赖的是静态字段。
+            // 页面是在**修改器启动时**构造的，那一刻游戏往往还没连上（基址为 0）——
+            // 于是这条校验会被静默跳过，而且整个会话都不会再恢复。
+            // 真机实测的后果：探测出的"选中对象"里混进了 8 个模块内的代码地址
+            //（类型表读出来是 0x8BF18B56 这种机器指令）。所以每轮都灌一次真值。
+            SelectionProbe.SetModuleRange(_attach.ModuleBase, _attach.ModuleSize);
+
             _homePage.TickRefresh();
             _featuresPage.TickRefresh();
             // 必须挂上：这一页的按钮可用状态取决于"游戏是否已连接"，而附加是异步完成的。

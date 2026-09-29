@@ -52,12 +52,14 @@ namespace MoTrainer.Ui.Pages
             _moduleBase = target == null ? 0 : target.ModuleBase;
             _moduleSize = target == null ? 0 : target.ModuleSize;
 
-            // 把模块区间交给「单位校准」的探测逻辑（静态字段）。
-            // 让它多一条硬判定：名单里每一项的头 4 字节必须是模块内的类型标记 ——
-            // 这条能把"游戏对象的方法表冒充名单"当场拒掉（真机踩过）。
-            // 放在这里是因为本页在启动时就会构造，值对全程有效。
-            SelectionProbe.ModuleBaseHint = _moduleBase;
-            SelectionProbe.ModuleSizeHint = _moduleSize;
+            // 把模块区间交给「单位校准」的探测逻辑，让它多一条硬判定：
+            // 名单里每一项的头 4 字节必须是模块内的类型标记 —— 这条能把
+            // "游戏对象的方法表冒充名单""模块里的代码地址冒充对象"当场拒掉（都真机踩过）。
+            //
+            // 但**这里只是初值**：本页在修改器启动时构造，那一刻游戏往往还没连上（基址为 0）。
+            // 真正保证它一直有效的是 `MainForm.TickRefresh` 每轮重灌一次，
+            // 以及各调用点（`HarvestSession` / `UnitPage`）在探测前自带一份。
+            SelectionProbe.SetModuleRange(_moduleBase, _moduleSize);
 
             BackColor = Theme.Bg0;
             AutoScroll = true;

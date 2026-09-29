@@ -99,6 +99,13 @@ namespace MoTrainer.Calibration
         private readonly ManualResetEvent _stop = new ManualResetEvent(false);
 
         private List<HarvestObjectRow> _lastRoster = new List<HarvestObjectRow>();
+        private uint _rosterSlot;
+        private uint _rosterArray;
+        private uint _rosterFirstArray;
+        private uint _rosterLastArray;
+        private int _rosterArrayMoves;
+        private int _rosterReadable = -1;
+        private bool _rosterTruncated;
         private Thread _thread;
         private DateTime _startedAt;
         private int _intervalMs = 1000;
@@ -168,6 +175,13 @@ namespace MoTrainer.Calibration
                 _tracked.Clear();
                 _byAddress.Clear();
                 _lastRoster = new List<HarvestObjectRow>();
+                _rosterSlot = 0;
+                _rosterArray = 0;
+                _rosterFirstArray = 0;
+                _rosterLastArray = 0;
+                _rosterArrayMoves = 0;
+                _rosterReadable = -1;
+                _rosterTruncated = false;
                 _reportPath = "";
             }
 
@@ -313,9 +327,16 @@ namespace MoTrainer.Calibration
                 memory, arrayAddress, ProbeObjectCount, moduleBase, moduleSize);
             if (!walk.Ok)
             {
-                sample.Note = "遍历失败：" + walk.Error;
+                // 失败提示里必须带上**两个地址**：只有"遍历失败"四个字，
+                // 事后完全分不清是"格子里的值不是数组"还是"数组读不动"。
+                // （第一版报告就漏了这一点，导致只能靠推测排查。）
+                sample.Note = string.Format(CultureInfo.InvariantCulture,
+                    "遍历失败：{0}（格子 0x{1:X8} → 数组 0x{2:X8}）",
+                    walk.Error, slotAddress, arrayAddress);
                 return rows;
             }
+
+            RecordRosterAddresses(slotAddress, arrayAddress, walk);
 
             sample.ObjectCount = walk.Count;
             sample.WalkSkipped = walk.Skipped;
@@ -332,6 +353,24 @@ namespace MoTrainer.Calibration
             return rows;
         }
 
+        /// <summary>
+        /// 记录对象名单的解析结果。**这几个数字是排查"名单读不出来"的唯一线索**，
+        /// 所以每轮都更新，并在报告头部如实列出来。
+        /// </summary>
+        private void RecordRosterAddresses(uint slot, uint array, TechnoWalkResult walk)
+        {
+            _rosterSlot = slot;
+            _rosterArray = array;
+            _rosterReadable = walk.ReadableEntries;
+            _rosterTruncated = walk.Truncated;
+
+            if (array != 0 && array != _rosterFirstArray)
+            {
+                if (_rosterFirstArray == 0) { _rosterFirstArray = array; }
+                else { _rosterArrayMoves++; _rosterLastArray = array; }
+            }
+        }
+
         private void ReadSelection(MemoryIO memory, uint moduleBase, HarvestSample sample)
         {
             if (!_profile.SelectedCount.IsCalibrated) { return; }
@@ -343,6 +382,11 @@ namespace MoTrainer.Calibration
             uint count;
             if (!memory.ReadUInt32(countAddress, out count)) { return; }
             if (count == 0 || count > SelectionProbe.MaxCount) { return; }
+
+            // 自带一份模块区间：不依赖界面有没有刷过。
+            // 缺了它，探测里"对象头必须是模块内类型表"这条硬校验会被跳过，
+            // 结果就是把模块里的代码地址当成选中对象收进跟踪集合（真机踩过）。
+            SelectionProbe.SetModuleRange(moduleBase, _target.ModuleSize);
 
             SelectionProbeResult probe = SelectionProbe.ProbeWithEscalation(memory, countAddress, (int)count);
             if (probe == null || !probe.Found) { return; }
@@ -487,6 +531,26 @@ namespace MoTrainer.Calibration
                 "字段偏移：阵营 +0x{0:X}｜血量 +0x{1:X}｜最大血量 +0x{2:X}｜铁幕 +0x{3:X}｜生产进度 +0x{4:X}",
                 _profile.OffsetTechnoOwner, _profile.OffsetTechnoHealth, _profile.TechnoMaxHealth,
                 _profile.OffsetTechnoIronCurtain, _profile.OffsetProductionTimer));
+
+            // 对象名单的解析结果。**这几个数字是排查"名单读不出来"的唯一线索** ——
+            // 第一版报告没记，导致只能靠推测，所以这里固定列出来。
+            if (_rosterArray != 0)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "对象名单：格子 0x{0:X8} → 数组 0x{1:X8}｜可读 {2} 项（请求 4096 项）{3}",
+                    _rosterSlot, _rosterArray, _rosterReadable,
+                    _rosterTruncated ? "  ← 数组尾部读不动，只读到这么多" : ""));
+                if (_rosterArrayMoves > 0)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  ⚠ 采集期间数组地址变过 {0} 次（首 0x{1:X8} → 末 0x{2:X8}）：这是正常的，游戏会重新分配它",
+                        _rosterArrayMoves, _rosterFirstArray, _rosterLastArray));
+                }
+            }
+            else
+            {
+                text.AppendLine("对象名单：**整个采集期间一次都没解析成功**（详见下方时间线里的「！」行）");
+            }
 
             // ---- 一、时间线 ----
             text.AppendLine();

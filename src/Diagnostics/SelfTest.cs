@@ -106,6 +106,7 @@ namespace MoTrainer.Diagnostics
             // 而是"该拒绝的时候一定拒绝、该跳过的一定跳过"。
             Section("12. 对象遍历与批量操作（S6 模块）");
             CheckTechnoWalker();
+            CheckTechnoWalkerPartialRead();
             CheckTechnoArrayFinder();
             CheckTechnoOps();
 
@@ -1810,6 +1811,8 @@ namespace MoTrainer.Diagnostics
             }
 
             IntPtr block = IntPtr.Zero;
+            uint savedHintBase = SelectionProbe.ModuleBaseHint;
+            uint savedHintSize = SelectionProbe.ModuleSizeHint;
             try
             {
                 block = AllocLowBlock(self.Handle);
@@ -1831,11 +1834,22 @@ namespace MoTrainer.Diagnostics
                 uint arrayAddress = blockAddress + 0x8000;
                 uint countAddress = blockAddress + 0x1040;
 
+                // 声明一块"假模块映像"并**真的把模块区间灌进去**。
+                //
+                // 早先这里没设模块区间，于是"对象头必须落在模块区间内"那条硬校验被跳过 ——
+                // 测试是靠"校验没跑"通过的，等于没测到它。而且留下一个地雷：
+                // 只要别的测试先设过模块区间，这一节就会莫名其妙地挂。
+                // 现在对象头写成模块区间内的地址，校验真的跑起来。
+                uint fakeModuleBase = blockAddress + 0x8000;
+                uint fakeModuleSize = 0x4000;
+                SelectionProbe.SetModuleRange(fakeModuleBase, fakeModuleSize);
+
                 uint[] objects = new uint[count];
                 for (int i = 0; i < count; i++)
                 {
                     objects[i] = blockAddress + 0x2000 + (uint)(i * 0x100);
-                    io.WriteUInt32(objects[i], (uint)(0x1111 + i));      // 让对象"可读"
+                    // 对象头 = 模块区间内的"类型表地址"，这样它才算个真对象
+                    io.WriteUInt32(objects[i], fakeModuleBase + 0x1000 + (uint)(i * 4));
                     io.WriteUInt32(arrayAddress + (uint)(i * 4), objects[i]);
                 }
                 io.WriteUInt32(countAddress, count);
@@ -1862,6 +1876,43 @@ namespace MoTrainer.Diagnostics
                     !SelectionProbe.Probe(io, countAddress, 0, 0x40).Found, "ok");
                 Check("选中列表探测：数量越界时拒绝",
                     !SelectionProbe.Probe(io, countAddress, 9999, 0x40).Found, "ok");
+
+                // ---- 真机事故回归（2026-09-29 用户采集）----
+                //
+                // 那次采集的"选中对象"里有 8 个是**模块内的代码地址**：
+                // 它们的头 4 字节读出来是 0x8BF18B56 这类值，拆开是 MOV/PUSH EBX/PUSH ESI
+                // 这些机器指令 —— 那是代码，不是对象。
+                // 根因是"模块区间"提示字段留了 0，第 ④ 条硬校验被**静默跳过**。
+
+                // ① 头不在模块区间内的"对象"，必须被拒
+                uint codeArray = blockAddress + 0x4000;
+                uint codeCount = blockAddress + 0x5000;
+                uint[] codeHeads = new uint[count];
+                for (int i = 0; i < count; i++)
+                {
+                    codeHeads[i] = blockAddress + 0x2400 + (uint)(i * 0x100);
+                    io.WriteUInt32(codeHeads[i], 0x8BF18B56u + (uint)i);   // 像机器指令的"类型表"
+                    io.WriteUInt32(codeArray + (uint)(i * 4), codeHeads[i]);
+                }
+                io.WriteUInt32(codeCount, count);
+                io.WriteUInt32(codeCount + 8, codeArray);
+
+                SelectionProbeResult junk = SelectionProbe.Probe(io, codeCount, count, 0x40);
+                Check("选中列表探测：头不在模块区间内的「代码地址」被拒（真机混进来过 8 个）",
+                    !junk.Found, junk.Found ? "误报为选中列表！" : junk.Error);
+
+                // ② 不知道模块区间时必须拒绝探测，而不是悄悄跳过校验
+                SelectionProbe.SetModuleRange(0, 0);
+                SelectionProbeResult blocked = SelectionProbe.ProbeWithEscalation(io, countAddress, count);
+                Check("选中列表探测：不知道模块区间时拒绝探测（不静默跳过安全检查）",
+                    !blocked.Found && blocked.Error.Length > 0, blocked.Error);
+
+                // ③ 反过来：模块区间给对了，同一批对象必须能被认出来
+                SelectionProbe.SetModuleRange(fakeModuleBase, fakeModuleSize);
+                SelectionProbeResult ok = SelectionProbe.ProbeWithEscalation(io, countAddress, count);
+                Check("选中列表探测：模块区间正确时正常认出（拒绝不是把好数据也挡了）",
+                    ok.Found && ok.ObjectAddresses.Count == count,
+                    ok.Found ? "共 " + ok.ObjectAddresses.Count + " 个" : ok.Error);
             }
             catch (Exception ex)
             {
@@ -1869,6 +1920,8 @@ namespace MoTrainer.Diagnostics
             }
             finally
             {
+                // 本节改了全局提示字段，收工时恢复原值，免得影响后面的检查
+                SelectionProbe.SetModuleRange(savedHintBase, savedHintSize);
                 if (block != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, block, IntPtr.Zero, MEM_RELEASE); }
                 self.Dispose();
             }
@@ -2499,6 +2552,88 @@ namespace MoTrainer.Diagnostics
             finally
             {
                 if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// 数组**尾部读不动**时，必须读出前面能读的部分，而不是整块失败。
+        ///
+        /// 这条来自一次真机失败（2026-09-29 用户采集）：遍历器一次性读 16384 字节，
+        /// 整块读取失败 → "场上对象"全程为 0；而同一份配置在前一次会话明明读出了 4094 个对象。
+        /// 根因是 `ReadProcessMemory` 要求整段可读，而数组的"容量"不等于"实际分配了那么长"。
+        /// </summary>
+        private static void CheckTechnoWalkerPartialRead()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("对象遍历（部分可读）", false, "OpenProcess 失败"); return; }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr tailBlock = IntPtr.Zero;
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                tailBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || tailBlock == IntPtr.Zero)
+                {
+                    Check("对象遍历（部分可读）测试内存块", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(tailBlock))
+                {
+                    WarnItem("对象遍历（部分可读）", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = 0x1000000;
+                uint tail = (uint)tailBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                uint blockEnd = tail + (uint)TestBlockSize;
+
+                // **先确认这条断言的前提成立**：紧接块尾之后确实读不动。
+                // 万一那块内存恰好可读，下面的断言就测不到想测的东西 ——
+                // 那时如实降级为提示，而不是假装通过。
+                if (io.ReadBytesQuiet(blockEnd, 4) != null)
+                {
+                    WarnItem("对象遍历（部分可读）", "块尾之后的内存恰好可读，这条断言测不了，跳过");
+                    return;
+                }
+
+                // 数组紧贴块尾摆放：只有最后 0x100 字节落在块内，再往后就是未分配区域。
+                // 这是"容量写的是 4096，实际只分配了几百字节"那种情形的缩小版。
+                uint arrayAddress = blockEnd - 0x100;
+
+                uint vtable = moduleBase + 0x2000;   // 类型表：必须落在模块区间内
+                for (int i = 0; i < 4; i++)
+                {
+                    uint objectAddress = tail + 0x100 + (uint)(i * 0x100);
+                    io.WriteUInt32(objectAddress, vtable);          // 对象头 = 类型表
+                    io.WriteUInt32(arrayAddress + (uint)(i * 4), objectAddress);
+                }
+                // 数组其余部分保持为 0（新提交的页本来就是 0），会被遍历器当作空槽跳过
+
+                // 请求 256 项（1024 字节），实际只有 64 项落在块内
+                TechnoWalkResult walk = TechnoWalker.WalkArray(
+                    io, arrayAddress, 256, moduleBase, moduleSize);
+
+                Check("对象遍历：数组尾部读不动时，仍能读出前面有效的部分（不再整块失败）",
+                    walk.Ok && walk.Truncated && walk.Scanned == 64 && walk.Count == 4,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "扫 {0}｜认 {1}｜可读 {2} 项｜截断 {3}{4}",
+                        walk.Scanned, walk.Count, walk.ReadableEntries,
+                        walk.Truncated ? "是" : "否",
+                        walk.Ok ? "" : "｜" + walk.Error));
+            }
+            catch (Exception ex)
+            {
+                Check("对象遍历（部分可读）", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (tailBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, tailBlock, IntPtr.Zero, MEM_RELEASE); }
                 self.Dispose();
             }
         }

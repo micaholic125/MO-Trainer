@@ -31,6 +31,15 @@ namespace MoTrainer.Cheats
         /// <summary>因为"类型标记只被极少数对象引用"而被剔除的数量（这些多为假对象）。</summary>
         public int RareTypeRemoved;
 
+        /// <summary>
+        /// 数组实际能读到的项数。可能小于请求数 —— 数组的"容量"不等于"实际分配了那么长"，
+        /// 尾部可能落在未分配区域。真机踩过：请求 4096 项整块读取失败、场上对象全程为 0。
+        /// </summary>
+        public int ReadableEntries = -1;
+
+        /// <summary>是否因为数组尾部读不动而只读到一部分（true 时 <see cref="ReadableEntries"/> 就是实际长度）。</summary>
+        public bool Truncated;
+
         public string Error = "";
 
         public bool Ok { get { return Error.Length == 0; } }
@@ -76,19 +85,24 @@ namespace MoTrainer.Cheats
             if (count == 0) { result.Error = "对象数量为 0（游戏未开局？）"; return result; }
             if (count > MaxObjects) { count = MaxObjects; }
 
-            // 一次批量读整个指针数组：逐项 ReadUInt32 会产生几千次系统调用，
+            // 批量读整个指针数组：逐项 ReadUInt32 会产生几千次系统调用，
             // 放进 33ms 的锁定循环里会把帧率拖垮。读失败也要**明确报错**而不是返回空结果，
             // 否则界面上看起来就像"游戏里没有单位"。
             int bytes = (int)count * 4;
-            byte[] block = memory.ReadBytesQuiet(arrayAddress, bytes);
-            if (block == null || block.Length < bytes)
+            int usableBytes;
+            byte[] block = ReadArrayBlock(memory, arrayAddress, bytes, out usableBytes);
+            if (block == null || usableBytes < 4)
             {
-                result.Error = string.Format("读取对象数组失败（{0} 项 / {1} 字节）", count, bytes);
+                result.Error = string.Format("读取对象数组失败（请求 {0} 项 / {1} 字节，一项都读不到）", count, bytes);
                 return result;
             }
 
+            int usableCount = usableBytes / 4;
+            result.ReadableEntries = usableCount;
+            result.Truncated = usableCount < (int)count;
+
             HashSet<uint> seen = new HashSet<uint>();
-            for (int i = 0; i < (int)count; i++)
+            for (int i = 0; i < usableCount; i++)
             {
                 uint address = ReadUInt32(block, i * 4);
                 result.Scanned++;
@@ -124,6 +138,56 @@ namespace MoTrainer.Cheats
             result.Objects.AddRange(kept);
 
             return result;
+        }
+
+        /// <summary>
+        /// 把对象数组读进来。**必须能容忍"只读到一部分"。**
+        ///
+        /// 真机实测（2026-09-29 用户采集）：一次性读 16384 字节**整块失败**，
+        /// 导致"场上对象"全程为 0 —— 而同一份配置在 09-27 明明读出了 4094 个对象。
+        /// 原因是 `ReadProcessMemory` 要求**整段**都可读：只要有一段落在未分配区域，
+        /// 整块读取就整体失败。而数组的"容量 4096"不等于"实际分配了 4096 项那么长"。
+        ///
+        /// 同一个坑在 `TechnoArrayFinder.ReadWindow` 里已经踩过一次
+        ///（那句注释写得很清楚："必须分块读……分块之后读不动的块跳过即可，不会牵连其它块"），
+        /// 但遍历器这边当时没跟着改。**同一类错误不要在第三个地方再犯。**
+        /// </summary>
+        private static byte[] ReadArrayBlock(MemoryIO memory, uint arrayAddress, int bytes, out int usableBytes)
+        {
+            usableBytes = 0;
+
+            // 快路：绝大多数情况下一次就读完，省掉十几次系统调用
+            byte[] whole = memory.ReadBytesQuiet(arrayAddress, bytes);
+            if (whole != null && whole.Length == bytes)
+            {
+                usableBytes = bytes;
+                return whole;
+            }
+
+            // 慢路：分块读。遇到第一块读不动就停 —— 数组的实际长度到此为止。
+            //
+            // 块大小取 0x100（64 项）是权衡的结果，**不能取大**：
+            // 块只要跨出数组尾部一点点，这**一整块**就作废。而数组实际可能只分配了几百字节
+            // （容量字段写 4096 不代表真分配了那么多）—— 块取 0x400 时，第一块就整个读不动，
+            // 分块读取等于白做（这条是写自检时用 0x400 实测出来的）。
+            // 代价是 16KB 要读 64 次；一次采样的成本可忽略，锁定线程里也只是几十微秒。
+            const int ChunkBytes = 0x100;
+            byte[] block = new byte[bytes];
+            int got = 0;
+            while (got < bytes)
+            {
+                int len = bytes - got;
+                if (len > ChunkBytes) { len = ChunkBytes; }
+
+                byte[] part = memory.ReadBytesQuiet(arrayAddress + (uint)got, len);
+                if (part == null || part.Length < len) { break; }
+
+                Buffer.BlockCopy(part, 0, block, got, len);
+                got += len;
+            }
+
+            usableBytes = got;
+            return got > 0 ? block : null;
         }
 
         /// <summary>

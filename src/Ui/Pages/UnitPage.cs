@@ -725,6 +725,12 @@ namespace MoTrainer.Ui.Pages
             }
 
             int count = (int)live;
+
+            // 探测前必须灌一次模块区间：缺了它，"对象头必须是模块内类型表"这条硬校验会被跳过，
+            // 结果就是把模块里的代码地址当成选中对象（真机踩过，混进来 8 个）。
+            // 不依赖主窗口有没有刷过，这里自带一份。
+            SelectionProbe.SetModuleRange(_target.ModuleBase, _target.ModuleSize);
+
             SelectionProbeResult probe = SelectionProbe.ProbeWithEscalation(_target.Memory, _countAddress, count);
             _probe = probe;
 

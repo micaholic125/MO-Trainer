@@ -54,11 +54,28 @@ namespace MoTrainer.Calibration
         public const int MaxCount = 64;
 
         /// <summary>
-        /// 游戏主模块区间。由界面在探测前设置；为 0 表示未知，此时跳过第 ④ 条判定。
+        /// 游戏主模块区间。由界面在探测前设置；为 0 表示未知。
         /// 用静态字段而不是改方法签名，是为了不动既有调用点（含自检里的合成内存场景）。
         /// </summary>
         public static uint ModuleBaseHint;
         public static uint ModuleSizeHint;
+
+        /// <summary>
+        /// 设置游戏模块区间。**每次探测之前都必须调用。**
+        ///
+        /// 为什么不能"构造时设一次就行"：这两个值曾经只在页面构造时灌一次，
+        /// 而页面是在**修改器启动时**构造的 —— 用户先开修改器、后开游戏的话，
+        /// 那一刻基址还是 0，于是第 ④ 条硬校验被**静默跳过**，而且整个会话都不会再恢复。
+        ///
+        /// 真机实测到的后果（2026-09-29 用户采集）：探测出来的"选中对象"里混进了 8 个
+        /// **模块内的代码地址** —— 它们的"类型表"读出来是 `0x8BF18B56` 这种值，
+        /// 拆开看是 `MOV`/`PUSH EBX`/`PUSH ESI` 这类机器指令。那是代码，不是对象。
+        /// </summary>
+        public static void SetModuleRange(uint moduleBase, uint moduleSize)
+        {
+            ModuleBaseHint = moduleBase;
+            ModuleSizeHint = moduleSize;
+        }
 
         /// <summary>
         /// 第 ④ 条判定：这一串指针指向的对象，头 4 字节（类型标记）是否都在模块区间内。
@@ -84,6 +101,21 @@ namespace MoTrainer.Calibration
         /// <summary>用依次放大的半径尝试探测，返回第一个成功的结果。</summary>
         public static SelectionProbeResult ProbeWithEscalation(MemoryIO memory, uint countAddress, int count)
         {
+            // **不知道模块区间就拒绝，不要静默跳过第 ④ 条校验。**
+            //
+            // 这条校验是"探测到的到底是不是真对象"的唯一硬判据。跳过它不会报错，
+            // 只会让结果里混进垃圾 —— 而垃圾看起来完全像成功（真机就是这样混进 8 个的）。
+            // 按项目规则：缺必要条件时功能必须拒绝执行并说明缺什么。
+            if (ModuleSizeHint == 0)
+            {
+                SelectionProbeResult blocked = new SelectionProbeResult();
+                blocked.CountAddress = countAddress;
+                blocked.Count = count;
+                blocked.Error = "未提供游戏模块区间，无法确认「选中的是不是真对象」，已拒绝探测"
+                              + "（内部错误：调用方必须先执行 SelectionProbe.SetModuleRange）";
+                return blocked;
+            }
+
             SelectionProbeResult last = null;
             for (int i = 0; i < Radii.Length; i++)
             {
