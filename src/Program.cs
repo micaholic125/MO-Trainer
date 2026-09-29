@@ -14,7 +14,10 @@ namespace MoTrainer
         {
             string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
             Logger.Init(baseDirectory);
+            // 构建时间放在启动第一行：排查时最怕的就是"对着旧程序争论新代码"，
+            // 先把这个数字钉在日志里，之后任何一行的现象都能对上版本
             Logger.Info("Program", "MO Trainer 启动，运行目录 " + baseDirectory);
+            Logger.Info("Program", "构建时间 " + BuildInfo.Text);
 
             AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
             Application.ThreadException += OnThreadException;

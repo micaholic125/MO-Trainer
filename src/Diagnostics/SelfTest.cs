@@ -152,12 +152,19 @@ namespace MoTrainer.Diagnostics
             Write("  进程位数   : " + (Environment.Is64BitProcess ? "x64" : "x86"));
             Write("  进程权限   : " + (elevated ? "管理员" : "普通用户"));
             Write("  运行目录   : " + AppDomain.CurrentDomain.BaseDirectory);
+            Write("  构建时间   : " + BuildInfo.Text);
 
             if (!elevated)
             {
                 WarnItem("当前不是管理员权限",
                     "若游戏以管理员启动，本节第 6 部分的附加检查会因权限不足而跳过；请用管理员身份运行本自检");
             }
+
+            // 构建标识要能读出来，否则"确认手里这份是不是最新"就无从谈起
+            string build = BuildInfo.Text;
+            Check("构建标识可读（能确认手里这份是不是最新编译的）",
+                build.Length > 0 && build.IndexOf("未知", StringComparison.Ordinal) < 0,
+                build);
 
             bool is64 = Environment.Is64BitProcess;
             if (is64)
