@@ -268,8 +268,13 @@ namespace MoTrainer.Ui.Controls
             if (feature.LastError.Length != 0)
             {
                 _status.ForeColor = Theme.Danger;
+                // 有些错误自带"该怎么做"的指引（例如秒杀敌人的"请先在游戏里选中一个自己的单位"）；
+                // 只有"地址层面的故障"才补上"重新校准 / 重启"这句通用建议 ——
+                // 否则两条指引打架，玩家会被引到错误的处置上去。
+                bool selfExplained = feature.LastError.IndexOf("请") >= 0;
                 _status.Text = "已开启，但" + feature.LastError
-                    + (feature.LastError == "未连接游戏" ? "" : "（请重新校准或重启游戏）");
+                    + (feature.LastError == "未连接游戏" || selfExplained
+                        ? "" : "（请重新校准或重启游戏）");
                 return;
             }
 
