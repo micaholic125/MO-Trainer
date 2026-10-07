@@ -983,8 +983,17 @@ namespace MoTrainer.Ui.Pages
             }
             text.AppendLine();
 
+            int rejectedCode;
             List<TechnoArrayCandidate> found = TechnoArrayFinder.Find(
-                memory, moduleBase, moduleSize, slotAddress, hints);
+                memory, moduleBase, moduleSize, slotAddress, hints, out rejectedCode);
+
+            if (rejectedCode > 0)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "（按 2026-10-07 加固规则，另有 {0} 个位置因落在可执行页/只读区被排除——指针格必须位于可写数据段）",
+                    rejectedCode));
+                text.AppendLine();
+            }
 
             if (found.Count == 0)
             {
@@ -1049,10 +1058,26 @@ namespace MoTrainer.Ui.Pages
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "已选定：名单 0x{0:X8}，数量字段 0x{1:X8}（数量 {2}）",
                 best.ArrayAddress, best.CountAddress, best.Count));
+
+            MemoryRegion slotRegion = memory.Describe(best.SlotAddress);
+            if (slotRegion != null)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "指针格 0x{0:X8} 所在内存：{1}", best.SlotAddress, slotRegion.ToString()));
+            }
+
             text.AppendLine(saved
                 ? "已保存到配置 —— 以后不用再找。"
                 : "保存失败：" + saveError);
             text.AppendLine();
+
+            if (saved)
+            {
+                text.AppendLine("**注意（2026-10-07 起的新规矩）**：这次只算「本局可用」，还不算「已固化」。");
+                text.AppendLine("该定位必须在**下一次开游戏**仍能读出，才算校准成功——下次开局请留意名单是否照常读出。");
+                text.AppendLine();
+            }
+
             text.AppendLine("下一步：点「扫描全对象数组」。若阵营分布显示为「少数几个阵营、各自聚集大量单位」，就说明找对了。");
             return text.ToString();
         }

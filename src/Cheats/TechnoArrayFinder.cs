@@ -44,6 +44,15 @@ namespace MoTrainer.Cheats
     /// 依据是这类容器在引擎里是同一批全局变量，通常挨着放在同一个数据块里 ——
     /// 既省掉了全内存扫描（几秒的卡顿），也大幅降低了误报概率。
     /// 而且每个候选都要过两道硬校验：数组里存的是不是真实对象、以及**含不含你选中的那个单位**。
+    ///
+    /// 【2026-10-07 加固】候选"指针格"还必须落在**可写、不可执行**的内存里。
+    /// 真机两次实测（09-27 与 10-07）：代码段里某些 4 字节窗口的**字节值恰好等于当场的数组地址**
+    /// （如 10-07 那次 `C7 44 24 6C …` 指令的一部分读出 `0x2C6C2444`，正是当天的数组地址）——
+    /// 这类"代码字节"能通过全部旧校验、还会因对象数最多排第一，于是"找到的指针格"其实是代码：
+    /// **当天能用、换一局失效**。真正的指针格是游戏会持续更新的全局变量，必然位于可写数据段；
+    /// 排除可执行页即从根上杜绝此类误认。
+    /// 附带修掉一个隐患：旧实现先按数组地址去重、后做判断 —— 代码里的"假格子"若先被扫到，
+    /// 会**占住该数组的去重名额**、把后面真正的指针格挤掉。本次把位置检查放在去重之前。
     /// </summary>
     public static class TechnoArrayFinder
     {
@@ -71,10 +80,13 @@ namespace MoTrainer.Cheats
         /// 查找总名单。
         /// `nearAddress` 是已知的选中名单容器地址（那个"指针格"）；
         /// `hints` 是当前选中单位的地址（可以为空，但为空时无法确认找对了）。
+        /// `rejectedByCode` 返回"因落在可执行页 / 只读区而被排除的格子数"（2026-10-07 加固，供日志留证）。
         /// </summary>
         public static List<TechnoArrayCandidate> Find(
-            MemoryIO memory, uint moduleBase, uint moduleSize, uint nearAddress, IList<uint> hints)
+            MemoryIO memory, uint moduleBase, uint moduleSize, uint nearAddress, IList<uint> hints,
+            out int rejectedByCode)
         {
+            rejectedByCode = 0;
             List<TechnoArrayCandidate> found = new List<TechnoArrayCandidate>();
             if (memory == null || moduleSize == 0 || nearAddress < 0x10000) { return found; }
 
@@ -83,6 +95,10 @@ namespace MoTrainer.Cheats
 
             uint[] slots = ReadWindow(memory, start, end);
             if (slots == null) { return found; }
+
+            // 窗口内的区域表取一份（一次枚举、几百个区域），后面每个格子做二分查找。
+            // **不能每个格子一次 VirtualQueryEx** —— 窗口里上百万个格子，那样等于上百万次系统调用。
+            List<MemoryRegion> regions = memory.EnumRegions(start, end, true, false, 0);
 
             HashSet<uint> seenArrays = new HashSet<uint>();
             for (int i = 0; i < slots.Length; i++)
@@ -99,6 +115,11 @@ namespace MoTrainer.Cheats
                 // 不排除的话这个候选永远排第一，于是每次"找到的总名单"其实是选中名单本身。
                 // 真机实测踩到过：保存下来的"总名单"和选中名单是同一个地址。
                 if (slotAddress == nearAddress) { continue; }
+
+                // 2026-10-07 加固：格子必须住在可写、不可执行的内存里（详见类注释）。
+                // **必须放在"按数组去重"之前** —— 否则代码里的假格子会占住去重名额、挤掉真格子。
+                if (!IsUsableSlotAddress(regions, slotAddress)) { rejectedByCode++; continue; }
+
                 if (!seenArrays.Add(arrayAddress)) { continue; }
 
                 TechnoArrayCandidate candidate = Inspect(memory, slotAddress, arrayAddress, moduleBase, moduleSize, hints);
@@ -115,6 +136,33 @@ namespace MoTrainer.Cheats
 
             if (found.Count > MaxCandidates) { found.RemoveRange(MaxCandidates, found.Count - MaxCandidates); }
             return found;
+        }
+
+        /// <summary>
+        /// 格子的地址是否可能存放"真正的指针"：位于已提交、**可写、不可执行**的内存里。
+        ///
+        /// 2026-10-07 加固的核心判据（缘由详见类注释）。regions 是一次枚举出来的窗口区域表，
+        /// 按地址升序、互不重叠，二分查找即可。
+        /// </summary>
+        private static bool IsUsableSlotAddress(List<MemoryRegion> regions, uint address)
+        {
+            if (regions == null || regions.Count == 0) { return false; }
+
+            int lo = 0;
+            int hi = regions.Count - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                MemoryRegion region = regions[mid];
+                if ((ulong)address < region.Base) { hi = mid - 1; }
+                else if ((ulong)address >= region.End) { lo = mid + 1; }
+                else
+                {
+                    if (region.State != Win32Api.MEM_COMMIT) { return false; }
+                    return region.Writable && !Win32Api.IsExecutableProtect(region.Protect);
+                }
+            }
+            return false;
         }
 
         /// <summary>检查一个候选数组：元素是不是真实对象、数量字段在哪、含不含选中的单位。</summary>

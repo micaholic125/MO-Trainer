@@ -2676,8 +2676,9 @@ namespace MoTrainer.Diagnostics
                 List<uint> hints = new List<uint>();
                 hints.Add(scene.Team[0]);
 
+                int rejectedFirst;
                 List<TechnoArrayCandidate> found = TechnoArrayFinder.Find(
-                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints);
+                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints, out rejectedFirst);
 
                 Check("自动查找总名单：含选中单位的那张排第一，有效对象数也对",
                     found.Count > 0 && found[0].ArrayAddress == arrayTotal
@@ -2692,6 +2693,49 @@ namespace MoTrainer.Diagnostics
                 Check("自动查找总名单：不会把「选中名单自己」当成总名单",
                     excludesSelf && found.Count >= 2,
                     string.Format(CultureInfo.InvariantCulture, "{0} 个候选", found.Count));
+
+                // ---- 2026-10-07 加固：可执行页里的「格子」必须被排除 ----
+                //
+                // 真机两次实测（09-27、10-07）：代码段里某些 4 字节窗口的值**恰好等于当场的
+                // 数组地址**，能通过全部旧校验、还因对象数最多排到第一 —— 存下来的"定位"其实
+                // 指向代码字节：当天能用、换一局失效。这里把同款的"假格子"造出来（一张正常
+                // 数组 + 一个写在可执行页里的指针格），断言它不再进入候选。
+                // 改坏验证：删掉位置检查，本断言立刻转红。
+                uint slotCode = scene.Arrays + 0x7000;
+                uint arrayCode = scene.Arrays + 0x6000;
+                io.WriteUInt32(slotCode, arrayCode);
+                scene.WriteArray(arrayCode, new uint[] { scene.Team[0], scene.Team[1], scene.Team[2] });
+
+                uint oldProtect;
+                bool flipped = Win32Api.VirtualProtectEx(self.Handle,
+                    (IntPtr)(long)slotCode, (IntPtr)0x1000, Win32Api.PAGE_EXECUTE_READWRITE, out oldProtect);
+                Check("自动查找总名单（加固用例）：可执行页已就位",
+                    flipped, flipped
+                        ? string.Format(CultureInfo.InvariantCulture, "0x{0:X8} 一页已改为可执行", slotCode)
+                        : Win32Api.LastErrorMessage());
+
+                int rejectedCode;
+                List<TechnoArrayCandidate> hardened = TechnoArrayFinder.Find(
+                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints, out rejectedCode);
+
+                bool codeExcluded = true;
+                for (int i = 0; i < hardened.Count; i++)
+                {
+                    if (hardened[i].SlotAddress == slotCode) { codeExcluded = false; }
+                }
+                Check("自动查找总名单：可执行页里的「格子」被排除（2026-10-07 加固）",
+                    codeExcluded && rejectedCode >= 1
+                        && hardened.Count > 0 && hardened[0].ArrayAddress == arrayTotal,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "候选 {0} 个｜按位置规则排除 {1} 个｜可执行页格子混入={2}",
+                        hardened.Count, rejectedCode, codeExcluded ? "否" : "是"));
+
+                uint restoreOld;
+                if (!Win32Api.VirtualProtectEx(self.Handle,
+                    (IntPtr)(long)slotCode, (IntPtr)0x1000, oldProtect, out restoreOld))
+                {
+                    Logger.Warn("SelfTest", "加固用例的可执行页还原失败：" + Win32Api.LastErrorMessage());
+                }
             }
             catch (Exception ex)
             {
