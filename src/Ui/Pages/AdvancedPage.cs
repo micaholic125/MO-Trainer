@@ -1083,25 +1083,31 @@ namespace MoTrainer.Ui.Pages
         }
 
         /// <summary>
-        /// 预演「秒杀敌人」：**只读不改**，列出"会杀哪些、放过哪些"。
+        /// 预演「秒杀敌人」：**只读不改**，列出"会杀哪些、放过哪些"，并做一次安全抽检。
         ///
-        /// 这是开放真正写入之前的最后一道人工关卡。判定规则与真正执行时完全相同：
-        /// 只处理"类型属于我方所在类"的对象，且阵营值 ≠ 我方阵营、且阵营值非零。
-        /// 用户只要看两个数字（将击杀 N / 放过我方 M）是否合理，就能判断能不能开写。
+        /// 这是真正开写之前的最后一道人工关卡。与 2026-10-07 之前最大的不同：
+        /// 敌我判据从"人工试出的阵营偏移 + 猜它的取值含义"改成**金钱锚定**
+        /// （见 `TechnoOwnership`），而且判完还要**用独立判据复核一遍**（抽检）——
+        /// 因为秒杀是唯一可能"把自己人一起清空"的功能，宁可多花几十毫秒。
+        /// 判定规则与引擎真正执行时完全相同（同一个锚点、同一个偏移）。
         /// </summary>
         private void OnKillPreviewClick(object sender, EventArgs e)
         {
             StringBuilder text = new StringBuilder();
             text.AppendLine("=== 预演：秒杀敌人（只读，不写入任何内存）===");
+            text.AppendLine("敌我判据：金钱锚定 —— 从你选中的单位里反查「指向我方 House（装着你的金钱）的指针」，");
+            text.AppendLine("用它的偏移和取值区分敌我；不依赖任何人工试出来的偏移。");
+            text.AppendLine();
 
             MemoryIO memory = _target.Memory;
             string error;
 
+            // ---- 名单 ----
             uint slotAddress;
             if (!_profile.TechnoArray.IsCalibrated
                 || !_profile.TechnoArray.TryResolve(memory, _moduleBase, out slotAddress, out error))
             {
-                text.AppendLine("【缺前置】还没找到对象名单。");
+                text.AppendLine("【缺前置】还没找到对象名单。请先点「自动查找总名单」。");
                 SetOutput(text.ToString());
                 return;
             }
@@ -1109,29 +1115,29 @@ namespace MoTrainer.Ui.Pages
             uint arrayPointer;
             if (!ReadUInt32Retry(memory, slotAddress, out arrayPointer) || arrayPointer < 0x10000)
             {
-                text.AppendLine("【缺前置】名单格子里读不到有效指针。");
+                text.AppendLine("【缺前置】名单格子里读不到有效指针（跨会话失效？请重新「自动查找总名单」）。");
                 SetOutput(text.ToString());
                 return;
             }
 
-            if (_profile.OffsetTechnoOwner == 0)
+            // ---- 金钱（锚点靠它判定）----
+            uint moneyAddress;
+            uint money = 0;
+            if (!_profile.Money.IsCalibrated
+                || !_profile.Money.TryResolve(memory, _moduleBase, out moneyAddress, out error)
+                || !ReadUInt32Retry(memory, moneyAddress, out money) || money == 0)
             {
-                text.AppendLine("【缺前置】阵营偏移未校准 —— 分不出敌我，绝不能写血量。");
+                text.AppendLine("【缺前置】读不到金钱值 —— 敌我锚点靠它判定（请确认金钱仍处于已校准状态）。");
                 SetOutput(text.ToString());
                 return;
             }
 
-            if (_profile.SelectedList.IsCalibrated == false)
-            {
-                text.AppendLine("【缺前置】选中名单不可用，无法确定\"我方\"是谁。");
-                SetOutput(text.ToString());
-                return;
-            }
-
+            // ---- 选中的单位（锚点样本）----
             uint selectedSlot;
-            if (!_profile.SelectedList.TryResolve(memory, _moduleBase, out selectedSlot, out error))
+            if (!_profile.SelectedList.IsCalibrated
+                || !_profile.SelectedList.TryResolve(memory, _moduleBase, out selectedSlot, out error))
             {
-                text.AppendLine("【缺前置】选中名单解析失败：" + error);
+                text.AppendLine("【缺前置】选中名单不可用，无法确定「我方」是谁。");
                 SetOutput(text.ToString());
                 return;
             }
@@ -1144,34 +1150,39 @@ namespace MoTrainer.Ui.Pages
                 return;
             }
 
-            // 我方阵营值 + 我方所属类型（只处理同一类对象，字段布局才对得上）
-            uint myOwner = 0;
-            uint myType = 0;
-            for (int i = 0; i < myObjects.Count; i++)
+            // ---- 建立锚点（金钱锚定）----
+            TechnoOwnership.OwnerAnchor anchor;
+            string why;
+            if (!TechnoOwnership.TryBuildAnchor(memory, myObjects, money, out anchor, out why))
             {
-                uint type;
-                if (!ReadUInt32Retry(memory, myObjects[i], out type)) { continue; }
-                uint owner;
-                if (!ReadUInt32Retry(memory, myObjects[i] + _profile.OffsetTechnoOwner, out owner)) { continue; }
-                if (owner == 0) { continue; }
-
-                myType = type;
-                myOwner = owner;
-                break;
-            }
-
-            if (myOwner == 0)
-            {
-                text.AppendLine("【缺前置】读不到我方的阵营值。");
+                text.AppendLine("【无法判定敌我】" + why);
+                text.AppendLine();
+                text.AppendLine("本次**没有写入任何内存**。");
                 SetOutput(text.ToString());
                 return;
             }
 
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "我方阵营 0x{0:X8}｜我方类型 0x{1:X8}", myOwner, myType));
+                "我方锚点：阵营字段 +0x{0:X} = 0x{1:X8}（由 {2} 个选中单位金钱锚定）",
+                anchor.OwnerOffset, anchor.MyHouse, anchor.Samples));
+            text.AppendLine();
+
+            // ---- 遍历全场 ----
+            uint count = 0;
+            bool countKnown = false;
+            if (_profile.TechnoArrayCount.IsCalibrated)
+            {
+                uint countAddress;
+                if (_profile.TechnoArrayCount.TryResolve(memory, _moduleBase, out countAddress, out error)
+                    && memory.ReadUInt32(countAddress, out count) && count >= 64)
+                {
+                    countKnown = true;
+                }
+            }
+            if (!countKnown || count > TechnoWalker.MaxObjects) { count = 4096; }
 
             TechnoWalkResult walk = TechnoWalker.WalkArray(
-                memory, arrayPointer, 4096, _moduleBase, _moduleSize);
+                memory, arrayPointer, count, _moduleBase, _moduleSize);
             if (!walk.Ok)
             {
                 text.AppendLine("遍历失败：" + walk.Error);
@@ -1181,20 +1192,19 @@ namespace MoTrainer.Ui.Pages
 
             int willKill = 0;
             int myUnits = 0;
-            int skippedType = 0;
+            int unknown = 0;
             Dictionary<uint, int> enemyGroups = new Dictionary<uint, int>();
 
             for (int i = 0; i < walk.Count; i++)
             {
-                uint type;
-                if (!ReadUInt32Retry(memory, walk.Objects[i].Address, out type)) { continue; }
-                if (myType != 0 && type != myType) { skippedType++; continue; }
-
                 uint owner;
-                if (!ReadUInt32Retry(memory, walk.Objects[i].Address + _profile.OffsetTechnoOwner, out owner)) { continue; }
-
-                if (owner == 0) { continue; }
-                if (owner == myOwner) { myUnits++; continue; }
+                if (!ReadUInt32Retry(memory, walk.Objects[i].Address + anchor.OwnerOffset, out owner))
+                {
+                    unknown++;
+                    continue;
+                }
+                if (owner == 0) { unknown++; continue; }
+                if (owner == anchor.MyHouse) { myUnits++; continue; }
 
                 willKill++;
                 int existing;
@@ -1202,11 +1212,12 @@ namespace MoTrainer.Ui.Pages
             }
 
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "遍历到 {0} 个对象（另有 {1} 个非我方类型，已跳过）", walk.Count, skippedType));
+                "遍历到 {0} 个对象", walk.Count));
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "**将击杀：{0} 个**｜**放过我方：{1} 个**", willKill, myUnits));
+                "**将击杀：{0} 个**｜**放过我方：{1} 个**｜归属不明：{2} 个",
+                willKill, myUnits, unknown));
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "血量偏移 +0x{0:X}（写入时每个目标都会先校验类型、写后回读）",
+                "血量偏移 +0x{0:X}（写入时每个目标都会先校验、写后回读）",
                 _profile.OffsetTechnoHealth));
 
             List<KeyValuePair<uint, int>> ordered = new List<KeyValuePair<uint, int>>();
@@ -1222,9 +1233,36 @@ namespace MoTrainer.Ui.Pages
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                     "  敌方阵营 0x{0:X8}：{1} 个", ordered[i].Key, ordered[i].Value));
             }
+            text.AppendLine();
+
+            // ---- 安全抽检：把"判为敌方"的对象拿独立判据复核 ----
+            int enemySeen;
+            int checkedCount;
+            uint suspect;
+            string verifyWhy;
+            bool verified = TechnoOwnership.VerifyEnemySample(
+                memory, walk.Objects, anchor.OwnerOffset, anchor.MyHouse, 256,
+                out enemySeen, out checkedCount, out suspect, out verifyWhy);
+
+            if (verified)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "安全抽检：复核 {0} 个判为敌方的对象，**没有一个连着你方 House** —— 通过。",
+                    checkedCount));
+            }
+            else
+            {
+                text.AppendLine("安全抽检：**未通过！** " + verifyWhy);
+                text.AppendLine("→ 敌我分类不可靠，**绝不能开启秒杀**。请把这份结果发给开发者。");
+            }
+
+            if (myUnits == 0)
+            {
+                text.AppendLine("⚠ 注意：名单里一个「我方」对象都没有 —— 这也是判据出问题的信号，程序会拒绝执行。");
+            }
 
             text.AppendLine();
-            text.AppendLine("本次**没有写入任何内存**。确认数字合理后再开放真正的秒杀。");
+            text.AppendLine("本次**没有写入任何内存**。确认两个数字（将击杀 / 放过我方）合理后再开启「秒杀敌人」。");
             SetOutput(text.ToString());
         }
 

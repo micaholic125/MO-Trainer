@@ -114,6 +114,7 @@ namespace MoTrainer.Ui.Pages
                 "Ctrl + Alt + 1        金钱开关",
                 "Ctrl + Alt + 2        电力开关",
                 "Ctrl + Alt + 3        选中单位无敌开关",
+                "Ctrl + Alt + 4        秒杀敌人开关",
                 "",
                 "提示：游戏若是独占全屏，Windows 可能把热键让给游戏窗口而收不到。",
                 "本工具不修改任何游戏文件，只读写游戏进程的内存。"
@@ -125,8 +126,8 @@ namespace MoTrainer.Ui.Pages
             {
                 Label line = new Label();
                 line.AutoSize = true;
-                line.Font = i >= 4 ? Theme.Small : Theme.Body;
-                line.ForeColor = i >= 4 ? Theme.Text2 : Theme.Text1;
+                line.Font = i >= 5 ? Theme.Small : Theme.Body;
+                line.ForeColor = i >= 5 ? Theme.Text2 : Theme.Text1;
                 line.Text = lines[i];
                 line.Location = new Point(Theme.CardPadding + 6, y);
                 card.Controls.Add(line);

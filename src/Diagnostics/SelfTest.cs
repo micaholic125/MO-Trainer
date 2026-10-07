@@ -109,6 +109,9 @@ namespace MoTrainer.Diagnostics
             CheckTechnoWalkerPartialRead();
             CheckTechnoArrayFinder();
             CheckTechnoOps();
+            // 引擎层的端到端接线回归（2026-10-07 [S6-1]）：名单从哪来、我方是谁、
+            // 什么时候必须拒绝 —— 这些参数链路的风险只有到引擎层才测得到。
+            CheckKillWiring();
 
             // 这一条格外重要：采集要靠**用户开一局游戏**才能跑，
             // 而用户的时间是本项目最稀缺的东西。采集本身若有 bug，
@@ -2808,6 +2811,15 @@ namespace MoTrainer.Diagnostics
                     unknown == 100,
                     string.Format(CultureInfo.InvariantCulture, "剩余血量 {0}", unknown));
 
+                // 已经倒下的（血量 0）不再重复写。不跳过的后果不只是浪费：
+                // 单拍写入有上限，前排"尸体"吃光额度会让后面的敌人永远轮不到（"杀着杀着不动了"）。
+                TechnoOpResult dead = TechnoOps.KillEnemies(
+                    io, walk.Objects, TechnoScene.OwnerOffset, TechnoScene.HealthOffset, scene.MyOwner);
+                Check("秒杀：血量已经是 0 的目标不重复写（旧写法这里会再写 3 个）",
+                    dead.Written == 0 && dead.Skipped >= 3,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "第二次写入 {0}｜跳过 {1}", dead.Written, dead.Skipped));
+
                 // ================= 瞬间建造 =================
 
                 io.WriteUInt32(scene.Team[0] + TechnoScene.ProgressOffset, 500);
@@ -2921,6 +2933,204 @@ namespace MoTrainer.Diagnostics
             }
             finally
             {
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        // ============================================================ 秒杀接线（S6-1）
+
+        /// <summary>
+        /// 「秒杀敌人」从引擎到内存的**端到端**回归（2026-10-07 接线时新增）。
+        ///
+        /// 为什么必须在引擎层再测一遍：`TechnoOps.KillEnemies` 单测只证明"给对参数就会写对"，
+        /// 而接线的风险全在**参数从哪来** —— 名单怎么解析、我方是谁、什么时候该拒绝。
+        /// 这是全项目唯一会一次性重写上千个对象状态的路径，出错的形态是"把自己的部队清空"，
+        /// 所以这一组断言的重点和 CheckTechnoOps 一样：**该拒绝的时候一定拒绝、一个字节都不写**。
+        ///
+        /// 用到的关键设计：**故意把配置里的「阵营偏移」设成错的**（+0x2A8，那些位置全是 0）。
+        /// 如果引擎真的用了它，全场都会判成"归属不明"，最终因"我方 0 个"而拒绝执行、
+        /// 一个敌人都杀不掉 —— 所以"敌人确实被清掉"这件事本身就证明：
+        /// 引擎用的是**金钱锚定**出来的偏移。
+        /// </summary>
+        private static void CheckKillWiring()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("秒杀接线", false, "OpenProcess 失败"); return; }
+
+            TechnoScene scene = null;
+            CheatEngine engine = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("秒杀接线测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+                uint module = scene.ModuleBase;
+
+                const uint Money = 5000;
+                const uint EnemyMoney = 7000;
+                const uint OwnerOffset = TechnoScene.OwnerOffset;     // 场景里对象的阵营字段（=真机的 +0xF0）
+                const uint HealthOffset = TechnoScene.HealthOffset;   // =真机的 +0x6C
+
+                // 房子：我方 / 敌方，各自 +0x30C 处放着金钱 —— 金钱锚定的判据就是它
+                io.WriteUInt32(scene.MyOwner + TechnoOwnership.HouseMoneyOffset, Money);
+                io.WriteUInt32(scene.EnemyOwner + TechnoOwnership.HouseMoneyOffset, EnemyMoney);
+
+                // 全对象名单：模块内的"格子"（静态地址）→ 数组
+                uint rosterSlot = module + 0x200;
+                uint rosterCount = module + 0x204;
+                io.WriteUInt32(rosterSlot, scene.ArrayMain);
+                io.WriteUInt32(rosterCount, 7);
+
+                // 选中名单：数量 + 指针槽（槽里放一张只含我方两个对象的数组）
+                uint selCount = module + 0x300;
+                uint selSlot = module + 0x304;
+                uint selArray = scene.Arrays + 0x1800;
+                io.WriteUInt32(selCount, 2);
+                io.WriteUInt32(selSlot, selArray);
+                io.WriteUInt32(selArray, scene.Team[0]);
+                io.WriteUInt32(selArray + 4, scene.Team[1]);
+
+                // 金钱链：静态根（模块内）→ 我方房子 → +0x30C
+                io.WriteUInt32(module + 0x100, scene.MyOwner);
+
+                CalibrationProfile profile = new CalibrationProfile();
+                profile.Money.SetOffsets(new uint[] { 0x100, TechnoOwnership.HouseMoneyOffset });
+                profile.TechnoArray.SetStaticAddress(0x200);
+                profile.TechnoArrayCount.SetStaticAddress(0x204);
+                profile.SelectedCount.SetStaticAddress(0x300);
+                profile.SelectedList.SetStaticAddress(0x304);
+                profile.OffsetTechnoHealth = HealthOffset;
+                profile.OffsetTechnoOwner = 0x2A8;   // **故意是错的** —— 见方法注释
+
+                List<MemoryRegion> heap = new List<MemoryRegion>();
+                heap.Add(MakeRegion(scene.Heap, TestBlockSize));
+                List<MemoryRegion> pointer = new List<MemoryRegion>();
+                pointer.Add(MakeRegion(scene.ModuleBase, TestBlockSize));
+                pointer.Add(MakeRegion(scene.Heap, TestBlockSize));
+                SyntheticTarget target = new SyntheticTarget(
+                    io, scene.ModuleBase, TechnoScene.FakeModuleSize, heap, pointer);
+
+                // ================= ① 正常路径 =================
+                engine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature kill = engine.Add(new CheatFeature(
+                    CheatId.KillEnemies, "秒杀", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+                Check("秒杀接线：名单齐备时功能被视为已校准",
+                    kill.IsCalibrated, "IsCalibrated=" + kill.IsCalibrated);
+
+                kill.Enabled = true;
+                engine.Start();
+
+                bool killed = WaitUntil(delegate
+                {
+                    return scene.ReadField(scene.Team[2], HealthOffset) == 0
+                        && scene.ReadField(scene.Team[3], HealthOffset) == 0
+                        && scene.ReadField(scene.Team[4], HealthOffset) == 0;
+                }, 3000);
+
+                Check("秒杀接线：只清敌方；我方与归属不明的对象一点没动（配置里的阵营偏移是错的也照样分清）",
+                    killed
+                        && scene.ReadField(scene.Team[0], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[1], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[5], HealthOffset) == 100,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "我方 {0}/{1}｜敌方 {2}/{3}/{4}｜归属不明 {5}｜写入 {6} 次｜{7}",
+                        scene.ReadField(scene.Team[0], HealthOffset),
+                        scene.ReadField(scene.Team[1], HealthOffset),
+                        scene.ReadField(scene.Team[2], HealthOffset),
+                        scene.ReadField(scene.Team[3], HealthOffset),
+                        scene.ReadField(scene.Team[4], HealthOffset),
+                        scene.ReadField(scene.Team[5], HealthOffset),
+                        kill.WriteCount,
+                        kill.LastError.Length == 0 ? "无错误" : kill.LastError));
+
+                engine.Stop();
+                engine = null;
+
+                // 后面每条用例都从"敌人满血"开始
+                for (int i = 2; i <= 4; i++) { io.WriteUInt32(scene.Team[i] + HealthOffset, 100); }
+
+                // ================= ② 建立不了我方锚点 → 拒绝 =================
+                io.WriteUInt32(selCount, 0);   // 游戏里"什么都没选中"
+
+                engine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature noAnchor = engine.Add(new CheatFeature(
+                    CheatId.KillEnemies, "秒杀", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+                noAnchor.Enabled = true;
+                engine.Start();
+                Thread.Sleep(900);
+
+                Check("秒杀接线：没有可用的「我方锚点」时拒绝执行，一个字节都没写",
+                    scene.ReadField(scene.Team[2], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[3], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[4], HealthOffset) == 100
+                        && noAnchor.LastError.Length > 0,
+                    noAnchor.LastError.Length == 0 ? "居然没有报错" : noAnchor.LastError);
+
+                engine.Stop();
+                engine = null;
+
+                // ================= ③ 抽检发现问题 → 拒绝 =================
+                io.WriteUInt32(selCount, 2);   // 恢复"选中了我方两个单位"
+                // 每条用例都从"敌人满血"开始：任一条用例失败时，后面的布尔判据才仍然独立可读
+                for (int i = 2; i <= 4; i++) { io.WriteUInt32(scene.Team[i] + HealthOffset, 100); }
+
+                // 在一个"判为敌方"的对象窗口里塞入我方 House 地址 ——
+                // 模拟真实世界里"分类偏移找错"的形态：被判成敌人的其实连着自己家。
+                io.WriteUInt32(scene.Team[2] + 0x150, scene.MyOwner);
+
+                engine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature suspect = engine.Add(new CheatFeature(
+                    CheatId.KillEnemies, "秒杀", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+                suspect.Enabled = true;
+                engine.Start();
+                Thread.Sleep(900);
+
+                Check("秒杀接线：安全抽检发现「判为敌方」的其实连着我方 House → 拒绝执行，一个字节都没写",
+                    scene.ReadField(scene.Team[2], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[3], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[4], HealthOffset) == 100
+                        && suspect.LastError.IndexOf("抽检") >= 0,
+                    suspect.LastError.Length == 0 ? "居然没有报错" : suspect.LastError);
+
+                engine.Stop();
+                engine = null;
+                io.WriteUInt32(scene.Team[2] + 0x150, 0);   // 清掉污染
+
+                // ================= ④ 名单指针失效 → 拒绝 =================
+                for (int i = 2; i <= 4; i++) { io.WriteUInt32(scene.Team[i] + HealthOffset, 100); }
+                io.WriteUInt32(rosterSlot, module + 0x7F00000);   // 指向一片没有映射的地址
+
+                engine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature badArray = engine.Add(new CheatFeature(
+                    CheatId.KillEnemies, "秒杀", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+                badArray.Enabled = true;
+                engine.Start();
+                Thread.Sleep(900);
+
+                Check("秒杀接线：名单指针失效时拒绝执行，一个字节都没写",
+                    scene.ReadField(scene.Team[2], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[3], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[4], HealthOffset) == 100
+                        && badArray.LastError.Length > 0,
+                    badArray.LastError.Length == 0 ? "居然没有报错" : badArray.LastError);
+
+                engine.Stop();
+                engine = null;
+                io.WriteUInt32(rosterSlot, scene.ArrayMain);
+            }
+            catch (Exception ex)
+            {
+                Check("秒杀接线", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (engine != null) { try { engine.Dispose(); } catch (Exception) { } }
                 if (scene != null) { scene.Dispose(); }
                 self.Dispose();
             }

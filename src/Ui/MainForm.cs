@@ -25,6 +25,7 @@ namespace MoTrainer.Ui
         private const int HotkeyMoney = 0xA001;
         private const int HotkeyPower = 0xA002;
         private const int HotkeyInvincible = 0xA003;
+        private const int HotkeyKillEnemies = 0xA004;
 
         private readonly ProcessAttach _attach;
         private readonly MemoryIO _memory;
@@ -350,6 +351,19 @@ namespace MoTrainer.Ui
                 + "因此本功能仅适合单人 / 打 AI 使用。\n\n"
                 + "「锁定为」的默认值是校准测出的满血值，一般不用改。";
 
+            // 秒杀敌人：**故意不从设置里恢复开启状态** —— 它是一次会话里最"重"的操作，
+            // 每次启动都应由玩家重新勾选确认后主动打开（与无敌同一处理）。
+            CheatFeature kill = _engine.Add(new CheatFeature(CheatId.KillEnemies, "秒杀敌人",
+                "开启后，战场上不属于你的单位血量会被持续清零。只打敌人，不碰自己人。", SynchRisk.High, false));
+            kill.Detail =
+                "单位血量是参与同步校验的游戏状态。\n"
+                + "单方面清空敌方血量，其它客户端算出的结果必然与你不同，\n"
+                + "很快就会出现 out of sync 掉线。仅适合单人 / 打 AI 使用。\n\n"
+                + "使用前请先做两件事：\n"
+                + "① 在游戏里选中一个自己的单位（程序靠它确认「我方」是谁）；\n"
+                + "② 到「高级功能」页点一次「预演：秒杀敌人」，看清「将击杀 / 放过我方」两个数字再开启。\n\n"
+                + "程序每一拍都会核对敌我，任何一处对不上就拒绝执行、一个字节都不写。";
+
             _settings.SetValue(CheatId.Money, money.TargetValue);
             _settings.SetValue(CheatId.PowerOutput, power.TargetValue);
         }
@@ -361,6 +375,7 @@ namespace MoTrainer.Ui
             RegisterHotkey(HotkeyMoney, Keys.D1, "1");
             RegisterHotkey(HotkeyPower, Keys.D2, "2");
             RegisterHotkey(HotkeyInvincible, Keys.D3, "3");
+            RegisterHotkey(HotkeyKillEnemies, Keys.D4, "4");
         }
 
         private void RegisterHotkey(int id, Keys key, string label)
@@ -412,6 +427,7 @@ namespace MoTrainer.Ui
                 case HotkeyMoney: target = CheatId.Money; break;
                 case HotkeyPower: target = CheatId.PowerOutput; break;
                 case HotkeyInvincible: target = CheatId.SelectedInvincible; break;
+                case HotkeyKillEnemies: target = CheatId.KillEnemies; break;
                 default: return;
             }
 

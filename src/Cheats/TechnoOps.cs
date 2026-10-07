@@ -81,6 +81,16 @@ namespace MoTrainer.Cheats
                 // 阵营读不出来 → 归属不明，绝不冒险
                 if (owner == 0 || owner == myOwner) { result.Skipped++; continue; }
 
+                // 血量已经是 0 的（已经倒下、还没被游戏从名单里清掉的）不再重复写。
+                // 不跳过的后果不只是浪费：单拍写入有上限（MaxWritesPerTick），
+                // 前排"尸体"会把额度吃光，让后面的敌人永远轮不到 —— 表现为"杀着杀着不动了"。
+                uint health = 0;
+                if (memory.ReadUInt32(address + healthOffset, out health) && health == 0)
+                {
+                    result.Skipped++;
+                    continue;
+                }
+
                 if (memory.WriteUInt32Verified(address + healthOffset, 0)) { result.Written++; guard++; }
                 else { result.Failed++; }
             }

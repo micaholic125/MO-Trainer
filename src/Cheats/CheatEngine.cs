@@ -223,6 +223,9 @@ namespace MoTrainer.Cheats
             bool ready = _target != null && _target.IsReady;
             bool peekTick = (Interlocked.Read(ref _ticks) % RelocateEveryTicks) == 0;
 
+            if (ready && !_readyPrev) { OnTargetReadyAgain(); }
+            _readyPrev = ready;
+
             for (int i = 0; i < _features.Count; i++)
             {
                 CheatFeature feature = _features[i];
@@ -248,14 +251,24 @@ namespace MoTrainer.Cheats
                     if (peekTick)
                     {
                         if (feature.Id == CheatId.SelectedInvincible) { PeekSelection(feature); }
+                        else if (feature.Id == CheatId.KillEnemies) { PeekTechnoArray(feature); }
                         else { PeekValue(feature); }
+                    }
+
+                    // 秒杀一旦关闭就把"已抽检"标记作废：下次开启会重新做一次安全抽检。
+                    if (feature.Id == CheatId.KillEnemies && _killArmed)
+                    {
+                        _killArmed = false;
+                        Logger.Info("Engine", "秒杀敌人已关闭：下次开启时会重新做一次安全抽检");
                     }
                     continue;
                 }
 
-                // 无敌不是"锁一个地址"，而是"遍历选中的每个对象逐一写血量"，
-                // 所以单独走一条路径，不复用单地址的读-比-写。
+                // 无敌不是"锁一个地址"，而是"遍历选中的每个对象逐一写血量"；
+                // 秒杀敌人同理（整场对象遍历 + 批量写），两者都单独走专用路径，
+                // 绝不复用单地址的读-比-写 —— 否则会拿"名单基地址"当单地址去写值。
                 if (feature.Id == CheatId.SelectedInvincible) { ApplySelectedInvincible(feature); }
+                else if (feature.Id == CheatId.KillEnemies) { ApplyKillEnemies(feature); }
                 else { ApplyFeature(feature); }
             }
         }
@@ -571,6 +584,379 @@ namespace MoTrainer.Cheats
             }
         }
 
+        // ============================================================ 秒杀敌人（S6-1）
+
+        /// <summary>
+        /// 秒杀敌人：整场对象遍历 → 把"不属于我方"的对象血量清零。
+        ///
+        /// 与无敌的关键区别：无敌写的是"玩家选中的那几个对象"（数量个位数），
+        /// 秒杀写的是**场上所有敌方对象**（真机规模上千个）——所以每一步都必须先假设
+        /// "判据可能是错的"，任何一关不过就**一个字节都不写**（fail-closed）：
+        ///   ① 名单先过信任关（`IsTrustworthy`）；
+        ///   ② "我方是谁"必须**金钱锚定**（`TechnoOwnership`），不接受人工试出的偏移；
+        ///   ③ 开启时做一次安全抽检（用独立判据复核分类结果），通过才允许写；
+        ///   ④ 每拍先自己数一遍：我方对象一个都没数到 = 锚点已失效，拒绝执行。
+        /// </summary>
+        private void ApplyKillEnemies(CheatFeature feature)
+        {
+            // 节流：整场遍历 + 几千次读取，按 30Hz 跑会把游戏帧率拖垮。
+            // 0.5 秒一拍：按真机规模（敌方一千上下）约 2 秒清完一轮，符合"3 秒内归零"。
+            if ((DateTime.UtcNow - _lastKillRun).TotalSeconds < KillIntervalSeconds) { return; }
+            _lastKillRun = DateTime.UtcNow;
+
+            if (_profile == null) { feature.LastError = "缺少校准配置"; return; }
+            if (_profile.OffsetTechnoHealth == 0)
+            {
+                feature.LastError = "未校准「对象血量」偏移，无法执行";
+                return;
+            }
+
+            // ---- ① 名单 ----
+            uint slotAddress;
+            uint arrayAddress;
+            uint count;
+            string reason;
+            if (!TryResolveTechnoArray(out slotAddress, out arrayAddress, out count, out reason))
+            {
+                feature.Address = 0;
+                feature.LastError = reason;
+                LogKillNote(reason);
+                return;
+            }
+            feature.Address = slotAddress;
+
+            TechnoWalkResult walk = TechnoWalker.WalkArray(
+                _target.Memory, arrayAddress, count, _target.ModuleBase, _target.ModuleSize);
+            if (!TechnoOps.IsTrustworthy(walk, out reason))
+            {
+                feature.Address = 0;
+                feature.LastError = "对象名单不可信（" + reason + "），已拒绝执行";
+                LogKillNote(feature.LastError);
+                return;
+            }
+
+            // ---- ② 我方锚点（金钱锚定）----
+            if (!EnsureOwnerAnchor(out reason))
+            {
+                feature.LastError = reason;
+                LogKillNote(reason);
+                return;
+            }
+
+            // ---- 每拍自查：把全场先数一遍 ----
+            int mine = 0;
+            int enemy = 0;
+            int unknown = 0;
+            for (int i = 0; i < walk.Objects.Count; i++)
+            {
+                uint owner;
+                if (!_target.Memory.ReadUInt32(walk.Objects[i].Address + _myOwnerOffset, out owner))
+                {
+                    unknown++;
+                    continue;
+                }
+                if (owner == 0) { unknown++; }
+                else if (owner == _myOwner) { mine++; }
+                else { enemy++; }
+            }
+
+            // 我方一个都没有 = 危险信号：锚点若是失效（比如换了一局），
+            // 全场都会判成敌方 —— 包括自己的部队。必须拒绝，而不是照写。
+            if (mine == 0)
+            {
+                _killArmed = false;
+                feature.Address = 0;
+                feature.LastError = "名单里没有任何一个对象属于「我方」——敌我锚点可能已失效，"
+                    + "已拒绝执行（请重新选中自己的单位，或关掉再开一次此功能）";
+                LogKillNote(feature.LastError);
+                return;
+            }
+
+            // ---- ③ 安全抽检（开启时 / 锚点重建后各做一次；失败则退避重试）----
+            if (!_killArmed && (DateTime.UtcNow - _lastKillVerify).TotalSeconds >= KillVerifyRetrySeconds)
+            {
+                _lastKillVerify = DateTime.UtcNow;
+
+                int enemySeen;
+                int checkedCount;
+                uint suspect;
+                string why;
+                if (!TechnoOwnership.VerifyEnemySample(
+                        _target.Memory, walk.Objects, _myOwnerOffset, _myOwner,
+                        KillVerifySamples, out enemySeen, out checkedCount, out suspect, out why))
+                {
+                    feature.LastError = "安全抽检未通过，已拒绝执行：" + why;
+                    LogKillNote(feature.LastError);
+                    return;
+                }
+
+                _killArmed = true;
+                Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                    "秒杀敌人：安全抽检通过（复核 {0}/{1} 个判为敌方的对象，均未连着我方 House）"
+                    + "｜阵营字段 +0x{2:X} = 0x{3:X8}（金钱锚定，样本 {4} 个）",
+                    checkedCount, enemySeen, _myOwnerOffset, _myOwner, _ownerAnchorSamples));
+            }
+            else if (!_killArmed)
+            {
+                return;   // 抽检未通过、还在退避期：不写
+            }
+
+            // ---- ④ 执行 ----
+            TechnoOpResult result = TechnoOps.KillEnemies(
+                _target.Memory, walk.Objects, _myOwnerOffset, _profile.OffsetTechnoHealth, _myOwner);
+
+            if (result.Written > 0) { feature.WriteCount += result.Written; }
+            feature.LastSeenValue = (uint)enemy;
+
+            if (result.Blocked.Length > 0)
+            {
+                feature.Address = 0;
+                feature.LastError = result.Blocked;
+                LogKillNote(result.Blocked);
+                return;
+            }
+
+            feature.LastError = result.Failed > 0
+                ? string.Format(CultureInfo.InvariantCulture, "有 {0} 个目标写入失败（已跳过）", result.Failed)
+                : "";
+            LogKillNote(feature.LastError);
+
+            // 心跳：每 5 秒一条。"到底有没有在写"在日志里必须看得见（与无敌同一套路数）。
+            if ((DateTime.UtcNow - _lastKillLog).TotalSeconds >= 5.0)
+            {
+                _lastKillLog = DateTime.UtcNow;
+                Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                    "秒杀敌人：名单 {0} 个｜我方 {1}｜敌方 {2}｜归属不明 {3}｜本拍写入 {4} 跳过 {5}"
+                    + "｜累计写入 {6}｜阵营字段 +0x{7:X}=0x{8:X8}（金钱锚定）",
+                    walk.Count, mine, enemy, unknown, result.Written, result.Skipped,
+                    feature.WriteCount, _myOwnerOffset, _myOwner));
+            }
+        }
+
+        /// <summary>
+        /// 解析「全对象名单」：格子（静态地址）→ 读出数组指针 → 数量。
+        /// 失败时 reason 是**给玩家看的话**（说明缺什么、去点哪个按钮）。
+        /// </summary>
+        private bool TryResolveTechnoArray(
+            out uint slotAddress, out uint arrayAddress, out uint count, out string reason)
+        {
+            slotAddress = 0;
+            arrayAddress = 0;
+            count = 0;
+            reason = "";
+
+            if (_profile == null || !_profile.TechnoArray.IsCalibrated)
+            {
+                reason = "还没有校准「全对象名单」——请先到「高级功能」页点一次「自动查找总名单」";
+                return false;
+            }
+
+            string error;
+            if (!_profile.TechnoArray.TryResolve(_target.Memory, _target.ModuleBase, out slotAddress, out error))
+            {
+                reason = "名单位置解析失败：" + error;
+                return false;
+            }
+
+            uint pointer;
+            if (!_target.Memory.ReadUInt32(slotAddress, out pointer)
+                || pointer < 0x10000 || pointer > 0x7FFFFFFF)
+            {
+                reason = "名单里读不到有效指针（跨会话失效？请重新点一次「自动查找总名单」）";
+                return false;
+            }
+            arrayAddress = pointer;
+
+            // 数量：优先用配置里的数量字段；读不到或明显不合理时按上限探测
+            //（真机教训：这类容器的"数量"字段有时是容量；实际多少个由遍历器自己数）。
+            count = 4096;
+            if (_profile.TechnoArrayCount.IsCalibrated)
+            {
+                uint countAddress;
+                if (_profile.TechnoArrayCount.TryResolve(_target.Memory, _target.ModuleBase, out countAddress, out error))
+                {
+                    uint value;
+                    if (_target.Memory.ReadUInt32(countAddress, out value) && value >= 64)
+                    {
+                        count = value > TechnoWalker.MaxObjects ? TechnoWalker.MaxObjects : value;
+                    }
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 读出"当前选中对象"的地址列表 —— 建立我方锚点的样本来源。
+        /// 复用无敌那套"多布局逐一尝试 + 归属自动更正"的解析，只取前几个。
+        /// </summary>
+        private List<uint> ReadSelectedObjectList()
+        {
+            List<uint> result = new List<uint>();
+
+            uint countAddress;
+            uint slotAddress;
+            if (!ResolveSelectionAddresses(out countAddress, out slotAddress)) { return result; }
+
+            uint count;
+            if (!_target.Memory.ReadUInt32(countAddress, out count) || count == 0) { return result; }
+            if (count > SelectionProbe.MaxCount) { return result; }
+
+            uint arrayAddress;
+            string note;
+            if (!ResolveSelectionArray(countAddress, slotAddress, count, out arrayAddress, out note))
+            {
+                return result;
+            }
+
+            int limit = count < (uint)TechnoOwnership.MaxAnchorSamples
+                ? (int)count : TechnoOwnership.MaxAnchorSamples;
+            for (int i = 0; i < limit; i++)
+            {
+                uint objectAddress;
+                if (!_target.Memory.ReadUInt32(arrayAddress + (uint)(i * 4), out objectAddress)) { break; }
+                if (objectAddress >= 0x10000) { result.Add(objectAddress); }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// 确保"我方锚点"（阵营字段偏移 + 我方 House 地址，金钱锚定）可用。
+        ///
+        /// 建立一次缓存 30 秒；到点且游戏里有选中单位时重建 —— 重建会把"已抽检"作废，
+        /// 下一拍重新抽检（这样锚点在整局里被持续复核，而不是只在开启那一刻看一次）。
+        /// 读不出金钱或建不出锚点时**拒绝执行**，绝不退回"人工试出的偏移"。
+        /// </summary>
+        private bool EnsureOwnerAnchor(out string reason)
+        {
+            reason = "";
+            bool haveAnchor = _myOwner != 0 && _myOwnerOffset != 0;
+            bool stale = (DateTime.UtcNow - _myOwnerStamp).TotalSeconds > OwnerAnchorRefreshSeconds;
+            if (haveAnchor && !stale) { return true; }
+
+            uint money;
+            if (!TryReadMoney(out money))
+            {
+                if (haveAnchor)
+                {
+                    // 锚点还在，金钱只是暂时读不到（不推翻已有结论）
+                    _myOwnerStamp = DateTime.UtcNow;
+                    return true;
+                }
+                reason = "读不到金钱值（敌我锚点靠它判定）——请确认金钱仍处于已校准状态";
+                return false;
+            }
+
+            List<uint> selected = ReadSelectedObjectList();
+            if (selected.Count > 0)
+            {
+                TechnoOwnership.OwnerAnchor anchor;
+                string why;
+                if (TechnoOwnership.TryBuildAnchor(_target.Memory, selected, money, out anchor, out why))
+                {
+                    bool changed = _myOwner != anchor.MyHouse || _myOwnerOffset != anchor.OwnerOffset;
+                    _myOwner = anchor.MyHouse;
+                    _myOwnerOffset = anchor.OwnerOffset;
+                    _ownerAnchorSamples = anchor.Samples;
+                    _myOwnerStamp = DateTime.UtcNow;
+
+                    // 锚点（可能）更新过 → 上一轮的抽检结论作废，下一拍重新抽检
+                    _killArmed = false;
+                    _lastKillVerify = DateTime.MinValue;
+
+                    if (changed)
+                    {
+                        Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                            "秒杀敌人：我方锚点已建立 —— 阵营字段 +0x{0:X} = 0x{1:X8}"
+                            + "（金钱 0x{2:X8} 锚定，样本 {3} 个{4}）",
+                            _myOwnerOffset, _myOwner, money, anchor.Samples,
+                            anchor.OtherOffsets.Count > 0
+                                ? string.Format(CultureInfo.InvariantCulture,
+                                    "；另有 {0} 个同样命中的偏移，已取最小", anchor.OtherOffsets.Count)
+                                : ""));
+                    }
+                    return true;
+                }
+
+                if (haveAnchor)
+                {
+                    // 这次建不出来（比如选中的不是自己单位），但旧锚点还没过期 —— 沿用旧的
+                    _myOwnerStamp = DateTime.UtcNow;
+                    return true;
+                }
+                reason = "无法建立我方锚点：" + why;
+                return false;
+            }
+
+            if (haveAnchor)
+            {
+                _myOwnerStamp = DateTime.UtcNow;   // 没有选中对象 → 沿用现有锚点
+                return true;
+            }
+
+            reason = "请先在游戏里选中一个自己的单位（程序要靠它确认「我方」是谁），然后再开启此功能";
+            return false;
+        }
+
+        /// <summary>
+        /// 关闭状态下的只读探测：轻量检查名单是否还能读（格子 → 指针 → 首项是不是真对象），
+        /// 并把"名单里登记了多少个对象"显示到卡片上。
+        ///
+        /// 刻意**不做整场遍历**：这一拍每秒一次，遍历要几千次读取；完整的名单健康检查
+        /// 由「扫描全对象数组」按钮和开启后的实际执行来做。
+        /// </summary>
+        private void PeekTechnoArray(CheatFeature feature)
+        {
+            uint slotAddress;
+            uint arrayAddress;
+            uint count;
+            string reason;
+            if (!TryResolveTechnoArray(out slotAddress, out arrayAddress, out count, out reason))
+            {
+                feature.Address = 0;
+                feature.LastError = reason;
+                return;
+            }
+
+            // 轻量健康检查：数组第一项的头 4 字节必须是模块区间内的类型标记
+            uint first;
+            uint vtable;
+            if (!_target.Memory.ReadUInt32(arrayAddress, out first) || first < 0x10000
+                || !_target.Memory.ReadUInt32(first, out vtable)
+                || vtable < _target.ModuleBase || vtable >= _target.ModuleBase + _target.ModuleSize)
+            {
+                feature.Address = 0;
+                feature.LastError = "名单内容异常（首项不是游戏对象）——可能需要重新查找总名单";
+                return;
+            }
+
+            feature.Address = slotAddress;
+            feature.LastSeenValue = count;
+            if (feature.LastError.Length > 0) { feature.LastError = ""; }
+        }
+
+        /// <summary>
+        /// 把秒杀的结论写进日志，但只在**结论变化**时记一行
+        /// （0.5 秒一拍，不这么做会把日志刷爆；完全不记又会让"没生效"变成悬案）。
+        /// </summary>
+        private void LogKillNote(string note)
+        {
+            if (note == null) { note = ""; }
+            if (note == _lastKillNote) { return; }
+
+            bool first = _lastKillNote == "(未开始)";
+            bool wasFailing = _lastKillNote.Length > 0;
+            _lastKillNote = note;
+
+            if (note.Length == 0)
+            {
+                Logger.Info("Engine", (wasFailing && !first) ? "秒杀敌人：已恢复正常执行" : "秒杀敌人：已开始执行");
+            }
+            else
+            {
+                Logger.Warn("Engine", "秒杀敌人：" + note);
+            }
+        }
+
         // ============================================================ 归属校验
 
         private readonly Dictionary<uint, bool> _ownedCache = new Dictionary<uint, bool>();
@@ -596,14 +982,81 @@ namespace MoTrainer.Cheats
         private bool _ownershipWarned;
         private DateTime _lastInvincibleTick = DateTime.MinValue;
 
+        // ---------------- 秒杀敌人（S6-1）的运行时状态 ----------------
+
+        /// <summary>上次执行秒杀的时刻。整场遍历 + 上千次读取太重，不能按 30Hz 跑。</summary>
+        private DateTime _lastKillRun = DateTime.MinValue;
+
+        /// <summary>上次秒杀心跳日志的时刻。</summary>
+        private DateTime _lastKillLog = DateTime.MinValue;
+
+        /// <summary>上一条已记录的秒杀结论（去重，避免每拍刷日志）。初值故意非空，让第一条也能记上。</summary>
+        private string _lastKillNote = "(未开始)";
+
+        /// <summary>本次开启是否已通过"安全抽检"。关闭 / 换局 / 锚点重建都会作废。</summary>
+        private bool _killArmed;
+
+        /// <summary>上次安全抽检的时刻（抽检失败时按退避间隔重试，不至于每拍都重扫）。</summary>
+        private DateTime _lastKillVerify = DateTime.MinValue;
+
+        /// <summary>我方锚点：阵营字段偏移 + 我方 House 地址（金钱锚定，见 TechnoOwnership）。</summary>
+        private uint _myOwner;
+        private uint _myOwnerOffset;
+        private int _ownerAnchorSamples;
+        private DateTime _myOwnerStamp = DateTime.MinValue;
+
+        /// <summary>上一拍的"游戏是否已连接"，用于识别（重新）连接并作废会话级缓存。</summary>
+        private bool _readyPrev;
+
+        /// <summary>秒杀的执行节拍：0.5 秒一拍（按真机规模约 2 秒清完一轮，符合"3 秒内归零"）。</summary>
+        private const double KillIntervalSeconds = 0.5;
+
+        /// <summary>开启时安全抽检复核多少个"判为敌方"的对象。</summary>
+        private const int KillVerifySamples = 128;
+
+        /// <summary>抽检失败后的重试间隔（秒）。</summary>
+        private const double KillVerifyRetrySeconds = 10.0;
+
+        /// <summary>我方锚点的缓存时长（秒）；到点且游戏里有选中单位时重新锚定并重新抽检。</summary>
+        private const double OwnerAnchorRefreshSeconds = 30.0;
+
+        /// <summary>
+        /// 游戏（重新）连接上时清空所有**会话级**缓存。
+        ///
+        /// 为什么必须清：这些缓存里存的是"上一局内存里的地址"（保护名单的血量基准、
+        /// 我方 House 地址……）。游戏关掉再开，堆的布局全变了，旧地址会落到**别的对象**上 ——
+        /// 对无敌来说是"给无关对象写血量"，对秒杀来说是"把所有人（含自己）都判成敌人"。
+        /// 这是跨会话最危险的一类 bug，宁可清掉重学，也不能赌地址没被复用。
+        /// </summary>
+        private void OnTargetReadyAgain()
+        {
+            bool hadState = _myOwner != 0 || _healthPeak.Count > 0 || _ownedCache.Count > 0;
+            _myOwner = 0;
+            _myOwnerOffset = 0;
+            _ownerAnchorSamples = 0;
+            _myOwnerStamp = DateTime.MinValue;
+            _killArmed = false;
+            _lastKillVerify = DateTime.MinValue;
+            _lastKillRun = DateTime.MinValue;
+            _healthPeak.Clear();
+            _ownedCache.Clear();
+            _resolvedSlot = 0;
+
+            if (hadState)
+            {
+                Logger.Info("Engine", "游戏（重新）连接：已作废上一局的会话级缓存（保护名单 / 我方锚点），避免拿旧地址误写");
+            }
+        }
+
         /// <summary>自动更正过的槽位缓存多久（避免每帧重扫附近所有槽位）。</summary>
         private const double SlotCacheSeconds = 5.0;
 
         /// <summary>
         /// 金钱字段在 HouseClass 内的偏移。真机三次会话一致（见 docs/05-校准与测试手册）。
         /// 归属校验靠它把"金钱正好在这个偏移上"作为判据 —— 比"块里哪里有这个数"硬得多。
+        /// 定义在 `TechnoOwnership` 里（秒杀的敌我锚定用的是同一条判据），这里只是别名。
         /// </summary>
-        private const uint HouseMoneyOffset = 0x30C;
+        private const uint HouseMoneyOffset = TechnoOwnership.HouseMoneyOffset;
 
         /// <summary>
         /// 找出"真正指向本单位"的选中数组。
@@ -836,7 +1289,8 @@ namespace MoTrainer.Cheats
         /// <summary>
         /// 在对象里找出所有像堆指针的字段，看它们指向的内存里有没有出现当前金钱值。
         ///
-        /// 三个参数都是被真机数据"教"出来的：
+        /// 扫描参数都是被真机数据"教"出来的（详见 `TechnoOwnership.FindHouseFields`，
+        /// 真正的扫描实现在那里 —— 秒杀的敌我锚定用的是同一条判据，不能有两份会走样的拷贝）：
         ///   · **扫描窗口 0x1000**：早先收窄到 0x100 就再也认不出本方单位了 ——
         ///     Owner 那种字段并不在对象开头 0x100 字节内（对照能正常工作的「单位校准」页，
         ///     它扫的是 0x1000）。
@@ -845,30 +1299,14 @@ namespace MoTrainer.Cheats
         ///     改成直接读、失败即跳过。
         ///   · **安静读取**：试探性读取必然大量失败，走普通读取会把日志刷满失败记录，
         ///     把真正的错误原因埋掉。
+        ///
+        /// `maxMatches` 传 1：这里只关心"有没有"，命中第一个立刻收工（保持既有性能特征）。
         /// </summary>
         private bool ObjectReferencesMoney(uint objectAddress, uint money)
         {
-            byte[] head = _target.Memory.ReadBytesQuiet(objectAddress, 0x1000);
-            if (head == null) { return false; }
-
-            int tried = 0;
-            for (int offset = 0; offset + 4 <= head.Length; offset += 4)
-            {
-                uint pointer = HexUtil.ReadUInt32(head, offset);
-                if (pointer < 0x10000 || pointer > 0x7FFFFFFF) { continue; }
-                if (tried++ >= 512) { break; }   // 上限只为兜底：安静读取失败很快（微秒级）
-
-                // 只认**金钱正好出现在 House 的金钱偏移上**。
-                //
-                // 早先的判据是"目标块里随便哪个位置等于金钱值"，真机直接翻车：
-                // 玩家把金钱锁成整数（如 100000）后，这个数字在内存里到处都是，
-                // 于是**敌方单位也被判成"本方"**，进了保护名单并被回满血 ——
-                // 等于给敌人开了无敌。
-                byte[] hit = _target.Memory.ReadBytesQuiet(pointer + HouseMoneyOffset, 4);
-                if (hit == null) { continue; }
-                if (HexUtil.ReadUInt32(hit, 0) == money) { return true; }
-            }
-            return false;
+            int probes;
+            return TechnoOwnership.FindHouseFields(
+                _target.Memory, objectAddress, money, 1, out probes).Count > 0;
         }
 
         /// <summary>只读探测：解析地址并读一次当前值，不写入。</summary>
