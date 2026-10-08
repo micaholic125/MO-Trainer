@@ -93,6 +93,10 @@ namespace MoTrainer.Calibration
         private readonly ProfileStore _store;
         private readonly object _lock = new object();
 
+        /// <summary>"你选中的是哪些单位"的可靠读法（金钱锚定 + 自动更正）——
+        /// 与引擎 / 高级功能页共用同一套实现，见 `SelectionResolver` 的类注释。</summary>
+        private readonly SelectionResolver _selection;
+
         private readonly List<HarvestSample> _samples = new List<HarvestSample>();
         private readonly List<HarvestTracked> _tracked = new List<HarvestTracked>();
         private readonly Dictionary<uint, HarvestTracked> _byAddress = new Dictionary<uint, HarvestTracked>();
@@ -118,6 +122,7 @@ namespace MoTrainer.Calibration
             _target = target;
             _profile = profile == null ? new CalibrationProfile() : profile;
             _store = store;
+            _selection = target == null ? null : new SelectionResolver(target);
         }
 
         public bool IsRunning
@@ -373,28 +378,25 @@ namespace MoTrainer.Calibration
 
         private void ReadSelection(MemoryIO memory, uint moduleBase, HarvestSample sample)
         {
-            if (!_profile.SelectedCount.IsCalibrated) { return; }
+            // **与引擎 / 高级功能页共用同一套"金钱锚定 + 自动更正"的读法**（2026-10-08 起）。
+            //
+            // 之前这里用的是结构探测（SelectionProbe）：它只验证"看起来像对象数组"，
+            // 不验证"是不是你的单位"。真机 10-08 证明那样读出来的"选中对象"根本不是玩家选中的
+            //（历次采集里它们一个字节都没变过、字段里能读出英文单词碎片），
+            // 把整份采集报告的可信度都拖垮了 —— 本次修复的起因就是它。
+            if (_selection == null) { return; }
 
-            uint countAddress;
-            string error;
-            if (!_profile.SelectedCount.TryResolve(memory, moduleBase, out countAddress, out error)) { return; }
-
-            uint count;
-            if (!memory.ReadUInt32(countAddress, out count)) { return; }
-            if (count == 0 || count > SelectionProbe.MaxCount) { return; }
-
-            // 自带一份模块区间：不依赖界面有没有刷过。
-            // 缺了它，探测里"对象头必须是模块内类型表"这条硬校验会被跳过，
-            // 结果就是把模块里的代码地址当成选中对象收进跟踪集合（真机踩过）。
-            SelectionProbe.SetModuleRange(moduleBase, _target.ModuleSize);
-
-            SelectionProbeResult probe = SelectionProbe.ProbeWithEscalation(memory, countAddress, (int)count);
-            if (probe == null || !probe.Found) { return; }
-
-            sample.SelectedCount = probe.ObjectAddresses.Count;
-            for (int i = 0; i < probe.ObjectAddresses.Count; i++)
+            List<uint> objects;
+            string note;
+            if (!_selection.TryReadSelectedObjects(_profile, SelectionProbe.MaxCount, false, out objects, out note))
             {
-                uint address = probe.ObjectAddresses[i];
+                return;
+            }
+
+            sample.SelectedCount = objects.Count;
+            for (int i = 0; i < objects.Count; i++)
+            {
+                uint address = objects[i];
                 sample.Selected.Add(address);
 
                 HarvestTracked tracked;

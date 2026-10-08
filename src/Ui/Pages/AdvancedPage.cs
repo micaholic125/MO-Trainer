@@ -32,6 +32,10 @@ namespace MoTrainer.Ui.Pages
         private readonly CalibrationProfile _profile;
         private readonly ProfileStore _store;
 
+        /// <summary>"你选中的是哪些单位"的可靠读法（金钱锚定 + 自动更正）——
+        /// 与引擎 / 采集器共用同一套实现，见 `SelectionResolver` 的类注释。</summary>
+        private readonly SelectionResolver _selection;
+
         /// <summary>
         /// 游戏主模块的地址区间。用来判断"指针指向的是不是游戏对象"。
         ///
@@ -59,6 +63,7 @@ namespace MoTrainer.Ui.Pages
             _target = target;
             _profile = profile == null ? new CalibrationProfile() : profile;
             _store = store;
+            _selection = target == null ? null : new SelectionResolver(target);
 
             // 把模块区间交给「单位校准」的探测逻辑，让它多一条硬判定：
             // 名单里每一项的头 4 字节必须是模块内的类型标记 —— 这条能把
@@ -420,13 +425,12 @@ namespace MoTrainer.Ui.Pages
 
             int sample = group.Count;
 
-            // 我方样本：当前选中的单位（那两个大兵）
-            List<uint> myObjects = new List<uint>();
-            uint selectedSlot;
-            if (_profile.SelectedList.IsCalibrated
-                && _profile.SelectedList.TryResolve(memory, LiveModuleBase, out selectedSlot, out error))
+            // 我方样本：你当前选中的单位（金钱锚定确认属于我方）
+            string sampleNote;
+            List<uint> myObjects = ReadSelectedObjects(out sampleNote);
+            if (myObjects.Count == 0)
             {
-                myObjects = ReadSelectedObjects(memory, selectedSlot);
+                text.AppendLine("我方样本读取失败：" + sampleNote);
             }
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "我方样本：{0} 个（你选中的单位）", myObjects.Count));
@@ -882,44 +886,36 @@ namespace MoTrainer.Ui.Pages
 
             // 与选中列表交叉验证：这一条是整套逻辑最有力的自证
             text.AppendLine("--- 与「选中列表」交叉验证 ---");
-            uint selectedAddress;
-            if (!_profile.SelectedList.IsCalibrated
-                || !_profile.SelectedList.TryResolve(memory, moduleBase, out selectedAddress, out error))
+            // 用与查找线索**同一套**读取（金钱锚定 + 自动更正）——
+            // 两边读法不同的话，"对不上"到底是谁错都说不清。
+            string selectionNote;
+            List<uint> selected = ReadSelectedObjects(out selectionNote);
+            if (selected.Count == 0)
             {
-                text.AppendLine("选中列表不可用（未校准或解析失败），跳过交叉验证。");
+                text.AppendLine("读不到你选中的单位（" + selectionNote + "）。");
+                text.AppendLine("先在游戏里选中一个自己的单位再扫描，");
+                text.AppendLine("这样就能用「选中的必须出现在全对象数组里」来做交叉验证。");
             }
             else
             {
-                // 用和"查找线索"**同一套健壮读取**（数量可能不在 +0，而是要试多个位置）。
-                // 之前直接按 +0 读，把"指针"当成了"数量"，于是出现"选中的 32 个单位"这种
-                // 离谱数字，交叉验证必然失败 —— 这不是数据错，是读法错。
-                List<uint> selected = ReadSelectedObjects(memory, selectedAddress);
-                if (selected.Count == 0)
-                {
-                    text.AppendLine("当前没有读到选中的单位 —— 先在游戏里选中一个自己的单位再扫描，");
-                    text.AppendLine("这样就能用「选中的必须出现在全对象数组里」来做交叉验证。");
-                }
-                else
-                {
-                    int hit = 0;
-                    int total = selected.Count;
+                int hit = 0;
+                int total = selected.Count;
 
-                    for (int i = 0; i < total; i++)
+                for (int i = 0; i < total; i++)
+                {
+                    uint objectAddress = selected[i];
+
+                    for (int k = 0; k < walk.Objects.Count; k++)
                     {
-                        uint objectAddress = selected[i];
-
-                        for (int k = 0; k < walk.Objects.Count; k++)
-                        {
-                            if (walk.Objects[k].Address == objectAddress) { hit++; break; }
-                        }
+                        if (walk.Objects[k].Address == objectAddress) { hit++; break; }
                     }
-
-                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                        "选中的 {0} 个单位里，有 {1} 个出现在全对象数组中。", total, hit));
-                    text.AppendLine(hit == total && total > 0
-                        ? "**交叉验证通过** —— 两个来源指向同一批对象，数组地址可信。"
-                        : "**交叉验证不通过** —— 选中的单位没有出现在数组里，说明数组地址或数量字段不对。");
                 }
+
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "选中的 {0} 个单位里，有 {1} 个出现在全对象数组中。", total, hit));
+                text.AppendLine(hit == total && total > 0
+                    ? "**交叉验证通过** —— 两个来源指向同一批对象，数组地址可信。"
+                    : "**交叉验证不通过** —— 选中的单位没有出现在数组里，说明数组地址或数量字段不对。");
             }
 
             text.AppendLine();
@@ -978,22 +974,25 @@ namespace MoTrainer.Ui.Pages
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "已知线索：选中名单指针格 0x{0:X8}", slotAddress));
 
-            List<uint> hints = ReadSelectedObjects(memory, slotAddress);
+            // 线索 = **金钱锚定确认属于我方**的选中单位（2026-10-08 起）。
+            // 以前这里用的是"按槽位直读"的弱校验读法，读出来的可能是垃圾 ——
+            // 拿垃圾当线索，"找到的名单"自然也是垃圾（真机三次定位失败都栽在这条链上）。
+            string hintsNote;
+            List<uint> hints = ReadSelectedObjects(out hintsNote);
             if (hints.Count == 0)
             {
-                text.AppendLine("提示：当前没有选中任何单位。仍可查找，但无法确认是否找对 ——");
-                text.AppendLine("建议先在游戏里选中一个自己的单位，再点这个按钮。");
+                text.AppendLine("【没有线索】" + hintsNote);
+                text.AppendLine("「自动查找」要靠你选中的单位去反查名单，没有线索就不找、也绝不保存。");
+                text.AppendLine("请：① 在游戏里选中一个自己的单位（框选 3~5 个更好）；② 确认金钱仍处于已校准状态；然后再点一次。");
+                return text.ToString();
             }
-            else
-            {
-                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "线索单位 {0} 个，第一个是 0x{1:X8}", hints.Count, hints[0]));
-            }
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "线索单位 {0} 个（金钱锚定确认属于我方），第一个是 0x{1:X8}", hints.Count, hints[0]));
             text.AppendLine();
 
             int rejectedCode;
             List<TechnoArrayCandidate> found = TechnoArrayFinder.Find(
-                memory, moduleBase, moduleSize, slotAddress, hints, out rejectedCode);
+                memory, moduleBase, moduleSize, slotAddress, hints, _profile.OffsetTechnoOwner, out rejectedCode);
 
             if (rejectedCode > 0)
             {
@@ -1022,21 +1021,21 @@ namespace MoTrainer.Ui.Pages
 
             TechnoArrayCandidate best = found[0];
 
-            // **没有线索就绝不落盘。**
-            // 真机踩到过：没读到选中单位（线索为空）时，代码照样把"看起来最像"的候选
-            // 存进了配置 —— 而那种排序纯属瞎猜，8 个候选全是垃圾。宁可什么都不存。
-            if (hints.Count == 0)
+            // ---- 硬验收（2026-10-08 起）----
+            //
+            // 真机教训：只要求"含 1 个选中单位"是不够的 —— 三次找到的"名单"都过了那条线，
+            // 却全都经不起换局检验（容器里装的其实是别的东西）。
+            // 现在两条判据必须**同时**满足，才允许保存：
+            //   ① 你选中的单位**全部**出现在名单里；
+            //   ② 「阵营」字段要聚集成群（少数几种取值、每种一大群）。
+            string acceptReason;
+            if (!TechnoArrayFinder.MeetsAcceptance(best, hints.Count, out acceptReason))
             {
-                text.AppendLine("没有读到「你选中的那个单位」，所以**这次不保存**。");
-                text.AppendLine("请确认：① 游戏里确实选中了一个自己的单位；② 选中后没有按过取消选中（Esc 或点空地）。");
-                text.AppendLine("然后再点一次这个按钮。");
-                return text.ToString();
-            }
-
-            if (best.HintHits == 0)
-            {
-                text.AppendLine("注意：没有一个候选包含你选中的单位，**这次结果不可信，不保存**。");
-                text.AppendLine("请确认游戏里确实选中了自己的单位、且处于对局中，然后再点一次。");
+                text.AppendLine("**本次不保存** —— 硬验收没过：");
+                text.AppendLine("  " + acceptReason);
+                text.AppendLine();
+                text.AppendLine("请确认：① 游戏里确实选中了你自己的单位（框选 3~5 个更好）；"
+                    + "② 处于对局中；③ 金钱仍处于已校准状态。然后再点一次这个按钮。");
                 return text.ToString();
             }
 
@@ -1140,20 +1139,13 @@ namespace MoTrainer.Ui.Pages
                 return;
             }
 
-            // ---- 选中的单位（锚点样本）----
-            uint selectedSlot;
-            if (!_profile.SelectedList.IsCalibrated
-                || !_profile.SelectedList.TryResolve(memory, LiveModuleBase, out selectedSlot, out error))
-            {
-                text.AppendLine("【缺前置】选中名单不可用，无法确定「我方」是谁。");
-                SetOutput(text.ToString());
-                return;
-            }
-
-            List<uint> myObjects = ReadSelectedObjects(memory, selectedSlot);
+            // ---- 选中的单位（锚点样本；金钱锚定确认属于我方）----
+            string sampleNote;
+            List<uint> myObjects = ReadSelectedObjects(out sampleNote);
             if (myObjects.Count == 0)
             {
-                text.AppendLine("【缺前置】读不到你选中的单位 —— 请在游戏里选中一个自己的单位再点。");
+                text.AppendLine("【缺前置】读不到你选中的自己的单位 —— " + sampleNote);
+                text.AppendLine("请在游戏里选中一个自己的单位再点这个按钮。");
                 SetOutput(text.ToString());
                 return;
             }
@@ -1535,47 +1527,38 @@ namespace MoTrainer.Ui.Pages
             return found;
         }
 
-        /// <summary>读出当前选中单位的地址列表，作为查找线索。</summary>
-        private List<uint> ReadSelectedObjects(MemoryIO memory, uint slotAddress)
+        /// <summary>
+        /// 读出"你选中的自己的单位"（金钱锚定确认属于我方）。
+        ///
+        /// **与引擎 / 采集器共用同一套"金钱锚定 + 自动更正"的读法**（2026-10-08 起）——
+        /// 在此之前这里是"按配置槽位直读 + 很弱的'看着像对象'校验"，
+        /// 真机 10-08 证明那样读出来的根本不是玩家选中的单位（详见 `SelectionResolver` 的类注释）。
+        /// 失败时把原因带回给调用方显示，并把这一带的原始值打进日志（便于排查）。
+        /// </summary>
+        private List<uint> ReadSelectedObjects(out string note)
         {
-            // 数量字段的位置**绝对不能猜**。
-            //
-            // 真机实测（单位校准页的探测日志）：「距数量字段 −40 字节」，
-            // 也就是数量 = 数组指针 + 0x28 —— 中间还夹着别的字段，
-            // 并不是教科书式的 {指针, 容量, 数量} 紧凑布局。
-            // 之前按 +8 读，读到的是别的字段，结果用户明明选中了单位却报"没有选中任何单位"。
-            //
-            // 现在优先用配置里那个**专门记录数量位置**的定位器（它就是干这个的），
-            // 再退回到几个常见偏移兜底。
-            if (_profile.SelectedCount.IsCalibrated)
+            note = "";
+            if (_selection == null)
             {
-                uint countAddress;
-                string error;
-                uint count;
-                if (_profile.SelectedCount.TryResolve(memory, _target.ModuleBase, out countAddress, out error)
-                    && memory.ReadUInt32(countAddress, out count)
-                    && count > 0 && count <= 64)
+                note = "内部错误：选中读取器未初始化";
+                return new List<uint>();
+            }
+
+            List<uint> objects;
+            if (!_selection.TryReadSelectedObjects(_profile, 16, true, out objects, out note))
+            {
+                Logger.Info("Advanced", "读取选中单位失败：" + note);
+
+                uint dumpSlot;
+                string dumpError;
+                if (_profile.SelectedList.TryResolve(_target.Memory, LiveModuleBase, out dumpSlot, out dumpError))
                 {
-                    List<uint> objects = Collect(memory, slotAddress, count, LiveModuleBase, LiveModuleSize);
-                    if (IsRealObject(memory, objects, _target.ModuleBase, _target.ModuleSize)) { return objects; }
+                    DumpSelectionSlots(_target.Memory, dumpSlot);
                 }
+                return new List<uint>();
             }
-
-            int[] countOffsets = new int[] { 0x28, 8, 0, 4, -4, -8, 0x24, 0x2C };
-            for (int i = 0; i < countOffsets.Length; i++)
-            {
-                uint countSlot = Offset(slotAddress, countOffsets[i]);
-                if (countSlot == 0) { continue; }
-
-                uint count;
-                if (!memory.ReadUInt32(countSlot, out count) || count == 0 || count > 64) { continue; }
-
-                List<uint> objects = Collect(memory, slotAddress, count, LiveModuleBase, LiveModuleSize);
-                if (IsRealObject(memory, objects, _target.ModuleBase, _target.ModuleSize)) { return objects; }
-            }
-
-            DumpSelectionSlots(memory, slotAddress);
-            return new List<uint>();
+            if (note.Length > 0) { Logger.Info("Advanced", "选中列表：" + note); }
+            return objects;
         }
 
         /// <summary>
@@ -1642,32 +1625,6 @@ namespace MoTrainer.Ui.Pages
             }
         }
 
-        /// <summary>从"数组指针格"读 count 个对象地址。</summary>
-        private static List<uint> Collect(MemoryIO memory, uint slotAddress, uint count, uint moduleBase, uint moduleSize)
-        {
-            List<uint> objects = new List<uint>();
-
-            uint arrayAddress;
-            if (!memory.ReadUInt32(slotAddress, out arrayAddress) || arrayAddress < 0x10000) { return objects; }
-
-            for (int k = 0; k < (int)count && objects.Count < 32; k++)
-            {
-                uint objectAddress;
-                if (!memory.ReadUInt32(arrayAddress + (uint)(k * 4), out objectAddress)) { break; }
-                if (objectAddress <= 0x10000) { continue; }
-
-                // 统一换算成"对象本身的地址"：线索要和总名单里的值可比对，
-                // 差一层就会永远比对不上（前面几轮"命中 0"就有这个因素）。
-                uint resolved = ResolveObject(memory, objectAddress, moduleBase, moduleSize);
-                objects.Add(resolved);
-
-                // 两种口径都留一份：名单里的原值、以及再跳一层后的对象地址。
-                // 真机实测：查找阶段能命中、交叉验证却 0 命中 —— 就是这个"差一层"造成的。
-                // 都留着，两种存法都能比对得上。
-                if (resolved != objectAddress) { objects.Add(objectAddress); }
-            }
-            return objects;
-        }
 
         private static uint Offset(uint address, int delta)
         {
@@ -1676,64 +1633,12 @@ namespace MoTrainer.Ui.Pages
             return (uint)value;
         }
 
-        private static bool IsRealObject(MemoryIO memory, List<uint> objects, uint moduleBase, uint moduleSize)
-        {
-            if (objects.Count == 0) { return false; }
-
-            for (int i = 0; i < objects.Count; i++)
-            {
-                if (LooksLikeObject(memory, objects[i], moduleBase, moduleSize)) { return true; }
-            }
-            return false;
-        }
 
         private static bool InModule(uint value, uint moduleBase, uint moduleSize)
         {
             return value >= moduleBase && value < moduleBase + moduleSize;
         }
 
-        /// <summary>
-        /// 判断一个地址是否指向游戏对象：看它开头 4 字节是不是模块内的类型标记。
-        ///
-        /// **不是的话再往里跳一层** —— 真机实测发现有些容器里存的不是"对象本身"，
-        /// 而是**包了一层的指针**。之前只认直接命中，于是明明读到了数组、也读到了数量，
-        /// 却因为"最后一跳"判不通过而报"读不到选中单位"。
-        /// 两种都认，才能同时兼容"直接存对象"和"包一层"两种容器。
-        /// </summary>
-        private static bool LooksLikeObject(MemoryIO memory, uint address, uint moduleBase, uint moduleSize)
-        {
-            uint first;
-            if (!ReadUInt32Retry(memory, address, out first)) { return false; }
-            if (InModule(first, moduleBase, moduleSize)) { return true; }
-
-            if (first >= 0x10000 && first <= 0x7FFFFFFF)
-            {
-                uint second;
-                if (ReadUInt32Retry(memory, first, out second) && InModule(second, moduleBase, moduleSize))
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        /// <summary>把"数组里的一项"换算成**对象本身的地址**（兼容包一层的情况）。</summary>
-        private static uint ResolveObject(MemoryIO memory, uint address, uint moduleBase, uint moduleSize)
-        {
-            uint first;
-            if (!ReadUInt32Retry(memory, address, out first)) { return address; }
-            if (InModule(first, moduleBase, moduleSize)) { return address; }
-
-            if (first >= 0x10000 && first <= 0x7FFFFFFF)
-            {
-                uint second;
-                if (ReadUInt32Retry(memory, first, out second) && InModule(second, moduleBase, moduleSize))
-                {
-                    return first;
-                }
-            }
-            return address;
-        }
 
         /// <summary>
         /// 读 4 字节，失败先重试几次再判负。

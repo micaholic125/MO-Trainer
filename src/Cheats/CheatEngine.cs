@@ -32,6 +32,10 @@ namespace MoTrainer.Cheats
         private readonly TrainerSettings _settings;
         private readonly List<CheatFeature> _features = new List<CheatFeature>();
 
+        /// <summary>"你选中的是哪些单位"的可靠读法（金钱锚定 + 自动更正）。
+        /// 2026-10-08 起提取为共享件，引擎 / 高级功能页 / 采集器用同一套 —— 见 SelectionResolver 的类注释。</summary>
+        private readonly SelectionResolver _selection;
+
         /// <summary>当前绑定的校准配置。无敌功能额外需要它里面的选中列表与血量偏移。</summary>
         private CalibrationProfile _profile;
 
@@ -50,6 +54,7 @@ namespace MoTrainer.Cheats
 
             _target = target;
             _settings = settings;
+            _selection = new SelectionResolver(target);
         }
 
         public IList<CheatFeature> Features { get { return _features; } }
@@ -275,34 +280,12 @@ namespace MoTrainer.Cheats
 
         // ============================================================ 选中单位无敌
 
-        /// <summary>解析"选中数量"与"选中列表数组指针存放位置"两个地址。</summary>
-        private bool ResolveSelectionAddresses(out uint countAddress, out uint slotAddress)
-        {
-            countAddress = 0;
-            slotAddress = 0;
-            if (_profile == null) { return false; }
-
-            string error;
-            if (!_profile.SelectedCount.TryResolve(
-                _target.Memory, _target.ModuleBase, out countAddress, out error))
-            {
-                return false;
-            }
-            if (!_profile.SelectedList.TryResolve(
-                _target.Memory, _target.ModuleBase, out slotAddress, out error))
-            {
-                countAddress = 0;
-                return false;
-            }
-            return true;
-        }
-
         /// <summary>关闭状态下的只读探测：把"当前选中了几个"显示到界面上。</summary>
         private void PeekSelection(CheatFeature feature)
         {
             uint countAddress;
             uint slotAddress;
-            if (!ResolveSelectionAddresses(out countAddress, out slotAddress))
+            if (!_selection.TryResolveAddresses(_profile, out countAddress, out slotAddress))
             {
                 feature.Address = 0;
                 feature.LastError = "地址解析失败";
@@ -338,7 +321,7 @@ namespace MoTrainer.Cheats
 
             uint countAddress;
             uint slotAddress;
-            if (!ResolveSelectionAddresses(out countAddress, out slotAddress))
+            if (!_selection.TryResolveAddresses(_profile, out countAddress, out slotAddress))
             {
                 feature.Address = 0;
                 feature.LastError = "地址解析失败";
@@ -373,10 +356,10 @@ namespace MoTrainer.Cheats
             }
 
             // 选中列表数组：不再无条件相信落盘的槽位，而是"认对象"自己挑。
-            // 见 ResolveSelectionArray 的注释 —— 配置里的槽位已被真机数据证明是错的。
+            // 见 SelectionResolver.ResolveArray 的注释 —— 配置里的槽位已被真机数据证明是错的。
             uint arrayAddress;
             string slotNote;
-            if (!ResolveSelectionArray(countAddress, slotAddress, count, out arrayAddress, out slotNote))
+            if (!_selection.ResolveArray(_profile, countAddress, slotAddress, count, out arrayAddress, out slotNote))
             {
                 feature.Address = 0;
                 feature.LastError = "选中列表定位有误 —— " + slotNote;
@@ -411,7 +394,7 @@ namespace MoTrainer.Cheats
                     uint selectedObject;
                     if (!_target.Memory.ReadUInt32(arrayAddress + (uint)(i * 4), out selectedObject)) { break; }
                     if (selectedObject < 0x10000) { continue; }
-                    if (!IsOwnedObject(selectedObject)) { continue; }
+                    if (!_selection.IsOwnedObject(_profile, selectedObject)) { continue; }
 
                     uint healthAddress = selectedObject + _profile.OffsetTechnoHealth;
                     uint healthNow;
@@ -450,7 +433,7 @@ namespace MoTrainer.Cheats
                 // 若数组找错，就会往完全无关的对象 +0x6C 处写值 —— 那是纯粹的破坏。
                 // 判据：对象里有没有指针指向"持有你金钱的那个对象"（全局只有 House 持有金钱），
                 // 不依赖任何硬编码偏移。
-                if (!IsOwnedObject(objectAddress))
+                if (!_selection.IsOwnedObject(_profile, objectAddress))
                 {
                     // 归属校验不通过 → 从保护名单里剔除。
                     // 必须剔除而不是"跳过这一拍"：否则一个误判进来的敌方单位会一直留在名单里，
@@ -557,7 +540,7 @@ namespace MoTrainer.Cheats
             {
                 _lastInvincibleWriteLog = DateTime.UtcNow;
                 uint nowMoney;
-                bool ownershipOk = TryReadMoney(out nowMoney);
+                bool ownershipOk = _selection.TryReadMoney(_profile, out nowMoney);
 
                 Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
                     "选中单位无敌：选中 {0}｜数组 0x{1:X8}｜本次写入 {2} 跳过 {3} 非本方 {4}｜累计写入 {5}"
@@ -791,30 +774,13 @@ namespace MoTrainer.Cheats
         /// </summary>
         private List<uint> ReadSelectedObjectList()
         {
-            List<uint> result = new List<uint>();
-
-            uint countAddress;
-            uint slotAddress;
-            if (!ResolveSelectionAddresses(out countAddress, out slotAddress)) { return result; }
-
-            uint count;
-            if (!_target.Memory.ReadUInt32(countAddress, out count) || count == 0) { return result; }
-            if (count > SelectionProbe.MaxCount) { return result; }
-
-            uint arrayAddress;
+            // 共享件读取（金钱锚定 + 自动更正）—— 与「高级功能」页 / 采集器同一套实现。
+            List<uint> result;
             string note;
-            if (!ResolveSelectionArray(countAddress, slotAddress, count, out arrayAddress, out note))
+            if (!_selection.TryReadSelectedObjects(
+                    _profile, TechnoOwnership.MaxAnchorSamples, false, out result, out note))
             {
-                return result;
-            }
-
-            int limit = count < (uint)TechnoOwnership.MaxAnchorSamples
-                ? (int)count : TechnoOwnership.MaxAnchorSamples;
-            for (int i = 0; i < limit; i++)
-            {
-                uint objectAddress;
-                if (!_target.Memory.ReadUInt32(arrayAddress + (uint)(i * 4), out objectAddress)) { break; }
-                if (objectAddress >= 0x10000) { result.Add(objectAddress); }
+                return new List<uint>();
             }
             return result;
         }
@@ -834,7 +800,7 @@ namespace MoTrainer.Cheats
             if (haveAnchor && !stale) { return true; }
 
             uint money;
-            if (!TryReadMoney(out money))
+            if (!_selection.TryReadMoney(_profile, out money))
             {
                 if (haveAnchor)
                 {
@@ -959,18 +925,12 @@ namespace MoTrainer.Cheats
 
         // ============================================================ 归属校验
 
-        private readonly Dictionary<uint, bool> _ownedCache = new Dictionary<uint, bool>();
-        private DateTime _ownedCacheStamp = DateTime.MinValue;
-
         /// <summary>
         /// 单位对象 → 见过的最高血量（也就是它的满血值）。
         /// 无敌的锁定值取这个，而不是配置里那个"某个单位的满血值" —— 见 ApplySelectedInvincible。
         /// </summary>
         private readonly Dictionary<uint, uint> _healthPeak = new Dictionary<uint, uint>();
 
-        private uint _resolvedSlot;
-        private uint _lastCorrectedSlot;
-        private DateTime _resolvedSlotStamp = DateTime.MinValue;
         /// <summary>
         /// 上一次记下的无敌结论。初值故意不是空串 ——
         /// 否则"第一次成功"会被当成"没变化"而不记日志（上一版就吃了这个亏：
@@ -979,7 +939,6 @@ namespace MoTrainer.Cheats
         private string _lastInvincibleNote = "(未开始)";
 
         private DateTime _lastInvincibleWriteLog = DateTime.MinValue;
-        private bool _ownershipWarned;
         private DateTime _lastInvincibleTick = DateTime.MinValue;
 
         // ---------------- 秒杀敌人（S6-1）的运行时状态 ----------------
@@ -1030,7 +989,7 @@ namespace MoTrainer.Cheats
         /// </summary>
         private void OnTargetReadyAgain()
         {
-            bool hadState = _myOwner != 0 || _healthPeak.Count > 0 || _ownedCache.Count > 0;
+            bool hadState = _myOwner != 0 || _healthPeak.Count > 0;
             _myOwner = 0;
             _myOwnerOffset = 0;
             _ownerAnchorSamples = 0;
@@ -1039,17 +998,13 @@ namespace MoTrainer.Cheats
             _lastKillVerify = DateTime.MinValue;
             _lastKillRun = DateTime.MinValue;
             _healthPeak.Clear();
-            _ownedCache.Clear();
-            _resolvedSlot = 0;
+            _selection.Reset();
 
             if (hadState)
             {
                 Logger.Info("Engine", "游戏（重新）连接：已作废上一局的会话级缓存（保护名单 / 我方锚点），避免拿旧地址误写");
             }
         }
-
-        /// <summary>自动更正过的槽位缓存多久（避免每帧重扫附近所有槽位）。</summary>
-        private const double SlotCacheSeconds = 5.0;
 
         /// <summary>
         /// 金钱字段在 HouseClass 内的偏移。真机三次会话一致（见 docs/05-校准与测试手册）。
@@ -1058,103 +1013,8 @@ namespace MoTrainer.Cheats
         /// </summary>
         private const uint HouseMoneyOffset = TechnoOwnership.HouseMoneyOffset;
 
-        /// <summary>
-        /// 找出"真正指向本单位"的选中数组。
-        ///
-        /// 为什么不能直接用落盘的槽位：真机数据已经两次打脸 ——
-        /// 配置里的槽位（数量字段 − 8）**根本不在**探测器找到的合格槽位里
-        /// （实测合格的是 `数量字段 − 0x0C`，符合 `VectorClass{Items, Capacity, IsInitialized, Count}`）。
-        /// 与其第三次押注某个字节位置，不如让它自己认：
-        /// **谁指向的对象里有本方单位，谁才是选中列表。**
-        ///
-        /// 顺序：配置槽位 → 上次自动更正过的槽位（缓存 5 秒）→ 数量字段 ±0x40 内逐个试。
-        /// </summary>
-        private bool ResolveSelectionArray(
-            uint countAddress, uint slotAddress, uint count, out uint arrayAddress, out string note)
-        {
-            arrayAddress = 0;
-            note = "";
 
-            uint configured;
-            bool configuredValid = _target.Memory.ReadUInt32(slotAddress, out configured) && configured >= 0x10000;
-
-            // 归属判据不可用时（金钱没校准）不做自动更正，避免误判成"全都不是本单位"
-            if (!OwnershipCheckAvailable())
-            {
-                if (!configuredValid) { return false; }
-                arrayAddress = configured;
-                return true;
-            }
-
-            int ignored;
-            if (configuredValid && ArrayHasOwnedObject(configured, count, out ignored))
-            {
-                arrayAddress = configured;
-                _resolvedSlot = slotAddress;
-                _resolvedSlotStamp = DateTime.UtcNow;
-                return true;
-            }
-
-            if (_resolvedSlot != 0
-                && (DateTime.UtcNow - _resolvedSlotStamp).TotalSeconds < SlotCacheSeconds)
-            {
-                uint cached;
-                if (_target.Memory.ReadUInt32(_resolvedSlot, out cached) && cached >= 0x10000
-                    && ArrayHasOwnedObject(cached, count, out ignored))
-                {
-                    arrayAddress = cached;
-                    return true;
-                }
-            }
-
-            uint start = countAddress > 0x40 ? countAddress - 0x40 : 0;
-            uint end = countAddress + 0x40;
-            int triedSlots = 0;
-            int examined = 0;
-            for (uint slot = start; slot <= end; slot += 4)
-            {
-                if (slot == slotAddress) { continue; }
-
-                uint candidate;
-                if (!_target.Memory.ReadUInt32(slot, out candidate)) { continue; }
-                if (candidate < 0x10000) { continue; }
-                triedSlots++;
-
-                int count2;
-                if (!ArrayHasOwnedObject(candidate, count, out count2)) { examined += count2; continue; }
-                examined += count2;
-
-                arrayAddress = candidate;
-                _resolvedSlot = slot;
-                _resolvedSlotStamp = DateTime.UtcNow;
-
-                // 只在**槽位真的变了**时报一次。
-                // 否则会和"写入成功"那条日志来回改结论，导致每 5 秒重复刷一遍同样的话。
-                if (slot != _lastCorrectedSlot)
-                {
-                    _lastCorrectedSlot = slot;
-                    note = string.Format(CultureInfo.InvariantCulture,
-                        "选中列表槽位自动更正：0x{0:X8} → 0x{1:X8}（配置里的槽位指向的不是本方单位，已按归属自动改用正确的那个）",
-                        slotAddress, slot);
-                }
-                return true;
-            }
-
-            // 失败时必须说清"试了多少、都没有" —— 否则日志里只剩一句"没找到"，照样得靠猜。
-            note = string.Format(CultureInfo.InvariantCulture,
-                "配置槽位 0x{0:X8}{1}；选中数量读到 {2}；数量字段 0x{3:X8} ±0x40 内试了 {4} 个候选数组、共检查 {5} 个对象，没有一个归属本方",
-                slotAddress, configuredValid ? "" : "（指针无效）", count, countAddress, triedSlots, examined);
-            return false;
-        }
-
-        /// <summary>
-        /// 数组里有没有本方单位。
-        ///
-        /// **只查第一个元素**：选中列表的第一项必然是本方单位。
-        /// 每个"对象"的归属校验最多要试几百条指针，而自动更正要在 ±0x40 内试三十几个槽位 ——
-        /// 挨个查 8 个元素会让首次探测卡住近一秒。查第一个既准又快。
-        /// examined 回报实际检查了几个对象，用于失败时给出可追查的数字。
-        /// </summary>
+        /// <summary>列表里有没有这个地址（无敌的保护名单去重用）。</summary>
         private static bool ContainsAddress(List<uint> list, uint value)
         {
             for (int i = 0; i < list.Count; i++)
@@ -1162,63 +1022,6 @@ namespace MoTrainer.Cheats
                 if (list[i] == value) { return true; }
             }
             return false;
-        }
-
-        private bool ArrayHasOwnedObject(uint arrayAddress, uint count, out int examined)
-        {
-            examined = 0;
-            if (count == 0) { return false; }
-
-            // 查前几个而不是只看第一个：真机日志里同一次会话内这条判定**两次结果不同**
-            // （自动更正被触发了两次），说明数组的第 0 项并不可靠
-            // （可能混着"当前操作目标"这类非单位引用）。
-            int limit = count < 4 ? (int)count : 4;
-            for (int i = 0; i < limit; i++)
-            {
-                // 安静读取：候选数组地址可能是野指针，普通读取会往日志里刷失败记录
-                byte[] raw = _target.Memory.ReadBytesQuiet(arrayAddress + (uint)(i * 4), 4);
-                if (raw == null) { return false; }
-                uint objectAddress = HexUtil.ReadUInt32(raw, 0);
-                if (objectAddress < 0x10000) { continue; }
-
-                examined++;
-                if (IsOwnedObject(objectAddress)) { return true; }
-            }
-            return false;
-        }
-
-        /// <summary>归属判据是否可用（金钱已校准且能读到）。</summary>
-        private bool OwnershipCheckAvailable()
-        {
-            uint money;
-            return TryReadMoney(out money);
-        }
-
-        /// <summary>读当前金钱值（归属校验的唯一外部依据）。读不到就说明判据不可用。</summary>
-        private bool TryReadMoney(out uint money)
-        {
-            money = 0;
-            if (_profile == null || !_profile.Money.IsCalibrated) { return false; }
-
-            uint moneyAddress;
-            string error;
-            if (!_profile.Money.TryResolve(
-                _target.Memory, _target.ModuleBase, out moneyAddress, out error)) { return false; }
-
-            return _target.Memory.ReadUInt32(moneyAddress, out money) && money != 0;
-        }
-
-        /// <summary>
-        /// 归属判据不可用时记一行（去重）。
-        /// 必须留下痕迹：否则"无敌不生效"会变成又一场悬案 ——
-        /// 上一轮 B1 被误保护，根因就是这个兜底悄悄放行了所有单位，而日志里毫无线索。
-        /// </summary>
-        private void LogOwnershipUnavailable()
-        {
-            if (_ownershipWarned) { return; }
-            _ownershipWarned = true;
-            Logger.Warn("Engine", "选中单位无敌：归属校验不可用（金钱字段读不到），"
-                + "为避免误伤已暂停对本方单位的判定 —— 请确认金钱仍处于已校准状态");
         }
 
         /// <summary>
@@ -1242,71 +1045,6 @@ namespace MoTrainer.Cheats
             {
                 Logger.Warn("Engine", "选中单位无敌：" + note);
             }
-        }
-
-        /// <summary>归属校验结果的缓存有效期：太短会卡帧，太长则新造出来的单位要等一会儿才生效。</summary>
-        private const double OwnedCacheSeconds = 3.0;
-
-        /// <summary>
-        /// 对象是否归属本方。判据：对象里有没有指针指向"持有你金钱的那个对象"。
-        ///
-        /// 单位对象必然带一个 Owner 指针指向自己的 HouseClass，而全局只有 House 持有金钱 ——
-        /// 所以"在对象里找到一条指针，它指向的内存里出现了当前金钱值"就等价于"这个对象属于你"。
-        /// 全程不硬编码 OffsetTechnoOwner（那个值我们其实还没校准）。
-        ///
-        /// 结果带缓存：每个对象要读几十次小内存，30Hz 下不可能每帧重算。
-        /// 拿不到判据时（金钱未校准等）返回 true，即"不拦" —— 不能因为判不了就不干活。
-        /// </summary>
-        private bool IsOwnedObject(uint objectAddress)
-        {
-            uint money;
-            if (!TryReadMoney(out money))
-            {
-                // 判不了就**不认**（fail-closed）。
-                //
-                // 这里早期是 `return true`，理由是"不能因为判不了就不干活" ——
-                // 真机证明这个默认值很危险：判据一旦不可用，**所有单位（含敌方）都会被认成本方**，
-                // 于是敌方单位被记进保护名单并回血（用户实测 B1 也变成了无敌）。
-                // 宁可"无敌暂时不生效但绝不误伤"，也不要"看起来能用却给敌人加血"。
-                LogOwnershipUnavailable();
-                return false;
-            }
-
-            if ((DateTime.UtcNow - _ownedCacheStamp).TotalSeconds > OwnedCacheSeconds)
-            {
-                _ownedCache.Clear();
-                _ownedCacheStamp = DateTime.UtcNow;
-            }
-
-            bool owned;
-            if (_ownedCache.TryGetValue(objectAddress, out owned)) { return owned; }
-
-            owned = ObjectReferencesMoney(objectAddress, money);
-            _ownedCache[objectAddress] = owned;
-            return owned;
-        }
-
-        /// <summary>
-        /// 在对象里找出所有像堆指针的字段，看它们指向的内存里有没有出现当前金钱值。
-        ///
-        /// 扫描参数都是被真机数据"教"出来的（详见 `TechnoOwnership.FindHouseFields`，
-        /// 真正的扫描实现在那里 —— 秒杀的敌我锚定用的是同一条判据，不能有两份会走样的拷贝）：
-        ///   · **扫描窗口 0x1000**：早先收窄到 0x100 就再也认不出本方单位了 ——
-        ///     Owner 那种字段并不在对象开头 0x100 字节内（对照能正常工作的「单位校准」页，
-        ///     它扫的是 0x1000）。
-        ///   · **不做 Describe 预检**：试过"先问这块可读吗再读"，结果把好指针也滤掉了
-        ///     （Describe 的粒度覆盖不住堆内的细碎分配），垃圾指针反倒放行。
-        ///     改成直接读、失败即跳过。
-        ///   · **安静读取**：试探性读取必然大量失败，走普通读取会把日志刷满失败记录，
-        ///     把真正的错误原因埋掉。
-        ///
-        /// `maxMatches` 传 1：这里只关心"有没有"，命中第一个立刻收工（保持既有性能特征）。
-        /// </summary>
-        private bool ObjectReferencesMoney(uint objectAddress, uint money)
-        {
-            int probes;
-            return TechnoOwnership.FindHouseFields(
-                _target.Memory, objectAddress, money, 1, out probes).Count > 0;
         }
 
         /// <summary>只读探测：解析地址并读一次当前值，不写入。</summary>

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using MoTrainer.Core;
 
 namespace MoTrainer.Cheats
@@ -25,11 +26,22 @@ namespace MoTrainer.Cheats
         /// <summary>你选中的单位在这个名单里出现了几次。**大于 0 才说明找对了。**</summary>
         public int HintHits;
 
+        /// <summary>算"阵营分布"用的字段偏移（0 = 未提供，未算）。</summary>
+        public uint OwnerOffset;
+
+        /// <summary>「阵营」字段有多少种互不相同的取值（0 = 没算）。正常名单应"少数几种"。</summary>
+        public int OwnerDistinct;
+
+        /// <summary>最大的一个「阵营」有多少个对象。正常名单应"一大群"。</summary>
+        public int OwnerLargest;
+
         public string Describe()
         {
             return string.Format(
-                "名单指针格 0x{0:X8}｜数组 0x{1:X8}｜数量 {2}（字段 0x{3:X8}）｜有效对象 {4}｜命中选中单位 {5}",
-                SlotAddress, ArrayAddress, Count, CountAddress, ValidObjects, HintHits);
+                "名单指针格 0x{0:X8}｜数组 0x{1:X8}｜数量 {2}（字段 0x{3:X8}）｜有效对象 {4}｜命中选中单位 {5}"
+                + (OwnerOffset != 0 ? "｜阵营 {6} 种/最大 {7} 个" : ""),
+                SlotAddress, ArrayAddress, Count, CountAddress, ValidObjects, HintHits,
+                OwnerDistinct, OwnerLargest);
         }
     }
 
@@ -76,15 +88,77 @@ namespace MoTrainer.Cheats
         /// <summary>返回的候选上限。</summary>
         public const int MaxCandidates = 8;
 
+        /// <summary>「阵营」取值种类超过这个数就不像一份真名单（真机实测：假名单散成几千种）。</summary>
+        public const int MaxOwnerDistinct = 64;
+
+        /// <summary>
+        /// 这份候选的「阵营」分布像不像一份真名单：**少数几种取值、每种一大群**。
+        /// 判据取"平均每种取值至少 2 个对象"（`有效对象数 ≥ 种类数 × 2`）——
+        /// 真机数据两边的差距是数量级的：真名单 4096 个对象只分 8 种（平均 512），
+        /// 假名单 4076 个对象散了 4072 种（平均 1.0）。
+        /// </summary>
+        public static bool Clusters(TechnoArrayCandidate candidate)
+        {
+            if (candidate == null || candidate.OwnerOffset == 0) { return false; }
+            if (candidate.OwnerDistinct < 2 || candidate.OwnerDistinct > MaxOwnerDistinct) { return false; }
+            return candidate.ValidObjects >= candidate.OwnerDistinct * 2;
+        }
+
+        /// <summary>
+        /// 「自动查找」保存前的**硬验收**（2026-10-08 起）：两条判据必须同时满足。
+        ///
+        /// 为什么必须加：在此之前只要求"名单里含 1 个你选中的单位"就保存 ——
+        /// 三次找到的"名单"都过了那条线，却全都经不起换局检验
+        /// （容器里装的其实是别的东西：数据散成几千种"阵营"、字段里能读出英文单词碎片）。
+        /// 现在改成：① 你选中的单位**全部**出现在名单里；② 「阵营」分布必须聚集成群。
+        /// 不满足就**不保存**并说明原因（fail-closed）。
+        /// </summary>
+        public static bool MeetsAcceptance(TechnoArrayCandidate candidate, int hintCount, out string reason)
+        {
+            reason = "";
+            if (candidate == null) { reason = "没有候选名单"; return false; }
+            if (hintCount <= 0)
+            {
+                reason = "没有可用的线索单位（先在游戏里选中自己的单位）";
+                return false;
+            }
+            if (candidate.HintHits < hintCount)
+            {
+                reason = string.Format(CultureInfo.InvariantCulture,
+                    "名单里只找到 {0}/{1} 个你选中的单位 —— 必须全部找到才算数",
+                    candidate.HintHits, hintCount);
+                return false;
+            }
+            if (candidate.OwnerOffset != 0)
+            {
+                if (candidate.OwnerDistinct < 2 || candidate.OwnerDistinct > MaxOwnerDistinct)
+                {
+                    reason = string.Format(CultureInfo.InvariantCulture,
+                        "「阵营」字段有 {0} 种取值 —— 正常的名单应聚成少数几种（≤{1} 种）",
+                        candidate.OwnerDistinct, MaxOwnerDistinct);
+                    return false;
+                }
+                if (candidate.ValidObjects < candidate.OwnerDistinct * 2)
+                {
+                    reason = string.Format(CultureInfo.InvariantCulture,
+                        "「阵营」分布太散（{0} 种取值只对应 {1} 个对象）—— 正常的名单应是\"每种一大群\"",
+                        candidate.OwnerDistinct, candidate.ValidObjects);
+                    return false;
+                }
+            }
+            return true;
+        }
+
         /// <summary>
         /// 查找总名单。
         /// `nearAddress` 是已知的选中名单容器地址（那个"指针格"）；
-        /// `hints` 是当前选中单位的地址（可以为空，但为空时无法确认找对了）。
+        /// `hints` 是当前选中单位的地址（**必须非空** —— 为空时无法确认找对了）。
+        /// `ownerOffset` 是算「阵营分布」用的字段偏移（0 表示不算，跳过那两条验收判据）。
         /// `rejectedByCode` 返回"因落在可执行页 / 只读区而被排除的格子数"（2026-10-07 加固，供日志留证）。
         /// </summary>
         public static List<TechnoArrayCandidate> Find(
             MemoryIO memory, uint moduleBase, uint moduleSize, uint nearAddress, IList<uint> hints,
-            out int rejectedByCode)
+            uint ownerOffset, out int rejectedByCode)
         {
             rejectedByCode = 0;
             List<TechnoArrayCandidate> found = new List<TechnoArrayCandidate>();
@@ -122,15 +196,26 @@ namespace MoTrainer.Cheats
 
                 if (!seenArrays.Add(arrayAddress)) { continue; }
 
-                TechnoArrayCandidate candidate = Inspect(memory, slotAddress, arrayAddress, moduleBase, moduleSize, hints);
+                TechnoArrayCandidate candidate = Inspect(
+                    memory, slotAddress, arrayAddress, moduleBase, moduleSize, hints, ownerOffset);
                 if (candidate != null) { found.Add(candidate); }
             }
 
-            // 排序：先看"含不含你选中的单位"，再看有效对象数量。
-            // 总名单在这两项上都应该是全场最大的。
+            // 排序：先看"含不含你选中的单位"，再看"阵营分布像不像真名单"，
+            // 最后才比对象数量。
+            //
+            // 2026-10-08 加入第二档：真机出现过"两张候选都含选中单位"的情况 ——
+            // 一张是真名单（阵营聚集成群），另一张是塞了几千个杂物的假容器（阵营散成一片），
+            // 而假的那张"有效对象数"还更多，旧排序会把它排在前面。
             found.Sort(delegate(TechnoArrayCandidate a, TechnoArrayCandidate b)
             {
                 if (a.HintHits != b.HintHits) { return b.HintHits.CompareTo(a.HintHits); }
+
+                bool ca = Clusters(a);
+                bool cb = Clusters(b);
+                if (ca != cb) { return ca ? -1 : 1; }
+
+                if (a.OwnerLargest != b.OwnerLargest) { return b.OwnerLargest.CompareTo(a.OwnerLargest); }
                 return b.ValidObjects.CompareTo(a.ValidObjects);
             });
 
@@ -165,10 +250,10 @@ namespace MoTrainer.Cheats
             return false;
         }
 
-        /// <summary>检查一个候选数组：元素是不是真实对象、数量字段在哪、含不含选中的单位。</summary>
+        /// <summary>检查一个候选数组：元素是不是真实对象、数量字段在哪、含不含选中的单位、阵营分布像不像真名单。</summary>
         private static TechnoArrayCandidate Inspect(
             MemoryIO memory, uint slotAddress, uint arrayAddress,
-            uint moduleBase, uint moduleSize, IList<uint> hints)
+            uint moduleBase, uint moduleSize, IList<uint> hints, uint ownerOffset)
         {
             byte[] block = memory.ReadBytesQuiet(arrayAddress, MaxEntries * 4);
             if (block == null || block.Length < 8) { return null; }
@@ -215,6 +300,29 @@ namespace MoTrainer.Cheats
             candidate.ValidObjects = valid;
             candidate.HintHits = hits;
             candidate.Count = (uint)valid;
+
+            // 「阵营分布」统计（2026-10-08）：数一数"阵营"字段有多少种取值、最大的一种有多少个。
+            // 真名单是"少数几种、每种一大群"；假容器会散成几千种、每种一两个。
+            candidate.OwnerOffset = ownerOffset;
+            if (ownerOffset != 0)
+            {
+                Dictionary<uint, int> ownerCounts = new Dictionary<uint, int>();
+                for (int k = 0; k < valid; k++)
+                {
+                    uint owner;
+                    if (!memory.ReadUInt32(ReadUInt32(block, k * 4) + ownerOffset, out owner)) { continue; }
+                    if (owner == 0) { continue; }   // 读不到 / 没阵营的不计入（与遍历器的统计口径一致）
+
+                    int existing;
+                    ownerCounts[owner] = ownerCounts.TryGetValue(owner, out existing) ? existing + 1 : 1;
+                }
+
+                candidate.OwnerDistinct = ownerCounts.Count;
+                foreach (KeyValuePair<uint, int> pair in ownerCounts)
+                {
+                    if (pair.Value > candidate.OwnerLargest) { candidate.OwnerLargest = pair.Value; }
+                }
+            }
 
             // 数量字段：这类容器是 {指针, 容量, 数量}，所以数量通常是指针格 +8；
             // 不同引擎版本偶尔是 -4，两个都试，取合理的那个。

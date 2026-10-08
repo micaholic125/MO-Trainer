@@ -108,6 +108,9 @@ namespace MoTrainer.Diagnostics
             CheckTechnoWalker();
             CheckTechnoWalkerPartialRead();
             CheckTechnoArrayFinder();
+            // 选中读取的共享件（2026-10-08）："你选中的是哪些单位"必须走金钱锚定 + 自动更正，
+            // 它是「自动查找」的线索来源 —— 线索错了，找到的名单必然是错的（真机三次定位全败的根因）。
+            CheckSelectionResolver();
             CheckTechnoOps();
             // 引擎层的端到端接线回归（2026-10-07 [S6-1]）：名单从哪来、我方是谁、
             // 什么时候必须拒绝 —— 这些参数链路的风险只有到引擎层才测得到。
@@ -2681,7 +2684,8 @@ namespace MoTrainer.Diagnostics
 
                 int rejectedFirst;
                 List<TechnoArrayCandidate> found = TechnoArrayFinder.Find(
-                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints, out rejectedFirst);
+                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints,
+                    TechnoScene.OwnerOffset, out rejectedFirst);
 
                 Check("自动查找总名单：含选中单位的那张排第一，有效对象数也对",
                     found.Count > 0 && found[0].ArrayAddress == arrayTotal
@@ -2696,6 +2700,60 @@ namespace MoTrainer.Diagnostics
                 Check("自动查找总名单：不会把「选中名单自己」当成总名单",
                     excludesSelf && found.Count >= 2,
                     string.Format(CultureInfo.InvariantCulture, "{0} 个候选", found.Count));
+
+                // ---- 2026-10-08 新增：混进一张"阵营散成一片"的假名单 ----
+                //
+                // 真机教训：假容器不只会出现（"阵营"散成几千种），而且它的"有效对象数"
+                // 可能比真名单**还多** —— 旧排序（只看对象数）会把它排到第一。
+                // 这里造同款假名单：7 个对象各属一个不同的"阵营"（只有 Team[0] 是真线索）。
+                // 断言：① 排序仍把真名单排第一；② 硬验收必须拦住它；③ 好消息不能被误伤。
+                uint junkArray = scene.Arrays + 0x5800;
+                uint slotJunk = scene.Arrays + 0x5400;
+                uint[] junkObjects = new uint[6];
+                for (int i = 0; i < junkObjects.Length; i++)
+                {
+                    junkObjects[i] = scene.Heap + 0x2000 + (uint)(i * 0x100);
+                    io.WriteUInt32(junkObjects[i], scene.ModuleBase + 0x2000);   // 像真对象：共用类型表
+                    io.WriteUInt32(junkObjects[i] + TechnoScene.OwnerOffset, 0x50000000u + (uint)i);
+                    io.WriteUInt32(junkObjects[i] + TechnoScene.HealthOffset, 100);
+                }
+                scene.WriteArray(junkArray, new uint[]
+                {
+                    scene.Team[0], junkObjects[0], junkObjects[1],
+                    junkObjects[2], junkObjects[3], junkObjects[4], junkObjects[5]
+                });
+                io.WriteUInt32(slotJunk, junkArray);
+
+                int rejectedJunk;
+                List<TechnoArrayCandidate> ranked = TechnoArrayFinder.Find(
+                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints,
+                    TechnoScene.OwnerOffset, out rejectedJunk);
+
+                Check("自动查找：混入「阵营散成一片」的假名单时，聚集成群的真名单仍排第一",
+                    ranked.Count > 0 && ranked[0].ArrayAddress == arrayTotal,
+                    ranked.Count > 0 ? ranked[0].Describe() : "一个候选都没有");
+
+                TechnoArrayCandidate junk = null;
+                for (int i = 0; i < ranked.Count; i++)
+                {
+                    if (ranked[i].ArrayAddress == junkArray) { junk = ranked[i]; }
+                }
+                string junkReason = "";
+                Check("自动查找：硬验收拦住「阵营散成一片」的候选",
+                    junk != null && !TechnoArrayFinder.MeetsAcceptance(junk, 1, out junkReason)
+                        && junkReason.Length > 0,
+                    junk == null ? "假候选没进前 8 名" : junkReason);
+
+                string goodReason;
+                Check("自动查找：正常名单通过硬验收（没把好数据也挡了）",
+                    TechnoArrayFinder.MeetsAcceptance(ranked[0], 1, out goodReason),
+                    goodReason.Length == 0 ? "通过" : goodReason);
+
+                string missingReason;
+                Check("自动查找：验收要求「选中的单位必须全部找到」（只找到一半也不行）",
+                    !TechnoArrayFinder.MeetsAcceptance(ranked[0], 3, out missingReason)
+                        && missingReason.Length > 0,
+                    missingReason);
 
                 // ---- 2026-10-07 加固：可执行页里的「格子」必须被排除 ----
                 //
@@ -2719,7 +2777,8 @@ namespace MoTrainer.Diagnostics
 
                 int rejectedCode;
                 List<TechnoArrayCandidate> hardened = TechnoArrayFinder.Find(
-                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints, out rejectedCode);
+                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints,
+                    TechnoScene.OwnerOffset, out rejectedCode);
 
                 bool codeExcluded = true;
                 for (int i = 0; i < hardened.Count; i++)
@@ -2930,6 +2989,124 @@ namespace MoTrainer.Diagnostics
             catch (Exception ex)
             {
                 Check("批量操作", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        // ============================================================ 选中读取（共享件，2026-10-08）
+
+        /// <summary>
+        /// 「你选中的是哪些单位」的可靠读法（`SelectionResolver`）——
+        /// 2026-10-08 真机教训的回归：**配置里的槽位指向的可能是垃圾数组**，
+        /// 必须靠"金钱锚定"自己认出正确的那张；认不出时按档位拒绝（fail-closed）。
+        /// </summary>
+        private static void CheckSelectionResolver()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("选中读取（金钱锚定）", false, "OpenProcess 失败"); return; }
+
+            TechnoScene scene = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("选中读取测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+                uint module = scene.ModuleBase;
+                const uint Money = 5000;
+
+                // 我方房子：+0x30C 装着金钱（归属判据）
+                io.WriteUInt32(scene.MyOwner + TechnoOwnership.HouseMoneyOffset, Money);
+
+                // 两张数组：真的（装我方两个对象）、假的（装"看着像对象"的 Team[2]/Team[3]）
+                uint realArray = scene.Arrays + 0x2000;
+                uint junkArray = scene.Arrays + 0x2400;
+                io.WriteUInt32(realArray, scene.Team[0]);
+                io.WriteUInt32(realArray + 4, scene.Team[1]);
+                io.WriteUInt32(junkArray, scene.Team[2]);
+                io.WriteUInt32(junkArray + 4, scene.Team[3]);
+
+                // 选中：数量 = 2；**配置槽位故意指向假数组**；真槽位放在数量字段 +0x24 处
+                uint countAddress = module + 0x300;
+                uint wrongSlot = module + 0x304;
+                uint rightSlot = module + 0x324;
+                io.WriteUInt32(countAddress, 2);
+                io.WriteUInt32(wrongSlot, junkArray);
+                io.WriteUInt32(rightSlot, realArray);
+
+                CalibrationProfile profile = new CalibrationProfile();
+                profile.SelectedCount.SetStaticAddress(0x300);
+                profile.SelectedList.SetStaticAddress(0x304);   // ← 故意是错的
+                profile.Money.SetOffsets(new uint[] { 0x100, TechnoOwnership.HouseMoneyOffset });
+                io.WriteUInt32(module + 0x100, scene.MyOwner);
+
+                List<MemoryRegion> heap = new List<MemoryRegion>();
+                heap.Add(MakeRegion(scene.Heap, TestBlockSize));
+                List<MemoryRegion> pointer = new List<MemoryRegion>();
+                pointer.Add(MakeRegion(module, TestBlockSize));
+                pointer.Add(MakeRegion(scene.Heap, TestBlockSize));
+                SyntheticTarget target = new SyntheticTarget(
+                    io, module, TechnoScene.FakeModuleSize, heap, pointer);
+
+                // ① 自动更正：配置槽位是垃圾，靠金钱锚定认出真数组
+                SelectionResolver resolver = new SelectionResolver(target);
+                List<uint> objects;
+                string note;
+                bool ok = resolver.TryReadSelectedObjects(profile, 8, true, out objects, out note);
+
+                bool sameSet = ok && objects.Count == 2;
+                if (sameSet)
+                {
+                    for (int i = 0; i < objects.Count; i++)
+                    {
+                        if (objects[i] != scene.Team[0] && objects[i] != scene.Team[1]) { sameSet = false; }
+                    }
+                }
+                Check("选中读取：配置槽位指向垃圾数组时，自动更正到真正含本方对象的那张",
+                    sameSet && note.IndexOf("自动更正") >= 0,
+                    ok ? string.Format(CultureInfo.InvariantCulture,
+                        "读到 {0} 个｜{1}", objects.Count, note) : note);
+
+                // ② 解析结果必须指向真数组，而不是配置槽位里那张
+                SelectionResolver fresh = new SelectionResolver(target);
+                uint resolved;
+                string resolveNote;
+                bool resolvedOk = fresh.ResolveArray(
+                    profile, countAddress, wrongSlot, 2, out resolved, out resolveNote);
+                Check("选中读取：解析结果指向真数组（不是配置槽位里那张垃圾）",
+                    resolvedOk && resolved == realArray,
+                    string.Format(CultureInfo.InvariantCulture, "解析到 0x{0:X8}（期望 0x{1:X8}）｜{2}",
+                        resolved, realArray, resolveNote));
+
+                // ③ fail-closed：金钱读不到时，"只返回自己人"这一档必须拒绝
+                //（宁可不给线索，也不拿没核对过的东西去当线索）
+                CalibrationProfile noMoney = new CalibrationProfile();
+                noMoney.SelectedCount.SetStaticAddress(0x300);
+                noMoney.SelectedList.SetStaticAddress(0x324);
+                SelectionResolver resolver2 = new SelectionResolver(target);
+                List<uint> objects2;
+                string note2;
+                bool ok2 = resolver2.TryReadSelectedObjects(noMoney, 8, true, out objects2, out note2);
+                Check("选中读取：读不到金钱值时拒绝返回「自己人」（fail-closed）",
+                    !ok2 && note2.Length > 0,
+                    note2);
+
+                // ④ 数量为 0：明确拒绝并说明，而不是静默返回空
+                io.WriteUInt32(countAddress, 0);
+                SelectionResolver resolver3 = new SelectionResolver(target);
+                bool ok3 = resolver3.TryReadSelectedObjects(profile, 8, true, out objects2, out note2);
+                Check("选中读取：没有选中任何对象时明确拒绝（不是静默返回空）",
+                    !ok3 && note2.IndexOf("没有选中") >= 0,
+                    note2);
+                io.WriteUInt32(countAddress, 2);
+            }
+            catch (Exception ex)
+            {
+                Check("选中读取（金钱锚定）", false, ex.GetType().Name + ": " + ex.Message);
             }
             finally
             {
@@ -3215,6 +3392,9 @@ namespace MoTrainer.Diagnostics
                 profile.ModuleSize = moduleSize;
                 profile.TechnoArray.SetStaticAddress(rosterSlot - moduleBase);
                 profile.SelectedCount.SetStaticAddress(countAddress - moduleBase);
+                // 2026-10-08 起，选中读取走共享件（SelectionResolver），需要配置里的"槽位"作为起点；
+                // 本用例刻意**不校准金钱**，覆盖"金钱不可用 → 直接用配置槽位"这条兜底分支。
+                profile.SelectedList.SetStaticAddress(countAddress + 8 - moduleBase);
                 profile.OffsetTechnoOwner = OwnerOffset;
                 profile.OffsetTechnoHealth = HealthOffset;
 
