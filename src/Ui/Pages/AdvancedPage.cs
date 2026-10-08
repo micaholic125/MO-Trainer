@@ -32,9 +32,19 @@ namespace MoTrainer.Ui.Pages
         private readonly CalibrationProfile _profile;
         private readonly ProfileStore _store;
 
-        /// <summary>游戏主模块的地址区间。用来判断"指针指向的是不是游戏对象"。</summary>
-        private readonly uint _moduleBase;
-        private readonly uint _moduleSize;
+        /// <summary>
+        /// 游戏主模块的地址区间。用来判断"指针指向的是不是游戏对象"。
+        ///
+        /// **必须每次现取，绝不能在构造时缓存成字段。** 真机教训（2026-10-08）：
+        /// 本页在**修改器启动时**就构造好了，而玩家常常"先开修改器、后开游戏"——
+        /// 那一刻还没附加，基址是 0；缓存下来的 0 会让本页所有"模块基址 + 偏移"的解析
+        /// 全部算错，界面上的表现却是"读不到金钱值"这类**看起来像数据问题**的报错，
+        /// 极难归因（当天"预演"按钮就是这样失败的）。`_target` 每次读到的都是当前值。
+        /// </summary>
+        private uint LiveModuleBase { get { return _target == null ? 0 : _target.ModuleBase; } }
+
+        private uint LiveModuleSize { get { return _target == null ? 0 : _target.ModuleSize; } }
+
         private readonly Button _scanButton;
         private readonly Button _findButton;
         private readonly Button _shroudButton;
@@ -49,8 +59,6 @@ namespace MoTrainer.Ui.Pages
             _target = target;
             _profile = profile == null ? new CalibrationProfile() : profile;
             _store = store;
-            _moduleBase = target == null ? 0 : target.ModuleBase;
-            _moduleSize = target == null ? 0 : target.ModuleSize;
 
             // 把模块区间交给「单位校准」的探测逻辑，让它多一条硬判定：
             // 名单里每一项的头 4 字节必须是模块内的类型标记 —— 这条能把
@@ -59,7 +67,7 @@ namespace MoTrainer.Ui.Pages
             // 但**这里只是初值**：本页在修改器启动时构造，那一刻游戏往往还没连上（基址为 0）。
             // 真正保证它一直有效的是 `MainForm.TickRefresh` 每轮重灌一次，
             // 以及各调用点（`HarvestSession` / `UnitPage`）在探测前自带一份。
-            SelectionProbe.SetModuleRange(_moduleBase, _moduleSize);
+            SelectionProbe.SetModuleRange(LiveModuleBase, LiveModuleSize);
 
             BackColor = Theme.Bg0;
             AutoScroll = true;
@@ -347,7 +355,7 @@ namespace MoTrainer.Ui.Pages
 
             uint slotAddress;
             if (!_profile.TechnoArray.IsCalibrated
-                || !_profile.TechnoArray.TryResolve(memory, _moduleBase, out slotAddress, out error))
+                || !_profile.TechnoArray.TryResolve(memory, LiveModuleBase, out slotAddress, out error))
             {
                 text.AppendLine("还没找到对象名单，先做前面的查找。");
                 return text.ToString();
@@ -361,7 +369,7 @@ namespace MoTrainer.Ui.Pages
             }
 
             TechnoWalkResult walk = TechnoWalker.WalkArray(
-                memory, arrayPointer, 4096, _moduleBase, _moduleSize);
+                memory, arrayPointer, 4096, LiveModuleBase, LiveModuleSize);
             if (!walk.Ok || walk.Count < 4)
             {
                 text.AppendLine("对象太少（" + walk.Count + " 个），无法分析。");
@@ -416,7 +424,7 @@ namespace MoTrainer.Ui.Pages
             List<uint> myObjects = new List<uint>();
             uint selectedSlot;
             if (_profile.SelectedList.IsCalibrated
-                && _profile.SelectedList.TryResolve(memory, _moduleBase, out selectedSlot, out error))
+                && _profile.SelectedList.TryResolve(memory, LiveModuleBase, out selectedSlot, out error))
             {
                 myObjects = ReadSelectedObjects(memory, selectedSlot);
             }
@@ -507,7 +515,7 @@ namespace MoTrainer.Ui.Pages
                     if (!ReadUInt32Retry(memory, walk.Objects[i].Address + offset, out value)) { continue; }
 
                     if (value != 0) { nonZero++; }
-                    if (value >= _moduleBase && value < _moduleBase + _moduleSize) { moduleHits++; }
+                    if (value >= LiveModuleBase && value < LiveModuleBase + LiveModuleSize) { moduleHits++; }
 
                     int existing;
                     counts[value] = counts.TryGetValue(value, out existing) ? existing + 1 : 1;
@@ -1105,7 +1113,7 @@ namespace MoTrainer.Ui.Pages
             // ---- 名单 ----
             uint slotAddress;
             if (!_profile.TechnoArray.IsCalibrated
-                || !_profile.TechnoArray.TryResolve(memory, _moduleBase, out slotAddress, out error))
+                || !_profile.TechnoArray.TryResolve(memory, LiveModuleBase, out slotAddress, out error))
             {
                 text.AppendLine("【缺前置】还没找到对象名单。请先点「自动查找总名单」。");
                 SetOutput(text.ToString());
@@ -1124,7 +1132,7 @@ namespace MoTrainer.Ui.Pages
             uint moneyAddress;
             uint money = 0;
             if (!_profile.Money.IsCalibrated
-                || !_profile.Money.TryResolve(memory, _moduleBase, out moneyAddress, out error)
+                || !_profile.Money.TryResolve(memory, LiveModuleBase, out moneyAddress, out error)
                 || !ReadUInt32Retry(memory, moneyAddress, out money) || money == 0)
             {
                 text.AppendLine("【缺前置】读不到金钱值 —— 敌我锚点靠它判定（请确认金钱仍处于已校准状态）。");
@@ -1135,7 +1143,7 @@ namespace MoTrainer.Ui.Pages
             // ---- 选中的单位（锚点样本）----
             uint selectedSlot;
             if (!_profile.SelectedList.IsCalibrated
-                || !_profile.SelectedList.TryResolve(memory, _moduleBase, out selectedSlot, out error))
+                || !_profile.SelectedList.TryResolve(memory, LiveModuleBase, out selectedSlot, out error))
             {
                 text.AppendLine("【缺前置】选中名单不可用，无法确定「我方」是谁。");
                 SetOutput(text.ToString());
@@ -1173,7 +1181,7 @@ namespace MoTrainer.Ui.Pages
             if (_profile.TechnoArrayCount.IsCalibrated)
             {
                 uint countAddress;
-                if (_profile.TechnoArrayCount.TryResolve(memory, _moduleBase, out countAddress, out error)
+                if (_profile.TechnoArrayCount.TryResolve(memory, LiveModuleBase, out countAddress, out error)
                     && memory.ReadUInt32(countAddress, out count) && count >= 64)
                 {
                     countKnown = true;
@@ -1182,7 +1190,7 @@ namespace MoTrainer.Ui.Pages
             if (!countKnown || count > TechnoWalker.MaxObjects) { count = 4096; }
 
             TechnoWalkResult walk = TechnoWalker.WalkArray(
-                memory, arrayPointer, count, _moduleBase, _moduleSize);
+                memory, arrayPointer, count, LiveModuleBase, LiveModuleSize);
             if (!walk.Ok)
             {
                 text.AppendLine("遍历失败：" + walk.Error);
@@ -1548,7 +1556,7 @@ namespace MoTrainer.Ui.Pages
                     && memory.ReadUInt32(countAddress, out count)
                     && count > 0 && count <= 64)
                 {
-                    List<uint> objects = Collect(memory, slotAddress, count, _moduleBase, _moduleSize);
+                    List<uint> objects = Collect(memory, slotAddress, count, LiveModuleBase, LiveModuleSize);
                     if (IsRealObject(memory, objects, _target.ModuleBase, _target.ModuleSize)) { return objects; }
                 }
             }
@@ -1562,7 +1570,7 @@ namespace MoTrainer.Ui.Pages
                 uint count;
                 if (!memory.ReadUInt32(countSlot, out count) || count == 0 || count > 64) { continue; }
 
-                List<uint> objects = Collect(memory, slotAddress, count, _moduleBase, _moduleSize);
+                List<uint> objects = Collect(memory, slotAddress, count, LiveModuleBase, LiveModuleSize);
                 if (IsRealObject(memory, objects, _target.ModuleBase, _target.ModuleSize)) { return objects; }
             }
 
@@ -1624,7 +1632,7 @@ namespace MoTrainer.Ui.Pages
                         k,
                         entryOk ? string.Format(CultureInfo.InvariantCulture, "0x{0:X8}", entry) : "读取失败",
                         headOk ? string.Format(CultureInfo.InvariantCulture, "0x{0:X8}", head) : "读取失败",
-                        headOk ? (InModule(head, _moduleBase, _moduleSize) ? "(在模块内✓)" : "(不在模块内)") : "");
+                        headOk ? (InModule(head, LiveModuleBase, LiveModuleSize) ? "(在模块内✓)" : "(不在模块内)") : "");
                 }
                 Logger.Info("Advanced", entries);
             }
