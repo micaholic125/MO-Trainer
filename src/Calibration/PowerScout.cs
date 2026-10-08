@@ -24,8 +24,8 @@ namespace MoTrainer.Calibration
     /// </summary>
     public static class PowerScout
     {
-        /// <summary>扫描对象头部多少字节（真机上这些对象的字段都挤在前 0x800 里）。</summary>
-        public const int ScanBytes = 0x600;
+        /// <summary>扫描对象头部多少字节。真机上这类对象本身就有 0x708 字节，取 0x800 全覆盖。</summary>
+        public const int ScanBytes = 0x800;
 
         /// <summary>顺着指针看目标的前多少个双字（找"指向字符串的指针"）。真机踩过：窗口太浅会漏掉类型对象的 ID。</summary>
         private const int PeekDwords = 128;
@@ -133,6 +133,21 @@ namespace MoTrainer.Calibration
             for (int i = 0; i < pointers.Count && i < 6; i++)
             {
                 AppendTargetDump(text, memory, pointers[i].ObjectOffset, pointers[i].Value);
+            }
+
+            // ④ **原始数据整段**：一次点击把对象前 0x800 字节全打出来，
+            // 开发者离线看全，不必让用户反复点（每点一次都是一次真机会话，能省则省）。
+            text.AppendLine();
+            text.AppendLine("—— 原始数据（前 0x800 字节，每行 16 字节）——");
+            for (int row = 0; row + 16 <= head.Length; row += 16)
+            {
+                StringBuilder line = new StringBuilder();
+                for (int k = 0; k < 16; k++)
+                {
+                    if (k > 0) { line.Append(' '); }
+                    line.Append(head[row + k].ToString("X2", CultureInfo.InvariantCulture));
+                }
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture, "  +0x{0:X3}  {1}", row, line.ToString()));
             }
 
             text.AppendLine();
