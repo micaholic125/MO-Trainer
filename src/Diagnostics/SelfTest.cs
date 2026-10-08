@@ -3154,11 +3154,49 @@ namespace MoTrainer.Diagnostics
                 io.WriteUInt32(scene.MyOwner + TechnoOwnership.HouseMoneyOffset, Money);
                 io.WriteUInt32(scene.EnemyOwner + TechnoOwnership.HouseMoneyOffset, EnemyMoney);
 
-                // 全对象名单：模块内的"格子"（静态地址）→ 数组
+                // 2026-10-08 新增的三类"特殊对象"（挂进扩展名单）：
+                //   · 疑似中立：归属房子的金钱读数为 0（中立/民用建筑通常如此）→ 绝不杀；
+                //   · 归属存疑：归属值指向代码区（真机上抓到过 0x0087E294 这种）→ 绝不杀；
+                //   · 邻居几何：一个敌方对象，其后方 0x600 处放一个我方对象 ——
+                //     真机上"抽检扫 0x1000"正是把这样的邻居当成了它自己
+                //     （被判为敌方的 0x2856C008，与线索单位 0x2856CE18 相距仅 0xE10）。
+                uint neutralHouse = scene.Heap + 0xFC00;
+                io.WriteUInt32(neutralHouse + TechnoOwnership.HouseMoneyOffset, 0);   // 金钱 0 = 疑似中立
+
+                uint neutral1 = scene.Heap + 0x3000;
+                uint neutral2 = scene.Heap + 0x3100;
+                uint junkOwner = scene.Heap + 0x3200;      // 归属值 = 代码区地址 → 存疑
+                uint myExtra = scene.Heap + 0x4300;        // 我方对象（邻居几何用）
+                uint neighborEnemy = scene.Heap + 0x3D00;  // 敌方对象，其旧 0x1000 窗口含上面的自己人
+
+                uint[] extra = new uint[] { neutral1, neutral2, junkOwner, myExtra, neighborEnemy };
+                for (int i = 0; i < extra.Length; i++)
+                {
+                    io.WriteUInt32(extra[i], scene.ModuleBase + 0x2000);   // 共用类型表（像真对象）
+                    io.WriteUInt32(extra[i] + HealthOffset, 100);
+                }
+                io.WriteUInt32(neutral1 + OwnerOffset, neutralHouse);
+                io.WriteUInt32(neutral2 + OwnerOffset, neutralHouse);
+                io.WriteUInt32(junkOwner + OwnerOffset, scene.ModuleBase + 0x800);   // 代码区里的值
+                // 让"代码区归属"指向的位置也放一个非 0 的"假金钱" —— 否则它会被
+                // "金钱 0 = 疑似中立"这条顺手保护，显不出"归属存疑"这条判据本身
+                //（改坏验证时要能把两条判据分开）。
+                io.WriteUInt32(scene.ModuleBase + 0x800 + TechnoOwnership.HouseMoneyOffset, 12345);
+                io.WriteUInt32(myExtra + OwnerOffset, scene.MyOwner);
+                io.WriteUInt32(neighborEnemy + OwnerOffset, scene.EnemyOwner);
+
+                // 全对象名单：模块内的"格子"（静态地址）→ 扩展数组（原 7 项 + 这 5 个）
                 uint rosterSlot = module + 0x200;
                 uint rosterCount = module + 0x204;
-                io.WriteUInt32(rosterSlot, scene.ArrayMain);
-                io.WriteUInt32(rosterCount, 7);
+                uint rosterArray = scene.Arrays + 0x2000;
+                scene.WriteArray(rosterArray, new uint[]
+                {
+                    scene.Team[0], scene.Team[1], scene.Team[2],
+                    scene.Team[3], scene.Team[4], scene.Team[5], scene.RareObject,
+                    neutral1, neutral2, junkOwner, myExtra, neighborEnemy
+                });
+                io.WriteUInt32(rosterSlot, rosterArray);
+                io.WriteUInt32(rosterCount, 12);
 
                 // 选中名单：数量 + 指针槽（槽里放一张只含我方两个对象的数组）
                 uint selCount = module + 0x300;
@@ -3223,11 +3261,32 @@ namespace MoTrainer.Diagnostics
                         kill.WriteCount,
                         kill.LastError.Length == 0 ? "无错误" : kill.LastError));
 
+                Check("秒杀接线：疑似中立（归属房子金钱读数为 0）的对象绝不杀",
+                    scene.ReadField(neutral1, HealthOffset) == 100
+                        && scene.ReadField(neutral2, HealthOffset) == 100,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "疑似中立血量 {0}/{1}",
+                        scene.ReadField(neutral1, HealthOffset), scene.ReadField(neutral2, HealthOffset)));
+
+                Check("秒杀接线：归属存疑（归属值指向代码区）的对象绝不杀",
+                    scene.ReadField(junkOwner, HealthOffset) == 100,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "存疑对象血量 {0}", scene.ReadField(junkOwner, HealthOffset)));
+
+                Check("秒杀接线：紧邻自己人的敌方对象照杀不误（抽检窗口不再把邻居算成它）",
+                    scene.ReadField(neighborEnemy, HealthOffset) == 0
+                        && scene.ReadField(myExtra, HealthOffset) == 100,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "邻居敌方血量 {0}｜旁边的自己人 {1}",
+                        scene.ReadField(neighborEnemy, HealthOffset),
+                        scene.ReadField(myExtra, HealthOffset)));
+
                 engine.Stop();
                 engine = null;
 
                 // 后面每条用例都从"敌人满血"开始
                 for (int i = 2; i <= 4; i++) { io.WriteUInt32(scene.Team[i] + HealthOffset, 100); }
+                io.WriteUInt32(neighborEnemy + HealthOffset, 100);
 
                 // ================= ② 建立不了我方锚点 → 拒绝 =================
                 io.WriteUInt32(selCount, 0);   // 游戏里"什么都没选中"
@@ -3299,7 +3358,7 @@ namespace MoTrainer.Diagnostics
 
                 engine.Stop();
                 engine = null;
-                io.WriteUInt32(rosterSlot, scene.ArrayMain);
+                io.WriteUInt32(rosterSlot, rosterArray);
             }
             catch (Exception ex)
             {

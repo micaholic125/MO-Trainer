@@ -1190,58 +1190,43 @@ namespace MoTrainer.Ui.Pages
                 return;
             }
 
-            int willKill = 0;
-            int myUnits = 0;
-            int unknown = 0;
-            Dictionary<uint, int> enemyGroups = new Dictionary<uint, int>();
-
-            for (int i = 0; i < walk.Count; i++)
-            {
-                uint owner;
-                if (!ReadUInt32Retry(memory, walk.Objects[i].Address + anchor.OwnerOffset, out owner))
-                {
-                    unknown++;
-                    continue;
-                }
-                if (owner == 0) { unknown++; continue; }
-                if (owner == anchor.MyHouse) { myUnits++; continue; }
-
-                willKill++;
-                int existing;
-                enemyGroups[owner] = enemyGroups.TryGetValue(owner, out existing) ? existing + 1 : 1;
-            }
+            // ---- 分类（与引擎共用同一份实现：预演看到的 = 真正开杀时用的）----
+            TechnoOwnership.OwnerClassification cls = TechnoOwnership.ClassifyOwners(
+                memory, walk.Objects, anchor.OwnerOffset, anchor.MyHouse, LiveModuleBase, LiveModuleSize);
 
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "遍历到 {0} 个对象", walk.Count));
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "**将击杀：{0} 个**｜**放过我方：{1} 个**｜归属不明：{2} 个",
-                willKill, myUnits, unknown));
+                "**将击杀：{0} 个**｜**放过我方：{1} 个**｜**疑似中立（不杀）：{2} 个**｜归属存疑（不杀）：{3} 个",
+                cls.KillableCount, cls.Mine, cls.NeutralCount, cls.Unknown));
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "血量偏移 +0x{0:X}（写入时每个目标都会先校验、写后回读）",
                 _profile.OffsetTechnoHealth));
-
-            List<KeyValuePair<uint, int>> ordered = new List<KeyValuePair<uint, int>>();
-            foreach (KeyValuePair<uint, int> pair in enemyGroups) { ordered.Add(pair); }
-            ordered.Sort(delegate(KeyValuePair<uint, int> a, KeyValuePair<uint, int> b)
-            {
-                return b.Value.CompareTo(a.Value);
-            });
-
-            text.AppendLine("按阵营拆分（将击杀的部分）：");
-            for (int i = 0; i < ordered.Count && i < 8; i++)
-            {
-                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "  敌方阵营 0x{0:X8}：{1} 个", ordered[i].Key, ordered[i].Value));
-            }
             text.AppendLine();
 
-            // ---- 安全抽检：把"判为敌方"的对象拿独立判据复核 ----
+            // ---- 你选中的对象逐个判定（2026-10-08 新增）----
+            // 用途：让你一眼看清"自己选中的东西被判成了哪边"——
+            // 比如把一座中立建筑和单位一起选中，就能看出中立建筑属于哪个阵营。
+            AppendSelectionVerdicts(text, memory, anchor);
+
+            // ---- 将击杀：按阵营拆分（附每个阵营的类型构成）----
+            AppendOwnerGroups(text, memory, "将击杀（按阵营拆分）", cls.KillableByGroup, anchor.OwnerOffset);
+
+            if (cls.NeutralCount > 0)
+            {
+                AppendOwnerGroups(text, memory,
+                    "疑似中立 / 民用（**不会杀**）", cls.NeutralByGroup, anchor.OwnerOffset);
+                text.AppendLine("  说明：这些阵营的「金钱」读数一直是 0 —— 中立 / 民用建筑通常如此，所以默认保护。");
+                text.AppendLine();
+            }
+
+            // ---- 安全抽检：把"判为敌方"的对象拿独立判据复核（与真正要写的名单一致）----
             int enemySeen;
             int checkedCount;
             uint suspect;
             string verifyWhy;
             bool verified = TechnoOwnership.VerifyEnemySample(
-                memory, walk.Objects, anchor.OwnerOffset, anchor.MyHouse, 256,
+                memory, cls.Killable, anchor.OwnerOffset, anchor.MyHouse, 256,
                 out enemySeen, out checkedCount, out suspect, out verifyWhy);
 
             if (verified)
@@ -1256,14 +1241,117 @@ namespace MoTrainer.Ui.Pages
                 text.AppendLine("→ 敌我分类不可靠，**绝不能开启秒杀**。请把这份结果发给开发者。");
             }
 
-            if (myUnits == 0)
+            if (cls.Mine == 0)
             {
                 text.AppendLine("⚠ 注意：名单里一个「我方」对象都没有 —— 这也是判据出问题的信号，程序会拒绝执行。");
             }
 
             text.AppendLine();
-            text.AppendLine("本次**没有写入任何内存**。确认两个数字（将击杀 / 放过我方）合理后再开启「秒杀敌人」。");
+            text.AppendLine("本次**没有写入任何内存**。确认数字合理（特别是「放过我方」应等于你自己的东西总数）后再开启「秒杀敌人」。");
             SetOutput(text.ToString());
+        }
+
+        /// <summary>
+        /// 「你选中的对象逐个判定」：列出当前选中（含非我方）的每个对象，以及它被判成了哪一类。
+        /// 用途：把一座中立建筑和单位一起选中点预演，就能直接看到中立建筑属于哪个阵营
+        ///（以及它为什么会被保护）。
+        /// </summary>
+        private void AppendSelectionVerdicts(StringBuilder text, MemoryIO memory, TechnoOwnership.OwnerAnchor anchor)
+        {
+            if (_selection == null) { return; }
+
+            List<uint> selected;
+            string note;
+            if (!_selection.TryReadSelectedObjects(_profile, 16, false, out selected, out note))
+            {
+                text.AppendLine("（当前没有读到选中的对象：" + note + "）");
+                text.AppendLine();
+                return;
+            }
+
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "你选中的对象逐个判定（共 {0} 个；同时选中自己的单位与想了解的东西，一次看清）：", selected.Count));
+            for (int i = 0; i < selected.Count && i < 12; i++)
+            {
+                uint address = selected[i];
+                uint type;
+                ReadUInt32Retry(memory, address, out type);
+
+                uint owner;
+                if (!ReadUInt32Retry(memory, address + anchor.OwnerOffset, out owner) || owner == 0)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8}（类型 0x{1:X8}）→ 归属读不出", address, type));
+                    continue;
+                }
+                if (owner == anchor.MyHouse)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8}（类型 0x{1:X8}）→ **我方**", address, type));
+                    continue;
+                }
+
+                uint money;
+                if (!TechnoOwnership.TryReadHouseMoney(memory, owner, LiveModuleBase, LiveModuleSize, out money))
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8}（类型 0x{1:X8}）→ 归属存疑（0x{2:X8} 不像真阵营，不会杀）",
+                        address, type, owner));
+                    continue;
+                }
+
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    money == 0
+                        ? "  0x{0:X8}（类型 0x{1:X8}）→ **疑似中立**（归属 0x{2:X8}，金钱读数为 0，不会杀）"
+                        : "  0x{0:X8}（类型 0x{1:X8}）→ 敌方（归属 0x{2:X8}，金钱 {3}，会被杀）",
+                    address, type, owner, money));
+            }
+            text.AppendLine();
+        }
+
+        /// <summary>按阵营分组输出（阵营 → 个数，并附该阵营的类型构成）。</summary>
+        private void AppendOwnerGroups(
+            StringBuilder text, MemoryIO memory, string title,
+            Dictionary<uint, List<TechnoObject>> groups, uint ownerOffset)
+        {
+            text.AppendLine(title + "：");
+            if (groups.Count == 0) { text.AppendLine("  （无）"); text.AppendLine(); return; }
+
+            List<KeyValuePair<uint, List<TechnoObject>>> ordered =
+                new List<KeyValuePair<uint, List<TechnoObject>>>();
+            foreach (KeyValuePair<uint, List<TechnoObject>> pair in groups) { ordered.Add(pair); }
+            ordered.Sort(delegate(KeyValuePair<uint, List<TechnoObject>> a, KeyValuePair<uint, List<TechnoObject>> b)
+            {
+                return b.Value.Count.CompareTo(a.Value.Count);
+            });
+
+            for (int i = 0; i < ordered.Count && i < 8; i++)
+            {
+                uint ownerValue = ordered[i].Key;
+                List<TechnoObject> list = ordered[i].Value;
+
+                uint money;
+                TechnoOwnership.TryReadHouseMoney(memory, ownerValue, LiveModuleBase, LiveModuleSize, out money);
+
+                StringBuilder types = new StringBuilder();
+                List<KeyValuePair<uint, int>> typeCounts = TechnoOwnership.CountTypes(list);
+                for (int k = 0; k < typeCounts.Count && k < 4; k++)
+                {
+                    if (k > 0) { types.Append("、"); }
+                    types.Append(string.Format(CultureInfo.InvariantCulture,
+                        "0x{0:X8}×{1}", typeCounts[k].Key, typeCounts[k].Value));
+                }
+                if (typeCounts.Count > 4) { types.Append("…"); }
+
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "  阵营 0x{0:X8}：{1} 个（金钱 {2}）｜类型：{3}",
+                    ownerValue, list.Count, money, types.ToString()));
+            }
+            if (ordered.Count > 8)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture, "  …另有 {0} 个阵营未列出", ordered.Count - 8));
+            }
+            text.AppendLine();
         }
 
         // ---- 全图视野：迷雾的定位与清除 ----

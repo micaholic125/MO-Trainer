@@ -626,26 +626,17 @@ namespace MoTrainer.Cheats
                 return;
             }
 
-            // ---- 每拍自查：把全场先数一遍 ----
-            int mine = 0;
-            int enemy = 0;
-            int unknown = 0;
-            for (int i = 0; i < walk.Objects.Count; i++)
-            {
-                uint owner;
-                if (!_target.Memory.ReadUInt32(walk.Objects[i].Address + _myOwnerOffset, out owner))
-                {
-                    unknown++;
-                    continue;
-                }
-                if (owner == 0) { unknown++; }
-                else if (owner == _myOwner) { mine++; }
-                else { enemy++; }
-            }
+            // ---- 每拍自查：按归属把全场分四类（我方 / 可击杀 / 疑似中立 / 归属存疑）----
+            //
+            // 分类规则与「预演」共用同一份实现（`TechnoOwnership.ClassifyOwners`）——
+            // 预演上看到的数字与真正开杀时的名单必须**完全一致**。
+            TechnoOwnership.OwnerClassification cls = TechnoOwnership.ClassifyOwners(
+                _target.Memory, walk.Objects, _myOwnerOffset, _myOwner,
+                _target.ModuleBase, _target.ModuleSize);
 
             // 我方一个都没有 = 危险信号：锚点若是失效（比如换了一局），
             // 全场都会判成敌方 —— 包括自己的部队。必须拒绝，而不是照写。
-            if (mine == 0)
+            if (cls.Mine == 0)
             {
                 _killArmed = false;
                 feature.Address = 0;
@@ -656,6 +647,8 @@ namespace MoTrainer.Cheats
             }
 
             // ---- ③ 安全抽检（开启时 / 锚点重建后各做一次；失败则退避重试）----
+            //
+            // 只抽检**可击杀名单里的对象**（与真正要写的名单一致）。
             if (!_killArmed && (DateTime.UtcNow - _lastKillVerify).TotalSeconds >= KillVerifyRetrySeconds)
             {
                 _lastKillVerify = DateTime.UtcNow;
@@ -665,7 +658,7 @@ namespace MoTrainer.Cheats
                 uint suspect;
                 string why;
                 if (!TechnoOwnership.VerifyEnemySample(
-                        _target.Memory, walk.Objects, _myOwnerOffset, _myOwner,
+                        _target.Memory, cls.Killable, _myOwnerOffset, _myOwner,
                         KillVerifySamples, out enemySeen, out checkedCount, out suspect, out why))
                 {
                     feature.LastError = "安全抽检未通过，已拒绝执行：" + why;
@@ -684,12 +677,12 @@ namespace MoTrainer.Cheats
                 return;   // 抽检未通过、还在退避期：不写
             }
 
-            // ---- ④ 执行 ----
+            // ---- ④ 执行（只写"可击杀"名单）----
             TechnoOpResult result = TechnoOps.KillEnemies(
-                _target.Memory, walk.Objects, _myOwnerOffset, _profile.OffsetTechnoHealth, _myOwner);
+                _target.Memory, cls.Killable, _myOwnerOffset, _profile.OffsetTechnoHealth, _myOwner);
 
             if (result.Written > 0) { feature.WriteCount += result.Written; }
-            feature.LastSeenValue = (uint)enemy;
+            feature.LastSeenValue = (uint)cls.KillableCount;
 
             if (result.Blocked.Length > 0)
             {
@@ -709,9 +702,11 @@ namespace MoTrainer.Cheats
             {
                 _lastKillLog = DateTime.UtcNow;
                 Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
-                    "秒杀敌人：名单 {0} 个｜我方 {1}｜敌方 {2}｜归属不明 {3}｜本拍写入 {4} 跳过 {5}"
-                    + "｜累计写入 {6}｜阵营字段 +0x{7:X}=0x{8:X8}（金钱锚定）",
-                    walk.Count, mine, enemy, unknown, result.Written, result.Skipped,
+                    "秒杀敌人：名单 {0} 个｜我方 {1}｜可击杀 {2}（{3} 个阵营）｜疑似中立不杀 {4}｜归属存疑不杀 {5}"
+                    + "｜本拍写入 {6} 跳过 {7}｜累计写入 {8}｜阵营字段 +0x{9:X}=0x{10:X8}（金钱锚定）",
+                    walk.Count, cls.Mine, cls.KillableCount, cls.KillableGroupCount,
+                    cls.NeutralCount, cls.Unknown,
+                    result.Written, result.Skipped,
                     feature.WriteCount, _myOwnerOffset, _myOwner));
             }
         }

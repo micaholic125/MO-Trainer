@@ -62,6 +62,136 @@ namespace MoTrainer.Cheats
         }
 
         /// <summary>
+        /// 判断一个"归属值"是不是**真实的阵营对象**（HouseClass 在堆上），并顺带读出它的金钱。
+        ///
+        /// 为什么要这道判据（2026-10-08 真机数据）：名单里混着大量非单位对象，
+        /// 它们 +0x14C 位置上的值五花八门 —— 实测抓到过**指向代码区**的值（0x0087E294）、
+        /// 小整数（0x000000FF）等等。这些"归属"不可能是阵营，对应的对象也**绝不能杀**。
+        ///
+        /// 判据（全部满足才算真阵营）：地址 ≥ 0x10000、4 字节对齐、**不在游戏模块区间内**
+        ///（阵营对象在堆上，代码区里的值一定是误读）、且 `+0x30C` 的金钱读得出来。
+        ///
+        /// 金钱读数还有第二个用途：**中立 / 民用房子的金钱通常恒为 0**，
+        /// 而真人 / AI 玩家的金钱会随建造消费变化 —— 秒杀用它来"保护疑似中立的阵营"
+        ///（`money == 0` ⇒ 视作中立，跳过不杀；宁可少杀、绝不误杀）。
+        /// </summary>
+        public static bool TryReadHouseMoney(
+            MemoryIO memory, uint ownerValue, uint moduleBase, uint moduleSize, out uint money)
+        {
+            money = 0;
+            if (memory == null || ownerValue < 0x10000) { return false; }
+            if ((ownerValue & 3) != 0) { return false; }
+            if (ownerValue >= moduleBase && ownerValue < moduleBase + moduleSize) { return false; }
+            return memory.ReadUInt32(ownerValue + HouseMoneyOffset, out money);
+        }
+
+        /// <summary>一次"按归属分类"的结果。</summary>
+        public sealed class OwnerClassification
+        {
+            /// <summary>我方对象数。</summary>
+            public int Mine;
+
+            /// <summary>归属读不出来 / 不像真阵营的对象数（**跳过，绝不写**）。</summary>
+            public int Unknown;
+
+            /// <summary>可击杀的对象（归属是真实的、非我方的、且金钱非 0 的阵营）。</summary>
+            public readonly List<TechnoObject> Killable = new List<TechnoObject>();
+
+            /// <summary>可击杀部分按阵营分组：归属 → 对象列表。</summary>
+            public readonly Dictionary<uint, List<TechnoObject>> KillableByGroup =
+                new Dictionary<uint, List<TechnoObject>>();
+
+            /// <summary>疑似中立 / 民用的阵营（金钱读数为 0）：归属 → 对象列表。**这些不杀。**</summary>
+            public readonly Dictionary<uint, List<TechnoObject>> NeutralByGroup =
+                new Dictionary<uint, List<TechnoObject>>();
+
+            public int KillableCount { get { return Killable.Count; } }
+
+            public int KillableGroupCount { get { return KillableByGroup.Count; } }
+
+            public int NeutralCount
+            {
+                get
+                {
+                    int total = 0;
+                    foreach (KeyValuePair<uint, List<TechnoObject>> pair in NeutralByGroup)
+                    {
+                        total += pair.Value.Count;
+                    }
+                    return total;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 把一批对象按归属分成四类：**我方 / 可击杀 / 疑似中立（金钱 0，不杀）/ 归属存疑（不杀）**。
+        ///
+        /// 引擎与「预演」共用这一份实现 —— 预演上看到的数字与真正开杀时用的名单**完全一致**，
+        /// 不允许出现"预演说杀 30 个、实际杀 178 个"这种两套判据的情况。
+        /// </summary>
+        public static OwnerClassification ClassifyOwners(
+            MemoryIO memory, IList<TechnoObject> objects, uint ownerOffset, uint myHouse,
+            uint moduleBase, uint moduleSize)
+        {
+            OwnerClassification result = new OwnerClassification();
+            if (memory == null || objects == null || ownerOffset == 0) { return result; }
+
+            for (int i = 0; i < objects.Count; i++)
+            {
+                uint address = objects[i].Address;
+                uint owner;
+                if (!memory.ReadUInt32(address + ownerOffset, out owner)) { result.Unknown++; continue; }
+                if (owner == 0) { result.Unknown++; continue; }
+                if (owner == myHouse) { result.Mine++; continue; }
+
+                uint money;
+                if (!TryReadHouseMoney(memory, owner, moduleBase, moduleSize, out money))
+                {
+                    // 归属值不像真阵营（代码区 / 小整数 / 读不到）→ 存疑，绝不杀
+                    result.Unknown++;
+                    continue;
+                }
+
+                Dictionary<uint, List<TechnoObject>> groups = money == 0
+                    ? result.NeutralByGroup      // 疑似中立 / 民用（金钱恒为 0）→ 保护，不杀
+                    : result.KillableByGroup;
+
+                List<TechnoObject> bucket;
+                if (!groups.TryGetValue(owner, out bucket))
+                {
+                    bucket = new List<TechnoObject>();
+                    groups[owner] = bucket;
+                }
+                bucket.Add(objects[i]);
+                if (money != 0) { result.Killable.Add(objects[i]); }
+            }
+            return result;
+        }
+
+        /// <summary>把一批对象按"类型表 → 个数"统计出来（显示用；数量多的在前）。</summary>
+        public static List<KeyValuePair<uint, int>> CountTypes(IList<TechnoObject> objects)
+        {
+            Dictionary<uint, int> counts = new Dictionary<uint, int>();
+            if (objects != null)
+            {
+                for (int i = 0; i < objects.Count; i++)
+                {
+                    uint type = objects[i].VTable;
+                    int existing;
+                    counts[type] = counts.TryGetValue(type, out existing) ? existing + 1 : 1;
+                }
+            }
+
+            List<KeyValuePair<uint, int>> ordered = new List<KeyValuePair<uint, int>>();
+            foreach (KeyValuePair<uint, int> pair in counts) { ordered.Add(pair); }
+            ordered.Sort(delegate(KeyValuePair<uint, int> a, KeyValuePair<uint, int> b)
+            {
+                return b.Value.CompareTo(a.Value);
+            });
+            return ordered;
+        }
+
+        /// <summary>
         /// 在**一个对象**里找出所有"指向 HouseClass 且该 House 装着给定金钱"的字段偏移。
         ///
         /// `maxMatches` 用来控制代价：无敌功能的归属校验只关心"有没有"（传 1，
@@ -211,13 +341,16 @@ namespace MoTrainer.Cheats
         ///
         /// 这是开写之前唯一一道**用独立判据复核分类结果**的关卡。
         /// 主判据（阵营字段）一旦整体性出错（偏移找错、语义根本不是阵营），
-        /// 后果是把自己人当敌人清空；抽检抓的就是这类**系统性错误**：
-        /// 按真机规模（我方约百个、敌方约千个）抽 128 个，若有一批自己人被误判成敌方，
-        /// 命中概率接近 100%（千人名单里混 100 个自己人，漏掉全部样本的概率约百万分之二）。
+        /// 后果是把自己人当敌人清空；抽检抓的就是这类**系统性错误**。
         ///
-        /// 复核判据刻意选"对象里有没有出现**我方 House 的地址**"（精确比对，不需要解引用）：
-        /// 不用"金钱值"复核是因为它会被巧合骗到 —— 开局时各家金钱可能恰好相同
-        /// （都是初始资金），拿金钱当判据会把敌方 House 也认成我方，一开就误报。
+        /// **扫描范围必须是 0x400，不能是 0x1000**（2026-10-08 真机实证后的修正）：
+        /// 真机上同类对象在内存里是**紧挨着摆**的（实测间距 0x708），
+        /// 第一次实现扫了 0x1000 字节，把"后面 3.6KB 处的自己人单位"也扫了进去 ——
+        /// 它 +0x14C 的归属指针正好落在窗口内，于是**把邻居当成了它自己**、误报"未通过"，
+        /// 让本来正确的分类被拦下（真机原话：被判为敌方的对象 0x2856C008 其实连着你方 House，
+        /// 而线索单位 0x2856CE18 就在它后面 0xE10 字节处）。
+        /// 敌我判据的归属字段在 +0x14C，取 0x400 足以覆盖"对象自己的"归属字段，
+        /// 而邻居对象的归属字段至少落在 objectSize + 0x14C ≈ 0x800 之后，不会被扫到。
         /// </summary>
         public static bool VerifyEnemySample(
             MemoryIO memory, IList<TechnoObject> objects,
@@ -243,7 +376,7 @@ namespace MoTrainer.Cheats
                 if (checkedCount >= sampleCount) { continue; }
                 checkedCount++;
 
-                byte[] head = memory.ReadBytesQuiet(address, ScanBytes);
+                byte[] head = memory.ReadBytesQuiet(address, VerifyScanBytes);
                 if (head == null) { continue; }   // 读不动：按"没查出问题"处理，但不计入已复核
 
                 bool connectedToMyHouse = false;
@@ -270,6 +403,12 @@ namespace MoTrainer.Cheats
             }
             return true;
         }
+
+        /// <summary>
+        /// 抽检扫描窗口。**0x400 是上限，不要调大**（缘由见 VerifyEnemySample 的注释：
+        /// 调大就会扫到邻居对象的归属字段，把"邻居是我方"误报成"它是我方"）。
+        /// </summary>
+        public const int VerifyScanBytes = 0x400;
 
         private static string DescribeOffsets(List<uint> offsets)
         {
