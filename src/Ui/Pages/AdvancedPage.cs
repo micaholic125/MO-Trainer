@@ -4,6 +4,8 @@ using System.Drawing;
 using System.Globalization;
 using System.Text;
 using System.Windows.Forms;
+// 注：**不能** `using System.Threading;` —— 那样本文件里的 `Timer` 会与 WinForms 的 Timer 冲突。
+// 电力试探要的后台线程写成全名 `System.Threading.Thread`（见 OnPowerProbeClick）。
 using MoTrainer.Calibration;
 using MoTrainer.Cheats;
 using MoTrainer.Core;
@@ -74,6 +76,7 @@ namespace MoTrainer.Ui.Pages
         private readonly Button _previewButton;
         private readonly Button _markAllyButton;
         private readonly Button _shroudButton;
+        private readonly Button _powerProbeButton;
         private readonly Button _harvestButton;
         private readonly Label _harvestStatus;
         private readonly Timer _harvestTimer;
@@ -167,6 +170,13 @@ namespace MoTrainer.Ui.Pages
             _harvestButton.Click += OnHarvestClick;
             Controls.Add(_harvestButton);
 
+            // 「电力试探」（2026-10-09 新增，`[S4-3]` B 方案）：**唯一一个会往游戏里写试探值**的按钮，
+            // 所以做成"点两次"（与「全图视野」同一套路）：第 1 次只给说明与警告，第 2 次才真试。
+            // 试探值只存在约 4 秒，随后**无条件还原**（见 `PowerProbe`）。
+            _powerProbeButton = UiFactory.MakeButton("电力试探（点两次）", 168);
+            _powerProbeButton.Click += OnPowerProbeClick;
+            Controls.Add(_powerProbeButton);
+
             _harvestStatus = MakeHintLabel();
             _harvestStatus.Text = "采集期间你只需要在游戏里正常玩：选几个单位、造点东西、让单位挨点打。程序自己记录。";
             Controls.Add(_harvestStatus);
@@ -175,6 +185,11 @@ namespace MoTrainer.Ui.Pages
             _harvestTimer = new Timer();
             _harvestTimer.Interval = 1000;
             _harvestTimer.Tick += OnHarvestTick;
+
+            // 电力试探的收尾轮询（试探在后台线程跑约 4 秒；这里每 400ms 看一次结果好了没有）。
+            _powerProbeTimer = new Timer();
+            _powerProbeTimer.Interval = 400;
+            _powerProbeTimer.Tick += OnPowerProbeTick;
 
             _output = new TextBox();
             _output.Multiline = true;
@@ -253,7 +268,8 @@ namespace MoTrainer.Ui.Pages
                 left, rightLimit) + 6;
             y = LayoutHint(_hintTop, y, rightLimit - left) + 14;
 
-            y = LayoutButtonRow(y, new Control[] { _shroudButton, _harvestButton }, left, rightLimit) + 6;
+            y = LayoutButtonRow(y, new Control[] { _shroudButton, _harvestButton, _powerProbeButton },
+                left, rightLimit) + 6;
             y = LayoutHint(_harvestStatus, y, rightLimit - left) + 14;
 
             int boxHeight = ClientSize.Height - y - 20;
@@ -1431,6 +1447,149 @@ namespace MoTrainer.Ui.Pages
             text.AppendLine(rosterSuspect
                 ? "本次**没有写入任何内存**。名单未通过自检，**秒杀不要开启**：请重新「自动查找总名单」后再点本按钮。"
                 : "本次**没有写入任何内存**。确认数字合理（特别是「放过我方」应等于你自己的东西总数）后再开启「秒杀敌人」。");
+            SetOutput(text.ToString());
+        }
+
+        /// <summary>「电力试探」是否已经解释过一次（点两次：第一次只给说明，第二次才真写）。</summary>
+        private bool _powerProbeExplained;
+
+        /// <summary>试探线程与它的结果（试探要跑约 4 秒，放后台线程，界面不卡）。</summary>
+        private System.Threading.Thread _powerProbeThread;
+        private PowerProbe.Result _powerProbeResult;
+        private readonly Timer _powerProbeTimer;
+
+        /// <summary>
+        /// 「电力试探」（`[S4-3]` B 方案）：判定建筑对象上的候选字段是不是**电力产出的来源**。
+        ///
+        /// 为什么要动手试：电力那条老路（写界面显示值）早被真机推翻；离线分析（4 份采集报告交叉比对）
+        /// 把候选缩到了建筑对象的 `+0xD0`（电厂建成时 `1 → 100`），但同一偏移在步兵身上也有值在跳 ——
+        /// **采集报告只记"变化过的字段"，再翻也就到这里了**，只能写一个试探值看游戏认不认。
+        ///
+        /// 安全设计（这是全程序**唯一**会往游戏里写"实验值"的地方）：
+        ///   ① 点两次才真试（第一次只给说明与警告）；
+        ///   ② 目标必须是**你自己选中、且属性确认属于我方**的一座建筑；
+        ///   ③ 写前先确认目标页可写；写后立刻回读校验；
+        ///   ④ **无条件还原**（`PowerProbe` 的 finally 里做），并回读确认还原成功；
+        ///   ⑤ 试探值只存在约 4 秒。
+        /// </summary>
+        private void OnPowerProbeClick(object sender, EventArgs e)
+        {
+            StringBuilder text = new StringBuilder();
+            text.AppendLine("=== 电力试探（会往游戏里写一个实验值，约 4 秒后自动还原）===");
+            text.AppendLine();
+
+            if (!_powerProbeExplained)
+            {
+                _powerProbeExplained = true;
+                text.AppendLine("**第一次点击只做说明，不会写任何东西。** 确认下面这些之后，再点一次才开始：");
+                text.AppendLine();
+                text.AppendLine("  · 你要先在游戏里**点选一座你自己的发电厂**（试探只作用于它）；");
+                text.AppendLine("  · 程序会往它身上试写一个大数值、盯着界面上的「电力」数字看它变不变，");
+                text.AppendLine("    **约 4 秒后自动写回原值**；");
+                text.AppendLine("  · 万一那个位置猜错了（不是电力字段），可能出现**短暂异常**（视觉或该建筑行为异常）——");
+                text.AppendLine("    试探值一还原就恢复；这是目前判定电力来源唯一可靠的办法；");
+                text.AppendLine("  · 想中止：关掉修改器即可（还原是在同一个函数里做的，中途关闭有极小概率留下试探值，");
+                text.AppendLine("    所以请**不要在试探期间关程序**）。");
+                text.AppendLine();
+                text.AppendLine("确认无误 → **再点一次这个按钮**开始试探。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            if (_powerProbeThread != null && _powerProbeThread.IsAlive)
+            {
+                text.AppendLine("上一次试探还在进行（约 4 秒），请稍候。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            // 前置：需要"我方是谁"（偏移来自本次会话已建立的锚点，与「标记友军」同一来源）
+            if (_cachedOwnerOffset == 0 || _cachedOwnerHouse == 0)
+            {
+                text.AppendLine("【缺前置】还没建立「我方锚点」—— 先在游戏里选中**你自己的一个单位**，");
+                text.AppendLine("点一次「预演：秒杀敌人」，再回来点本按钮。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            // 前置：选中要试探的那座发电厂。用**宽松读取**（它能读到不属于我方的东西，
+            // 这样下面"这不是你的"那条拒绝提示才有意义），随后逐项核对。
+            List<uint> selected;
+            string note = "";
+            if (_selection == null || !_selection.TryReadSelectedObjectsLoose(_profile, 4, out selected, out note)
+                || selected.Count == 0)
+            {
+                text.AppendLine("【读不到选中的对象】" + note);
+                text.AppendLine("请先在游戏里**点选一座你自己的发电厂**，再点本按钮。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            uint target = selected[0];
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "试探目标：0x{0:X8}（你选中的{1}）", target, selected.Count > 1 ? "第一个对象" : "对象"));
+            text.AppendLine("正在试探…（约 4 秒，期间请不要关程序）");
+            SetOutput(text.ToString());
+            Logger.Info("Advanced", string.Format(CultureInfo.InvariantCulture,
+                "电力试探开始：目标 0x{0:X8}，候选字段 +0x{1:X}，试探值 {2}",
+                target, PowerProbe.CandidateOffset, PowerProbe.TestValue));
+
+            _powerProbeResult = null;
+            uint moduleBase = LiveModuleBase;
+            uint myHouse = _cachedOwnerHouse;
+            uint ownerOffset = _cachedOwnerOffset;
+            _powerProbeButton.Enabled = false;
+            _powerProbeThread = new System.Threading.Thread(delegate()
+            {
+                PowerProbe.Result probe;
+                try
+                {
+                    probe = PowerProbe.Run(_target.Memory, _profile, moduleBase, target, myHouse, ownerOffset);
+                }
+                catch (Exception ex)
+                {
+                    probe = new PowerProbe.Result();
+                    probe.Detail = "试探过程中出错：" + ex.Message;
+                }
+                _powerProbeResult = probe;      // 引用赋值，界面线程读到的要么是 null 要么是完整结果
+            });
+            _powerProbeThread.IsBackground = true;
+            _powerProbeThread.Start();
+            _powerProbeTimer.Start();
+        }
+
+        /// <summary>试探线程的收尾（界面线程）：把结果写出来，并在日志里留一份完整记录。</summary>
+        private void OnPowerProbeTick(object sender, EventArgs e)
+        {
+            if (_powerProbeResult == null) { return; }
+            _powerProbeTimer.Stop();
+            _powerProbeButton.Enabled = true;
+
+            PowerProbe.Result r = _powerProbeResult;
+            StringBuilder text = new StringBuilder();
+            text.AppendLine("=== 电力试探 结果 ===");
+            text.AppendLine(r.Detail);
+            if (r.Ok)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "界面「电力产出」读数：写前 {0} → 写中 {1} → 还原后 {2}",
+                    r.OutputBefore, r.OutputPeak, r.OutputAfter));
+                text.AppendLine(r.Verdict);
+                text.AppendLine();
+                text.AppendLine(r.Restored
+                    ? "原值已还原并回读确认 —— 游戏里没有任何残留改动。"
+                    : "⚠ **还原未确认！** 请立即把这段发给开发者，并关掉游戏（不要存档）。");
+            }
+            else
+            {
+                text.AppendLine("本次**没有完成试探**（原因见上）—— 没有留下任何改动。");
+            }
+
+            Logger.Info("Advanced", "电力试探结果：" + r.Detail
+                + (r.Ok ? string.Format(CultureInfo.InvariantCulture,
+                    "｜读数 {0} → {1} → {2}｜判定：{3}",
+                    r.OutputBefore, r.OutputPeak, r.OutputAfter,
+                    r.LooksLikeSource ? "是产出来源" : "不是产出来源") : ""));
             SetOutput(text.ToString());
         }
 

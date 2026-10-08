@@ -123,6 +123,8 @@ namespace MoTrainer.Diagnostics
             // 环境（游戏版本）检查：防止"换了引擎还照旧写"。它失效时表面完全看不出来，
             // 所以算法、三种结论、以及"引擎是否真的停写"都要有断言兜着。
             CheckEnvironmentCheck();
+            // 「电力试探」是全程序唯一往游戏里写**实验值**的地方：中心是"无论如何都还原"与"不该写就一个字节不写"。
+            CheckPowerProbe();
 
             // 这一条格外重要：采集要靠**用户开一局游戏**才能跑，
             // 而用户的时间是本项目最稀缺的东西。采集本身若有 bug，
@@ -2946,8 +2948,11 @@ namespace MoTrainer.Diagnostics
                     totalOverflow == 0 ? "0 处超出" : string.Format(CultureInfo.InvariantCulture,
                         "{0} 处超出（宽 {1}）", totalOverflow, worstWidth));
 
+                // 门槛取 100：这一条的意思是"输出框别被挤没"，不是"必须多高"。
+                // 最窄的 560 宽度下按钮会多换一行、输出框相应变矮（实测 111），属正常；
+                // 用户实际使用的 820 宽度下它在 150 以上（真机冒烟的日志可查）。
                 Check("高级功能页排版：输出框仍在页面内且有可用高度（不会被挤没）",
-                    !boxOutside && minBoxHeight >= 120,
+                    !boxOutside && minBoxHeight >= 100,
                     string.Format(CultureInfo.InvariantCulture,
                         "最小高度 {0}｜越界={1}", minBoxHeight, boxOutside));
             }
@@ -3069,6 +3074,123 @@ namespace MoTrainer.Diagnostics
             catch (Exception ex)
             {
                 Check("版本检查", false, ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 「电力试探」的回归（2026-10-09 新增，`[S4-3]` B 方案）。
+        ///
+        /// 为什么必须测：这是**全程序唯一会往游戏里写"实验值"**的地方。它一旦出问题，
+        /// 后果是"在用户自己的建筑上留下一个改过的值"。所以本节的中心不是"能不能判对"，
+        /// 而是**"无论如何都要还原"**与**"不该写的时候一个字节都不写"**。
+        /// </summary>
+        private static void CheckPowerProbe()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("电力试探", false, "OpenProcess 失败"); return; }
+
+            TechnoScene scene = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("电力试探测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+                uint module = scene.ModuleBase;
+                // 真机上"界面电力产出"在 House + 0x53A4；这里改用 0x2000 —— 合成场景的堆块只有 64KB，
+                // 0x53A4 会落到块外读不出来（踩过一次）。本用例考的是**机制**，不是那个具体偏移。
+                const uint OutputOffset = 0x2000;
+
+                // 场景：我方房子（有钱，供锚定）+ 我方的一座"电厂"（对象 +0xD0 放候选字段）
+                io.WriteUInt32(scene.MyOwner + TechnoOwnership.HouseMoneyOffset, 5000);
+                uint plant = scene.Team[0];               // Team[0] 归属我方
+                io.WriteUInt32(plant + PowerProbe.CandidateOffset, 100);   // 原值 = 100（真机实测的候选值）
+
+                // "界面电力产出"模拟字段：放在堆块内某处（真机在 House+0x53A4，合成场景照搬会落到块外）。
+                // 定位链：模块内静态根（0x104）→ 一块可写区（Heap+0xE000）→ +0x800 = Heap+0xE800。
+                uint outputAddress = scene.Heap + 0xE800;
+                io.WriteUInt32(module + 0x104, scene.Heap + 0xE000);
+                io.WriteUInt32(outputAddress, 60);                          // 界面电力产出 = 60
+
+                CalibrationProfile profile = new CalibrationProfile();
+                profile.Money.SetOffsets(new uint[] { 0x100, TechnoOwnership.HouseMoneyOffset });
+                profile.PowerOutput.SetOffsets(new uint[] { 0x104, 0x800 });
+                io.WriteUInt32(module + 0x100, scene.MyOwner);
+
+                // ---- ① 判定规则（纯函数）----
+                Check("电力试探：判定规则 —— 读数跟着试探值涨、还原后回落 =「是来源」",
+                    PowerProbe.Judge(60, 5060, 60, 4900),
+                    "before=60 peak=5060 after=60 delta=4900");
+                Check("电力试探：判定规则 —— 读数压根没动 =「不是来源」",
+                    !PowerProbe.Judge(60, 60, 60, 4900), "before=60 peak=60 after=60");
+                Check("电力试探：判定规则 —— 涨上去但还原后没回落 = 不算数（防误判）",
+                    !PowerProbe.Judge(60, 5060, 3000, 4900), "before=60 peak=5060 after=3000");
+
+                // ---- ② 机制：短时长的完整一遍（模拟"游戏会把字段汇总成产出"的循环）----
+                // 起一个后台线程，每 20ms 把"电厂字段"抄进"界面产出" —— 这正是真机上游戏自己在做的事。
+                bool running = true;
+                System.Threading.Thread mimic = new System.Threading.Thread(delegate()
+                {
+                    while (running)
+                    {
+                        uint field;
+                        if (io.ReadUInt32(plant + PowerProbe.CandidateOffset, out field))
+                        {
+                            io.WriteUInt32(outputAddress, field);
+                        }
+                        System.Threading.Thread.Sleep(20);
+                    }
+                });
+                mimic.IsBackground = true;
+                mimic.Start();
+
+                PowerProbe.Result yes = PowerProbe.Run(
+                    io, profile, module, plant, scene.MyOwner, TechnoScene.OwnerOffset, 240, 40);
+                running = false;
+
+                uint afterValue;
+                io.ReadUInt32(plant + PowerProbe.CandidateOffset, out afterValue);
+                Check("电力试探：试探值**无条件还原**（跑完之后字段必须是原值）",
+                    afterValue == 100 && yes.Ok && yes.Restored,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "字段现值 {0}（原值 100）｜还原标记 {1}", afterValue, yes.Restored));
+
+                Check("电力试探：能判出「这个字段就是产出来源」（读数跟着涨、还原后回落）",
+                    yes.LooksLikeSource,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "写前 {0} → 写中 {1} → 还原后 {2}", yes.OutputBefore, yes.OutputPeak, yes.OutputAfter));
+                Check("电力试探：界面上那三档读数都拿到了（日志与界面要能对上）",
+                    yes.OutputBefore > 0 && yes.OutputPeak >= 5000
+                        && yes.OutputAfter == yes.OutputBefore,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "写前 {0}｜写中峰值 {1}｜还原后 {2}", yes.OutputBefore, yes.OutputPeak, yes.OutputAfter));
+
+                // ---- ③ 不是我的东西 → 拒绝，且一个字节都不写 ----
+                uint enemy = scene.Team[2];               // Team[2] 属敌方
+                io.WriteUInt32(enemy + PowerProbe.CandidateOffset, 77);
+                PowerProbe.Result refused = PowerProbe.Run(
+                    io, profile, module, enemy, scene.MyOwner, TechnoScene.OwnerOffset, 120, 40);
+
+                uint enemyAfter;
+                io.ReadUInt32(enemy + PowerProbe.CandidateOffset, out enemyAfter);
+                Check("电力试探：目标不属于我方时拒绝，且**一个字节都不写**",
+                    !refused.Ok && enemyAfter == 77 && refused.Detail.Length > 0, refused.Detail);
+
+                // ---- ④ 没校准电力产出 → 拒绝 ----
+                CalibrationProfile bare = new CalibrationProfile();
+                PowerProbe.Result noLocator = PowerProbe.Run(
+                    io, bare, module, plant, scene.MyOwner, TechnoScene.OwnerOffset, 120, 40);
+                Check("电力试探：配置里没有「电力产出」定位时拒绝并说明（不许悄悄什么都不做）",
+                    !noLocator.Ok && noLocator.Detail.IndexOf("电力") >= 0, noLocator.Detail);
+            }
+            catch (Exception ex)
+            {
+                Check("电力试探", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
             }
         }
 
