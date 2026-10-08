@@ -126,9 +126,62 @@ namespace MoTrainer.Calibration
                     "  +0x{0:X3} = {1}", numbers[i].ObjectOffset, numbers[i].Value));
             }
 
+            // ③ **深挖**：把上面那些"疑似类型对象"的结构本身也摊开看一遍（只读）。
+            // 为什么：电力在尤里复仇里是"建筑类型"上的属性（同类建筑共用一份），
+            // 而类型对象整局不变、采集报告里永远看不到 —— 只能现场看。
+            text.AppendLine();
+            text.AppendLine("—— 深挖：指针目标结构内部（每个最多列 40 个字段）——");
+            for (int i = 0; i < pointers.Count && i < 6; i++)
+            {
+                AppendTargetDump(text, memory, pointers[i].ObjectOffset, pointers[i].Value);
+            }
+
             text.AppendLine();
             text.AppendLine("本次**没有写入任何内存**。把这段（或整个日志）发回给开发者即可。");
             return text.ToString();
+        }
+
+        /// <summary>
+        /// 把一个"指针目标结构"摊开看（**只读**）：字符串指针（带原文）+ 小整数，
+        /// 两类都按"像不像建筑类型的属性"来列（电力值一般就是 50~500 这种小整数）。
+        /// </summary>
+        private static void AppendTargetDump(StringBuilder text, MemoryIO memory, uint fromOffset, uint target)
+        {
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "  · 目标 0x{0:X8}（来自对象 +0x{1:X3}）：", target, fromOffset));
+
+            byte[] block = memory.ReadBytesQuiet(target, 0x400);
+            if (block == null) { text.AppendLine("      读不动"); return; }
+
+            // 字符串指针（大概率是名字/ID/EVA 事件名）
+            int strings = 0;
+            for (int i = 0; i + 4 <= block.Length && strings < 6; i += 4)
+            {
+                uint inner = ReadUInt32(block, i);
+                if (inner < 0x10000 || inner > 0x7FFFFFFF) { continue; }
+                string ascii = ReadAsciiString(memory, inner, 40);
+                if (ascii != null)
+                {
+                    strings++;
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "      +0x{0:X3} → 字符串「{1}」", i, ascii));
+                }
+            }
+
+            // 小整数（电力值就在这一堆里）
+            StringBuilder numbers = new StringBuilder();
+            int count = 0;
+            for (int i = 0; i + 4 <= block.Length; i += 4)
+            {
+                uint value = ReadUInt32(block, i);
+                if (value < 10 || value > 100000) { continue; }
+                if (count > 0) { numbers.Append("、"); }
+                numbers.Append(string.Format(CultureInfo.InvariantCulture, "+0x{0:X3}={1}", i, value));
+                count++;
+                if (count >= 40) { break; }
+            }
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "      小整数 {0} 个：{1}", count, numbers.ToString()));
         }
 
         /// <summary>
@@ -169,7 +222,17 @@ namespace MoTrainer.Calibration
                 if (b < 0x20 || b > 0x7E) { return null; }   // 出现不可打印字符 → 不是字符串
                 text.Append((char)b);
             }
-            return text.Length >= 3 ? text.ToString() : null;
+            // 至少 5 个字符、且只由字母/数字/下划线组成 —— 真机踩过：3 个字符的巧合（如 "0hO"）
+            // 会把"阵营对象的虚表指针"误报成"类型对象里的 ID 字符串"。
+            if (text.Length < 5) { return null; }
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+                bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                    || (c >= '0' && c <= '9') || c == '_';
+                if (!ok) { return null; }
+            }
+            return text.ToString();
         }
 
         private static uint ReadUInt32(byte[] buffer, int offset)
