@@ -27,6 +27,14 @@ namespace MoTrainer.Calibration
         /// <summary>扫描对象头部多少字节。真机上这类对象本身就有 0x708 字节，取 0x800 全覆盖。</summary>
         public const int ScanBytes = 0x800;
 
+        /// <summary>
+        /// 「建筑类型对象」指针在对象内的偏移 —— **真机归纳出来的**（不是猜的）：
+        /// 2026-10-09 凌晨对三座不同建筑（电厂/兵营/核电站）侦查，只有这个偏移指向的目标**三种各不相同**，
+        /// 且其中一个目标里带着类型对象才有的字符串（「NetID」）。类型对象是"同类建筑共用一份"的
+        /// （电力的 `Power=` 就是类型上的属性），所以"随类型而变"正是它的特征。
+        /// </summary>
+        public const uint TypePointerOffset = 0x0E4;
+
         /// <summary>顺着指针看目标的前多少个双字（找"指向字符串的指针"）。真机踩过：窗口太浅会漏掉类型对象的 ID。</summary>
         private const int PeekDwords = 128;
 
@@ -170,6 +178,22 @@ namespace MoTrainer.Calibration
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture, "  +0x{0:X3}  {1}", row, line.ToString()));
             }
 
+            // ⑤ **类型对象专段**：把 +0x0E4 指向的那个结构完整摊开（只读）。
+            //    数值带**正负号**：兵营这类**耗电**建筑的类型里，电力那一栏应当是个**负数** ——
+            //    成本和血量永远不会是负数，所以"负值"就是电力字段的指纹。
+            text.AppendLine();
+            uint typePointer;
+            if (memory.ReadUInt32(objectAddress + TypePointerOffset, out typePointer) && typePointer >= 0x10000)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "—— 类型对象（对象 +0x{0:X} = 0x{1:X8}）完整摊开 ——", TypePointerOffset, typePointer));
+                AppendTypeDump(text, memory, typePointer);
+            }
+            else
+            {
+                text.AppendLine("（读不到对象 +0x0E4 的类型指针）");
+            }
+
             text.AppendLine();
             text.AppendLine("本次**没有写入任何内存**。把这段（或整个日志）发回给开发者即可。");
             return text.ToString();
@@ -275,6 +299,46 @@ namespace MoTrainer.Calibration
                 if (!ok) { return null; }
             }
             return text.ToString();
+        }
+
+        /// <summary>
+        /// 把"类型对象"完整摊开（**只读**）：字符串指针（带原文）、以及**带正负号**的数值。
+        /// 带上负值是因为：耗电建筑的类型里电力是负数，而成本/血量不可能为负 —— 负值就是指纹。
+        /// </summary>
+        private static void AppendTypeDump(StringBuilder text, MemoryIO memory, uint target)
+        {
+            byte[] block = memory.ReadBytesQuiet(target, 0x800);
+            if (block == null) { text.AppendLine("      读不动"); return; }
+
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "      头 4 字节 0x{0:X8}｜前 8 个双字：{1}", ReadUInt32(block, 0), DescribeDwords(block, 8)));
+
+            for (int i = 0; i + 4 <= block.Length; i += 4)
+            {
+                uint inner = ReadUInt32(block, i);
+                if (inner < 0x10000 || inner > 0x7FFFFFFF) { continue; }
+                string ascii = ReadAsciiString(memory, inner, 40);
+                if (ascii != null)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "      +0x{0:X3} → 字符串「{1}」", i, ascii));
+                }
+            }
+
+            StringBuilder numbers = new StringBuilder();
+            int count = 0;
+            for (int i = 0; i + 4 <= block.Length; i += 4)
+            {
+                int signed = (int)ReadUInt32(block, i);
+                if (signed == 0 || signed < -100000 || signed > 1000000) { continue; }
+                if (count > 0) { numbers.Append('、'); }
+                numbers.Append(string.Format(CultureInfo.InvariantCulture, "+0x{0:X3}={1}", i, signed));
+                count++;
+                if (count >= 100) { break; }
+            }
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "      带符号数值 {0} 个（**负数**最值得看 —— 耗电建筑的电力就是负的）：", count));
+            text.AppendLine("        " + numbers.ToString());
         }
 
         /// <summary>把前 n 个双字排成一行（十六进制），用于快速辨认结构。</summary>
