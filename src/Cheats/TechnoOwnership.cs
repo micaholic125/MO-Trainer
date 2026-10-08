@@ -91,6 +91,13 @@ namespace MoTrainer.Cheats
             /// <summary>我方对象数。</summary>
             public int Mine;
 
+            /// <summary>**被用户标记为友军**的阵营所拥有的对象数（`AllyGuard`）。这些与"疑似中立"一样绝不杀。</summary>
+            public int Ally;
+
+            /// <summary>友军阵营分组（归属 → 对象列表），供界面显示"你标记了哪几个阵营、各有多少东西"。</summary>
+            public readonly Dictionary<uint, List<TechnoObject>> AllyByGroup =
+                new Dictionary<uint, List<TechnoObject>>();
+
             /// <summary>归属读不出来 / 不像真阵营的对象数（**跳过，绝不写**）。</summary>
             public int Unknown;
 
@@ -124,10 +131,15 @@ namespace MoTrainer.Cheats
         }
 
         /// <summary>
-        /// 把一批对象按归属分成四类：**我方 / 可击杀 / 疑似中立（金钱 0，不杀）/ 归属存疑（不杀）**。
+        /// 把一批对象按归属分成五类：**我方 / 友军（用户标记过，不杀）/ 可击杀 /
+        /// 疑似中立（金钱 0，不杀）/ 归属存疑（不杀）**。
         ///
         /// 引擎与「预演」共用这一份实现 —— 预演上看到的数字与真正开杀时用的名单**完全一致**，
         /// 不允许出现"预演说杀 30 个、实际杀 178 个"这种两套判据的情况。
+        ///
+        /// **友军这一档是 2026-10-08 晚按用户提问补的**：AI 队友（以及局域网的人类队友）
+        /// 有自己的阵营、也通常有钱，旧规则会把他们一起清掉 —— 而这类误伤不可逆。
+        /// 现在由用户在游戏里点选队友单位、手动标记（`AllyGuard`），标记过的阵营一律跳过。
         /// </summary>
         public static OwnerClassification ClassifyOwners(
             MemoryIO memory, IList<TechnoObject> objects, uint ownerOffset, uint myHouse,
@@ -143,6 +155,21 @@ namespace MoTrainer.Cheats
                 if (!memory.ReadUInt32(address + ownerOffset, out owner)) { result.Unknown++; continue; }
                 if (owner == 0) { result.Unknown++; continue; }
                 if (owner == myHouse) { result.Mine++; continue; }
+
+                // 用户标记过的友军阵营 —— 与"疑似中立"同一层保护，绝不写。
+                // **必须排在中立/敌方判据之前**：队友的阵营有钱，"金钱 0"那条挡不住它。
+                if (AllyGuard.IsProtected(owner))
+                {
+                    result.Ally++;
+                    List<TechnoObject> allied;
+                    if (!result.AllyByGroup.TryGetValue(owner, out allied))
+                    {
+                        allied = new List<TechnoObject>();
+                        result.AllyByGroup[owner] = allied;
+                    }
+                    allied.Add(objects[i]);
+                    continue;
+                }
 
                 uint money;
                 if (!TryReadHouseMoney(memory, owner, moduleBase, moduleSize, out money))

@@ -63,6 +63,7 @@ namespace MoTrainer.Ui.Pages
 
         private readonly Button _scanButton;
         private readonly Button _findButton;
+        private readonly Button _markAllyButton;
         private readonly Button _shroudButton;
         private readonly Button _harvestButton;
         private readonly Label _harvestStatus;
@@ -136,6 +137,16 @@ namespace MoTrainer.Ui.Pages
             _shroudButton.Click += OnShroudClick;
             Controls.Add(_shroudButton);
 
+            // 「标记友军」：把选中的东西所属的阵营记入"永不秒杀"名单。
+            // 为什么必须由用户点一下：秒杀只认"不是你 + 阵营有钱"，
+            // **不知道"同盟"** —— AI 队友 / 局域网人类队友恰好符合"不是你 + 有钱"，
+            // 会被一起清掉，而且不可逆（2026-10-08 用户提问时发现，见 `AllyGuard` 的注释）。
+            _markAllyButton = UiFactory.MakePrimaryButton("标记友军（不会杀）", 180);
+            _markAllyButton.Location = new Point(620, 124);
+            _markAllyButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _markAllyButton.Click += OnMarkAllyClick;
+            Controls.Add(_markAllyButton);
+
             Label hint = new Label();
             hint.AutoSize = false;
             hint.Font = Theme.Small;
@@ -143,7 +154,7 @@ namespace MoTrainer.Ui.Pages
             hint.Text = "用法：先在游戏里选中一个自己的单位，再点「自动查找总名单」。选中的单位会用来确认名单是否找对。";
             hint.Location = new Point(24, 130);
             hint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            hint.Size = new Size(760, 20);
+            hint.Size = new Size(580, 20);
             Controls.Add(hint);
 
             // ---- 一键采集 ----
@@ -1253,8 +1264,9 @@ namespace MoTrainer.Ui.Pages
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                     "遍历到 {0} 个对象", walk.Count));
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "**将击杀：{0} 个**｜**放过我方：{1} 个**｜**疑似中立（不杀）：{2} 个**｜归属存疑（不杀）：{3} 个",
-                    cls.KillableCount, cls.Mine, cls.NeutralCount, cls.Unknown));
+                    "**将击杀：{0} 个**｜**放过我方：{1} 个**｜**疑似中立（不杀）：{2} 个**"
+                    + "｜**友军不杀：{3} 个**｜归属存疑（不杀）：{4} 个",
+                    cls.KillableCount, cls.Mine, cls.NeutralCount, cls.Ally, cls.Unknown));
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                     "血量偏移 +0x{0:X}（写入时每个目标都会先校验、写后回读）",
                     _profile.OffsetTechnoHealth));
@@ -1268,6 +1280,14 @@ namespace MoTrainer.Ui.Pages
                     AppendOwnerGroups(text, memory,
                         "疑似中立 / 民用（**不会杀**）", cls.NeutralByGroup, anchor.OwnerOffset);
                     text.AppendLine("  说明：这些阵营的「金钱」读数一直是 0 —— 中立 / 民用建筑通常如此，所以默认保护。");
+                    text.AppendLine();
+                }
+
+                if (cls.Ally > 0)
+                {
+                    AppendOwnerGroups(text, memory,
+                        "友军（**你标记过的，不会杀**）", cls.AllyByGroup, anchor.OwnerOffset);
+                    text.AppendLine("  说明：这些阵营是你在「标记友军」里点过的 —— 队友（AI 或人类）靠它免于误伤。");
                     text.AppendLine();
                 }
 
@@ -1297,6 +1317,104 @@ namespace MoTrainer.Ui.Pages
             text.AppendLine(rosterSuspect
                 ? "本次**没有写入任何内存**。名单未通过自检，**秒杀不要开启**：请重新「自动查找总名单」后再点本按钮。"
                 : "本次**没有写入任何内存**。确认数字合理（特别是「放过我方」应等于你自己的东西总数）后再开启「秒杀敌人」。");
+            SetOutput(text.ToString());
+        }
+
+        /// <summary>
+        /// 「标记友军」：把**当前选中对象所属的阵营**记入"永不秒杀"名单（`AllyGuard`）。
+        ///
+        /// 为什么必须由用户点一下，而不是程序自动判断：秒杀的判据只有"不是你 + 阵营有钱"，
+        /// 它**不知道"同盟"这回事**；AI 队友 / 局域网里的人类队友恰好是"不是你 + 有钱"，
+        /// 会被一起清掉，而这类误伤**不可逆**。由用户点选队友的任意一个单位来标记，
+        /// 是不需要猜游戏内部结构、又能当场验证的办法；误标记一个敌人的后果也只是"少杀"（方向安全）。
+        ///
+        /// 前置：读"阵营字段"用的偏移来自**本次会话已建立的我方锚点**（`_cachedOwnerOffset`）——
+        /// 那是同一套对象布局（我方单位与队友单位是同一类对象）。没建过锚点就明确提示，不猜偏移。
+        /// </summary>
+        private void OnMarkAllyClick(object sender, EventArgs e)
+        {
+            StringBuilder text = new StringBuilder();
+            text.AppendLine("=== 标记友军（此后永不参与秒杀）===");
+            text.AppendLine();
+
+            MemoryIO memory = _target.Memory;
+            if (_cachedOwnerOffset == 0)
+            {
+                text.AppendLine("【缺前置】还没建立「我方锚点」—— 程序要靠它知道去对象的哪个位置读阵营。");
+                text.AppendLine("请先在游戏里选中**你自己的一个单位**，点一次「预演：秒杀敌人」，再回来点本按钮。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            List<uint> selected;
+            string note = "";
+            if (_selection == null
+                || !_selection.TryReadSelectedObjectsLoose(_profile, 4, out selected, out note))
+            {
+                text.AppendLine("【读不到选中的对象】" + note);
+                text.AppendLine("请在游戏里**点选队友的一个单位或建筑**（点一下就行），再点本按钮。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            int marked = 0;
+            for (int i = 0; i < selected.Count && i < 4; i++)
+            {
+                uint address = selected[i];
+                uint owner;
+                if (!ReadUInt32Retry(memory, address + _cachedOwnerOffset, out owner) || owner < 0x10000)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8} → 归属读不出，没有标记", address));
+                    continue;
+                }
+                if (owner == _cachedOwnerHouse)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8} → 这是**你自己的阵营**，不用标记（秒杀本来就不会碰自己人）", address));
+                    continue;
+                }
+
+                uint money;
+                if (!TechnoOwnership.TryReadHouseMoney(memory, owner, LiveModuleBase, LiveModuleSize, out money))
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8} → 它的归属值 0x{1:X8} 不像真阵营（读不出阵营数据），**没有标记** ——"
+                        + "请确认选中的是队友的部队或建筑", address, owner));
+                    continue;
+                }
+
+                if (AllyGuard.IsProtected(owner))
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8} → 阵营 0x{1:X8} **刚才已经标记过**了", address, owner));
+                    continue;
+                }
+
+                if (AllyGuard.Mark(owner))
+                {
+                    marked++;
+                    Logger.Info("Advanced", string.Format(CultureInfo.InvariantCulture,
+                        "已标记友军阵营 0x{0:X8}（对象 0x{1:X8} 的归属）—— 秒杀不会再写它的任何东西",
+                        owner, address));
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8} → **已标记为友军**：阵营 0x{1:X8}（金钱读数 {2}）", address, owner, money));
+                }
+            }
+
+            text.AppendLine();
+            if (marked > 0)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "现在共标记了 {0} 个友军阵营 —— 秒杀**不会**碰它们的任何东西（与「疑似中立」同一层保护）。",
+                    AllyGuard.Count));
+                text.AppendLine("**每次重新开局都要重新标记一次**（阵营地址每局都会变，程序不会跨局沿用）。");
+                text.AppendLine("验证办法：再点一次「预演」，上面会多出「**友军不杀：N 个**」这一项。");
+            }
+            else
+            {
+                text.AppendLine("本次没有新增标记（原因见上）。你想保护的队友，标记一次就够了。");
+            }
             SetOutput(text.ToString());
         }
 
@@ -1385,6 +1503,14 @@ namespace MoTrainer.Ui.Pages
                 {
                     text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                         "  0x{0:X8}（类型 0x{1:X8}）→ **我方**", address, type));
+                    continue;
+                }
+
+                if (AllyGuard.IsProtected(owner))
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8}（类型 0x{1:X8}）→ **友军（你标记过，不会杀）**（归属 0x{2:X8}）",
+                        address, type, owner));
                     continue;
                 }
 

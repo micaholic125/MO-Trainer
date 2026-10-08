@@ -3254,13 +3254,23 @@ namespace MoTrainer.Diagnostics
                 uint neutralHouse = scene.Heap + 0xFC00;
                 io.WriteUInt32(neutralHouse + TechnoOwnership.HouseMoneyOffset, 0);   // 金钱 0 = 疑似中立
 
+                // 2026-10-08 晚新增：**有钱的友军阵营**（AI 队友/人类队友就是这样）——
+                // 它和"疑似中立"的关键区别就是**有钱**，所以"金钱 0 不杀"那条挡不住它。
+                // 用户拍板用「标记友军」兜底：没标记 → 会被当敌人清掉；标记过 → 一个字节都不碰。
+                // 房子要放在堆块内：它的"金钱字段"在 +0x30C，放得太靠边会落到块外读不出来
+                // （踩过一次：0xFE00 + 0x30C 已经越过 64KB 的堆块 → 阵营被当成"读不出"）。
+                uint allyHouse = scene.Heap + 0xE800;
+                io.WriteUInt32(allyHouse + TechnoOwnership.HouseMoneyOffset, 8888);
+                uint ally1 = scene.Heap + 0x3300;
+                uint ally2 = scene.Heap + 0x3400;
+
                 uint neutral1 = scene.Heap + 0x3000;
                 uint neutral2 = scene.Heap + 0x3100;
                 uint junkOwner = scene.Heap + 0x3200;      // 归属值 = 代码区地址 → 存疑
                 uint myExtra = scene.Heap + 0x4300;        // 我方对象（邻居几何用）
                 uint neighborEnemy = scene.Heap + 0x3D00;  // 敌方对象，其旧 0x1000 窗口含上面的自己人
 
-                uint[] extra = new uint[] { neutral1, neutral2, junkOwner, myExtra, neighborEnemy };
+                uint[] extra = new uint[] { neutral1, neutral2, junkOwner, myExtra, neighborEnemy, ally1, ally2 };
                 for (int i = 0; i < extra.Length; i++)
                 {
                     io.WriteUInt32(extra[i], scene.ModuleBase + 0x2000);   // 共用类型表（像真对象）
@@ -3275,8 +3285,10 @@ namespace MoTrainer.Diagnostics
                 io.WriteUInt32(scene.ModuleBase + 0x800 + TechnoOwnership.HouseMoneyOffset, 12345);
                 io.WriteUInt32(myExtra + OwnerOffset, scene.MyOwner);
                 io.WriteUInt32(neighborEnemy + OwnerOffset, scene.EnemyOwner);
+                io.WriteUInt32(ally1 + OwnerOffset, allyHouse);
+                io.WriteUInt32(ally2 + OwnerOffset, allyHouse);
 
-                // 全对象名单：模块内的"格子"（静态地址）→ 扩展数组（原 7 项 + 这 5 个）
+                // 全对象名单：模块内的"格子"（静态地址）→ 扩展数组（原 7 项 + 这 7 个）
                 uint rosterSlot = module + 0x200;
                 uint rosterCount = module + 0x204;
                 uint rosterArray = scene.Arrays + 0x2000;
@@ -3284,10 +3296,10 @@ namespace MoTrainer.Diagnostics
                 {
                     scene.Team[0], scene.Team[1], scene.Team[2],
                     scene.Team[3], scene.Team[4], scene.Team[5], scene.RareObject,
-                    neutral1, neutral2, junkOwner, myExtra, neighborEnemy
+                    neutral1, neutral2, junkOwner, myExtra, neighborEnemy, ally1, ally2
                 });
                 io.WriteUInt32(rosterSlot, rosterArray);
-                io.WriteUInt32(rosterCount, 12);
+                io.WriteUInt32(rosterCount, 14);
 
                 // 选中名单：数量 + 指针槽（槽里放一张只含我方两个对象的数组）
                 uint selCount = module + 0x300;
@@ -3450,6 +3462,107 @@ namespace MoTrainer.Diagnostics
                 engine.Stop();
                 engine = null;
                 io.WriteUInt32(rosterSlot, rosterArray);
+
+                // ================= ⑤ 「标记友军」→ 绝不杀（2026-10-08 晚新增） =================
+                //
+                // 背景（用户提问）：秒杀的判据只有"不是你 + 阵营有钱"，它**不知道"同盟"** ——
+                // AI 队友 / 局域网人类队友恰好符合这两条，会被一起清掉，而这类误伤**不可逆**。
+                // 用户拍板用"手动标记友军"兜底，这一节把"标记前会被杀、标记后一个字节不碰"钉死。
+                for (int i = 2; i <= 4; i++) { io.WriteUInt32(scene.Team[i] + HealthOffset, 100); }
+                io.WriteUInt32(neighborEnemy + HealthOffset, 100);
+                io.WriteUInt32(ally1 + HealthOffset, 100);
+                io.WriteUInt32(ally2 + HealthOffset, 100);
+
+                // ---- ⑤-a 标记之后的分类：友军单独归一类，绝不进入可击杀名单 ----
+                AllyGuard.Reset();
+                AllyGuard.Mark(allyHouse);
+
+                TechnoWalkResult allyRoster = TechnoWalker.WalkArray(
+                    io, rosterArray, 14, scene.ModuleBase, scene.ModuleSize);
+                TechnoOwnership.OwnerClassification allyCls = TechnoOwnership.ClassifyOwners(
+                    io, allyRoster.Objects, OwnerOffset, scene.MyOwner, scene.ModuleBase, scene.ModuleSize);
+                bool allyNotKillable = true;
+                for (int i = 0; i < allyCls.Killable.Count; i++)
+                {
+                    if (allyCls.Killable[i].Address == ally1 || allyCls.Killable[i].Address == ally2)
+                    {
+                        allyNotKillable = false;
+                    }
+                }
+                Check("分类：标记过的友军阵营单独归为「友军」，绝不进入可击杀名单",
+                    allyCls.Ally == 2 && allyNotKillable && allyCls.KillableCount >= 3,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "友军 {0}｜可击杀 {1}｜我方 {2}｜疑似中立 {3}｜存疑 {4}",
+                        allyCls.Ally, allyCls.KillableCount, allyCls.Mine, allyCls.NeutralCount, allyCls.Unknown));
+
+                // ---- ⑤-b **没标记**时它会被杀：这条断言记录"这个洞是真实存在的"（也解释了为什么必须标记）----
+                AllyGuard.Reset();
+                engine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature unmarked = engine.Add(new CheatFeature(
+                    CheatId.KillEnemies, "秒杀", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+                unmarked.Enabled = true;
+                engine.Start();
+
+                bool unmarkedAllyDied = WaitUntil(delegate
+                {
+                    return scene.ReadField(ally1, HealthOffset) == 0
+                        && scene.ReadField(ally2, HealthOffset) == 0;
+                }, 3000);
+                Check("秒杀：**没标记**的友军阵营会被当成敌人清掉（这就是「必须先标记」的原因）",
+                    unmarkedAllyDied,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "未标记友军血量 {0}/{1}", scene.ReadField(ally1, HealthOffset), scene.ReadField(ally2, HealthOffset)));
+
+                engine.Stop();
+                engine = null;
+
+                // ---- ⑤-c 标记之后：一个字节都不碰，敌人照杀 ----
+                for (int i = 2; i <= 4; i++) { io.WriteUInt32(scene.Team[i] + HealthOffset, 100); }
+                io.WriteUInt32(neighborEnemy + HealthOffset, 100);
+
+                engine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature marked = engine.Add(new CheatFeature(
+                    CheatId.KillEnemies, "秒杀", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+                marked.Enabled = true;
+                engine.Start();
+
+                // 顺序要和真机一致：**先连上游戏、引擎跑起来，再标记友军**。
+                // （引擎在"游戏刚连上"那一刻会清空会话级缓存 —— 那是防"换局拿旧地址认人"的，
+                //   标记放在这之后才不会被那一拍清掉；真机上用户也是连上游戏之后才点标记。）
+                Thread.Sleep(300);
+                AllyGuard.Mark(allyHouse);
+                io.WriteUInt32(ally1 + HealthOffset, 100);   // 标记前若挨过一拍，这里复原
+                io.WriteUInt32(ally2 + HealthOffset, 100);
+
+                bool enemiesStillDie = WaitUntil(delegate
+                {
+                    return scene.ReadField(scene.Team[2], HealthOffset) == 0
+                        && scene.ReadField(scene.Team[3], HealthOffset) == 0
+                        && scene.ReadField(scene.Team[4], HealthOffset) == 0;
+                }, 3000);
+
+                // 再让引擎多跑几拍：判据每一拍都重新算，若友军被算进"可击杀"，它 0.5 秒内就会被打回 0
+                Thread.Sleep(1200);
+
+                Check("秒杀：标记过的友军阵营一个字节都不写（队友免于误伤），敌人照杀不误",
+                    enemiesStillDie
+                        && scene.ReadField(ally1, HealthOffset) == 100
+                        && scene.ReadField(ally2, HealthOffset) == 100,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "友军血量 {0}/{1}｜敌方 {2}/{3}/{4}｜写入 {5} 次",
+                        scene.ReadField(ally1, HealthOffset), scene.ReadField(ally2, HealthOffset),
+                        scene.ReadField(scene.Team[2], HealthOffset),
+                        scene.ReadField(scene.Team[3], HealthOffset),
+                        scene.ReadField(scene.Team[4], HealthOffset),
+                        marked.WriteCount));
+
+                engine.Stop();
+                engine = null;
+
+                // 静态登记处是进程内共享的 —— 用完必须清掉，否则会污染后面的用例
+                AllyGuard.Reset();
             }
             catch (Exception ex)
             {
@@ -3457,6 +3570,7 @@ namespace MoTrainer.Diagnostics
             }
             finally
             {
+                AllyGuard.Reset();   // 静态状态：任何一个用例抛异常都不能把"友军标记"留给后面
                 if (engine != null) { try { engine.Dispose(); } catch (Exception) { } }
                 if (scene != null) { scene.Dispose(); }
                 self.Dispose();

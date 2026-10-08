@@ -702,10 +702,11 @@ namespace MoTrainer.Cheats
             {
                 _lastKillLog = DateTime.UtcNow;
                 Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
-                    "秒杀敌人：名单 {0} 个｜我方 {1}｜可击杀 {2}（{3} 个阵营）｜疑似中立不杀 {4}｜归属存疑不杀 {5}"
-                    + "｜本拍写入 {6} 跳过 {7}｜累计写入 {8}｜阵营字段 +0x{9:X}=0x{10:X8}（金钱锚定）",
+                    "秒杀敌人：名单 {0} 个｜我方 {1}｜可击杀 {2}（{3} 个阵营）｜疑似中立不杀 {4}"
+                    + "｜友军不杀 {5}（{6} 个阵营，你标记的）｜归属存疑不杀 {7}"
+                    + "｜本拍写入 {8} 跳过 {9}｜累计写入 {10}｜阵营字段 +0x{11:X}=0x{12:X8}（金钱锚定）",
                     walk.Count, cls.Mine, cls.KillableCount, cls.KillableGroupCount,
-                    cls.NeutralCount, cls.Unknown,
+                    cls.NeutralCount, cls.Ally, cls.AllyByGroup.Count, cls.Unknown,
                     result.Written, result.Skipped,
                     feature.WriteCount, _myOwnerOffset, _myOwner));
             }
@@ -995,9 +996,22 @@ namespace MoTrainer.Cheats
             _healthPeak.Clear();
             _selection.Reset();
 
-            if (hadState)
+            // 「标记友军」的名单同样是**会话级**的：阵营地址每局重新分配，
+            // 跨局沿用 = 可能保护到别的阵营（该杀的没杀），甚至保护到真正的敌人。
+            bool hadAllies = AllyGuard.Count > 0;
+            AllyGuard.Reset();
+
+            if (hadState || hadAllies)
             {
-                Logger.Info("Engine", "游戏（重新）连接：已作废上一局的会话级缓存（保护名单 / 我方锚点），避免拿旧地址误写");
+                Logger.Info("Engine", "游戏（重新）连接：已作废上一局的会话级缓存"
+                    + "（保护名单 / 我方锚点 / 已标记的友军阵营），避免拿旧地址误写");
+            }
+            if (hadAllies)
+            {
+                // 「标记友军」清空必须**说得出来**：否则用户以为队友还受保护，实际已经失效 ——
+                // 那正是"看起来能用、实际会误伤队友"的最坏形态。
+                Logger.Warn("Engine", "已清空上一局标记的友军阵营 —— **如果这一局有队友，请重新点一次「标记友军」**"
+                    + "（阵营地址每局都会变，程序不会跨局沿用）");
             }
         }
 
