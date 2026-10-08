@@ -11,6 +11,7 @@ using MoTrainer.Calibration;
 using MoTrainer.Cheats;
 using MoTrainer.Core;
 using MoTrainer.Ui.Controls;
+using MoTrainer.Ui.Pages;   // 页面排版自检要真造出「高级功能」页来量控件位置
 using MoTrainer.Util;
 
 // 布局自检要用真实控件量尺寸，所以需要 WinForms 与绘图类型
@@ -115,6 +116,10 @@ namespace MoTrainer.Diagnostics
             // 引擎层的端到端接线回归（2026-10-07 [S6-1]）：名单从哪来、我方是谁、
             // 什么时候必须拒绝 —— 这些参数链路的风险只有到引擎层才测得到。
             CheckKillWiring();
+            // 「高级功能」页的排版（2026-10-08 晚）：用户真机截图里按钮挤成一堆、压住提示文字。
+            // 这类问题**本机 96 DPI 复现不出来**（用户显示器有缩放），所以只能靠"用数字量"：
+            // 直接造出页面、在几档宽度下量每个控件的位置，断言互不重叠、不出页面。
+            CheckAdvancedPageLayout();
 
             // 这一条格外重要：采集要靠**用户开一局游戏**才能跑，
             // 而用户的时间是本项目最稀缺的东西。采集本身若有 bug，
@@ -2841,6 +2846,126 @@ namespace MoTrainer.Diagnostics
                 if (scene != null) { scene.Dispose(); }
                 self.Dispose();
             }
+        }
+
+        /// <summary>
+        /// 「高级功能」页的排版回归（2026-10-08 晚新增）。
+        ///
+        /// 为什么必须用代码量、不能靠截图看：用户显示器**开了 DPI 缩放**，按钮随字号变宽，
+        /// 而本机是 96 DPI —— 这类"按钮挤成一堆、压住提示文字"的问题在本机根本复现不出来
+        ///（`CLAUDE.md` 7.2 记的就是这类坑，真机上花了 6 轮才定位）。
+        /// 做法：把页面真造出来，在几档宽度下重排，然后**逐个控件量矩形**：
+        /// ① 任意两个控件不得相交（提示文字必须各占一行、按钮换行后不得压回去）；
+        /// ② 任何控件不得超出页面宽度（超了就会出现横向滚动条、右侧被切掉）；
+        /// ③ 输出框必须仍在页面内且有可用高度。
+        /// </summary>
+        private static void CheckAdvancedPageLayout()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("高级功能页排版", false, "OpenProcess 失败"); return; }
+
+            TechnoScene scene = null;
+            AdvancedPage page = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("高级功能页排版测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+                List<MemoryRegion> heap = new List<MemoryRegion>();
+                heap.Add(MakeRegion(scene.Heap, TestBlockSize));
+                List<MemoryRegion> pointer = new List<MemoryRegion>();
+                pointer.Add(MakeRegion(scene.ModuleBase, TestBlockSize));
+                pointer.Add(MakeRegion(scene.Heap, TestBlockSize));
+                SyntheticTarget target = new SyntheticTarget(
+                    io, scene.ModuleBase, TechnoScene.FakeModuleSize, heap, pointer);
+
+                page = new AdvancedPage(target, new CalibrationProfile(), new ProfileStore(null));
+
+                // 四档宽度：560（很窄，第一排按钮必须换行）/ 820（用户常规窗口的内容区）/
+                // 1400（中宽）/ 2380（用户最大化时的内容区，真机日志里就是这个数）
+                int[] widths = new int[] { 560, 820, 1400, 2380 };
+                int totalOverlaps = 0;
+                int totalOverflow = 0;
+                int worstWidth = 0;
+                string worstPair = "";
+                int minBoxHeight = int.MaxValue;
+                bool boxOutside = false;
+
+                for (int w = 0; w < widths.Length; w++)
+                {
+                    page.Size = new Size(widths[w], 484);
+                    page.PerformLayout();
+
+                    List<Control> items = new List<Control>();
+                    for (int i = 0; i < page.Controls.Count; i++)
+                    {
+                        if (page.Controls[i].Visible) { items.Add(page.Controls[i]); }
+                    }
+
+                    for (int i = 0; i < items.Count; i++)
+                    {
+                        Rectangle a = items[i].Bounds;
+                        if (a.Left < 0 || a.Right > page.ClientSize.Width)
+                        {
+                            totalOverflow++;
+                            worstWidth = widths[w];
+                        }
+                        if (items[i] is TextBox)
+                        {
+                            if (items[i].Height < minBoxHeight) { minBoxHeight = items[i].Height; }
+                            if (a.Bottom > page.ClientSize.Height) { boxOutside = true; }
+                        }
+
+                        for (int k = i + 1; k < items.Count; k++)
+                        {
+                            Rectangle hit = Rectangle.Intersect(a, items[k].Bounds);
+                            if (hit.Width > 2 && hit.Height > 2)
+                            {
+                                totalOverlaps++;
+                                worstWidth = widths[w];
+                                worstPair = string.Format(CultureInfo.InvariantCulture,
+                                    "「{0}」与「{1}」在宽 {2} 时相交 {3}x{4}",
+                                    Short(items[i].Text), Short(items[k].Text),
+                                    widths[w], hit.Width, hit.Height);
+                            }
+                        }
+                    }
+                }
+
+                Check("高级功能页排版：560/820/1400/2380 四档宽度下，控件互不重叠（按钮放不下就换行）",
+                    totalOverlaps == 0,
+                    totalOverlaps == 0 ? "0 处重叠" : string.Format(CultureInfo.InvariantCulture,
+                        "{0} 处重叠，例如 {1}", totalOverlaps, worstPair));
+
+                Check("高级功能页排版：任何宽度下控件都不超出页面（否则右侧会被切掉/出横向滚动条）",
+                    totalOverflow == 0,
+                    totalOverflow == 0 ? "0 处超出" : string.Format(CultureInfo.InvariantCulture,
+                        "{0} 处超出（宽 {1}）", totalOverflow, worstWidth));
+
+                Check("高级功能页排版：输出框仍在页面内且有可用高度（不会被挤没）",
+                    !boxOutside && minBoxHeight >= 120,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "最小高度 {0}｜越界={1}", minBoxHeight, boxOutside));
+            }
+            catch (Exception ex)
+            {
+                Check("高级功能页排版", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (page != null) { try { page.Dispose(); } catch (Exception) { } }
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        /// <summary>控件文字太长时截断（只用于断言说明，不影响界面）。</summary>
+        private static string Short(string text)
+        {
+            if (text == null) { return ""; }
+            string one = text.Replace("\n", " ");
+            return one.Length > 14 ? one.Substring(0, 14) + "…" : one;
         }
 
         private static void CheckTechnoOps()

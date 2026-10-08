@@ -61,8 +61,17 @@ namespace MoTrainer.Ui.Pages
 
         private uint LiveModuleSize { get { return _target == null ? 0 : _target.ModuleSize; } }
 
+        /// <summary>页面留白与按钮间距（位置计算用；不是控件的绝对坐标）。</summary>
+        private const int PagePadding = 24;
+        private const int ButtonGap = 10;
+        private const int ButtonRowGap = 8;
+
+        private readonly Label _heading;
+        private readonly Label _subtitle;
+        private readonly Label _hintTop;
         private readonly Button _scanButton;
         private readonly Button _findButton;
+        private readonly Button _previewButton;
         private readonly Button _markAllyButton;
         private readonly Button _shroudButton;
         private readonly Button _harvestButton;
@@ -90,94 +99,74 @@ namespace MoTrainer.Ui.Pages
             BackColor = Theme.Bg0;
             AutoScroll = true;
 
-            Label heading = new Label();
-            heading.AutoSize = false;
-            heading.Font = Theme.Heading;
-            heading.ForeColor = Theme.Text0;
-            heading.Text = "高级功能";
-            heading.Location = new Point(24, 20);
-            heading.Size = new Size(520, 34);
-            Controls.Add(heading);
+            // ---- 头部：位置一律由 `RelayoutAll()` 按**实测宽度**排（不写死坐标）----
+            //
+            // 为什么改成这样（2026-10-08 真机截图）：此前这里全是写死的坐标
+            //（按钮 x=24/184/344/556、提示 y=130、采集 y=156）。用户显示器有 DPI 缩放，
+            // 字号放大 → 按钮跟着变宽 → 新加的「标记友军」压住提示文字、「开始采集」与提示叠在一起。
+            // 这正是 `CLAUDE.md` 7.2 记的那一类坑（**像素不跟着缩放走**），治法是"位置按实测尺寸算"。
+            _heading = new Label();
+            _heading.AutoSize = false;
+            _heading.Font = Theme.Heading;
+            _heading.ForeColor = Theme.Text0;
+            _heading.Text = "高级功能";
+            Controls.Add(_heading);
 
-            Label sub = new Label();
-            sub.AutoSize = false;
-            sub.Font = Theme.Body;
-            sub.ForeColor = Theme.Text2;
-            sub.Text = "秒杀敌人 / 瞬间建造 / 全图视野 —— 当前阶段本页只读不写；下方「一键采集」是把后续要用的数据一次收齐的校准辅助工具。";
-            sub.Location = new Point(24, 56);
-            sub.Size = new Size(760, 22);
-            Controls.Add(sub);
+            _subtitle = MakeHintLabel();
+            _subtitle.Font = Theme.Body;
+            _subtitle.Text = "秒杀敌人 / 瞬间建造 / 全图视野 —— 本页只读不写；下面「开始采集」是把后续要用的数据一次收齐的校准辅助工具。";
+            Controls.Add(_subtitle);
 
-            // 两个按钮并排；提示文字放到按钮下面单独一行 ——
-            // 之前把提示放在按钮右边，按钮加宽后会压住它（用户截图里看到的现象）。
+            // 第一组：名单与秒杀（四个按钮挨着放，提示文字单独占一行在它们下面）
             _scanButton = UiFactory.MakePrimaryButton("扫描全对象数组", 150);
-            _scanButton.Location = new Point(24, 92);
             _scanButton.Click += OnScanClick;
             Controls.Add(_scanButton);
 
             _findButton = UiFactory.MakePrimaryButton("自动查找总名单", 150);
-            _findButton.Location = new Point(184, 92);
             _findButton.Click += OnFindClick;
             Controls.Add(_findButton);
 
             // 预演按钮：**只计算、不写入**。
             // 秒杀敌人是所有功能里唯一可能"误伤自家部队"的一项，
             // 所以先给用户一个"会杀谁、不杀谁"的清单，确认无误后再放开真正的执行。
-            Button preview = UiFactory.MakeButton("预演：秒杀敌人（不写入）", 200);
-            preview.Location = new Point(344, 92);
-            preview.Click += OnKillPreviewClick;
-            Controls.Add(preview);
-
-            // 全图视野：一个按钮、两次点击。
-            // 第 1 次记录"迷雾快照"，用户去游戏里揭开一小块地图，第 2 次对比并清除。
-            // 原理：迷雾是一大片连续位图，揭开地图时**只有它那部分字节在变** ——
-            // 对比前后就能把它定位出来，再分片清零。
-            _shroudButton = UiFactory.MakePrimaryButton("全图视野（点两次）", 168);
-            _shroudButton.Location = new Point(556, 92);
-            _shroudButton.Click += OnShroudClick;
-            Controls.Add(_shroudButton);
+            _previewButton = UiFactory.MakeButton("预演：秒杀敌人（不写入）", 200);
+            _previewButton.Click += OnKillPreviewClick;
+            Controls.Add(_previewButton);
 
             // 「标记友军」：把选中的东西所属的阵营记入"永不秒杀"名单。
             // 为什么必须由用户点一下：秒杀只认"不是你 + 阵营有钱"，
             // **不知道"同盟"** —— AI 队友 / 局域网人类队友恰好符合"不是你 + 有钱"，
             // 会被一起清掉，而且不可逆（2026-10-08 用户提问时发现，见 `AllyGuard` 的注释）。
             _markAllyButton = UiFactory.MakePrimaryButton("标记友军（不会杀）", 180);
-            _markAllyButton.Location = new Point(620, 124);
-            _markAllyButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _markAllyButton.Click += OnMarkAllyClick;
             Controls.Add(_markAllyButton);
 
-            Label hint = new Label();
-            hint.AutoSize = false;
-            hint.Font = Theme.Small;
-            hint.ForeColor = Theme.Text2;
-            hint.Text = "用法：先在游戏里选中一个自己的单位，再点「自动查找总名单」。选中的单位会用来确认名单是否找对。";
-            hint.Location = new Point(24, 130);
-            hint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            hint.Size = new Size(580, 20);
-            Controls.Add(hint);
+            _hintTop = MakeHintLabel();
+            _hintTop.Text = "用法：先在游戏里选中一个自己的单位，再点「自动查找总名单」；然后点「预演」看它准备杀谁、放过谁。\n"
+                + "有队友的局：点选队友的一个单位（或建筑）→ 点「标记友军」，该阵营就永远不会被秒杀。";
+            Controls.Add(_hintTop);
 
-            // ---- 一键采集 ----
+            // 第二组：全图视野 + 一键采集。
             //
-            // 存在的意义：本项目的瓶颈是"每要一个数据就得让用户开一局游戏"。
+            // 「开始采集」存在的意义：本项目的瓶颈是"每要一个数据就得让用户开一局游戏"。
             // 有了它，用户只操作一次（开局 → 点开始 → 随便玩几分钟 → 点停止），
             // 期间程序自己按秒采样，把后面几轮要用的数据一次收齐。
-            //
             // 它是**校准辅助**，不属于面向玩家的产品功能；S8 交付前应连同本页的其它
             // 调试按钮一起评估去留（见 docs/04 的 S8）。
+            //
+            // 全图视野：一个按钮、两次点击。第 1 次记录"迷雾快照"，用户去游戏里揭开一小块地图，
+            // 第 2 次对比并清除。原理：迷雾是一大片连续位图，揭开地图时**只有它那部分字节在变** ——
+            // 对比前后就能把它定位出来，再分片清零。
+            _shroudButton = UiFactory.MakePrimaryButton("全图视野（点两次）", 168);
+            _shroudButton.Click += OnShroudClick;
+            Controls.Add(_shroudButton);
+
             _harvestButton = UiFactory.MakePrimaryButton("开始采集（3 分钟）", 180);
-            _harvestButton.Location = new Point(24, 156);
             _harvestButton.Click += OnHarvestClick;
             Controls.Add(_harvestButton);
 
-            _harvestStatus = new Label();
-            _harvestStatus.AutoSize = false;
-            _harvestStatus.Font = Theme.Small;
-            _harvestStatus.ForeColor = Theme.Text2;
+            _harvestStatus = MakeHintLabel();
             _harvestStatus.Text = "采集期间你只需要在游戏里正常玩：选几个单位、造点东西、让单位挨点打。程序自己记录。";
-            _harvestStatus.Location = new Point(216, 162);
-            _harvestStatus.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            _harvestStatus.Size = new Size(560, 20);
             Controls.Add(_harvestStatus);
 
             // 每秒刷新一次状态文字。用界面线程的 Timer，避免后台线程碰控件。
@@ -194,12 +183,11 @@ namespace MoTrainer.Ui.Pages
             _output.ForeColor = Theme.Text0;
             _output.Font = Theme.Mono;
             _output.BorderStyle = BorderStyle.FixedSingle;
-            _output.Location = new Point(24, 190);
-            _output.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            _output.Anchor = AnchorStyles.Top | AnchorStyles.Left;   // 位置与大小都由 RelayoutAll 算
             Controls.Add(_output);
 
-            SizeChanged += delegate { LayoutOutput(); };
-            LayoutOutput();
+            SizeChanged += delegate { RelayoutAll(); };
+            RelayoutAll();
             RefreshUi();
             UpdateHarvestUi();
 
@@ -231,13 +219,99 @@ namespace MoTrainer.Ui.Pages
             base.Dispose(disposing);
         }
 
-        private void LayoutOutput()
+        /// <summary>
+        /// 重排本页头部与输出框 —— **位置按控件的实测宽度算，不写死坐标**。
+        ///
+        /// 为什么（2026-10-08 真机截图）：此前按钮与提示用的是写死的 x/y。用户显示器有 DPI 缩放，
+        /// 字号放大后按钮跟着变宽，于是「标记友军」压住了提示文字、「开始采集」和提示又叠在一起，
+        /// 窄窗口下按钮还会互相重叠。全部改由"实测宽度 + 放不下就换行"决定后，
+        /// **任何缩放、任何窗口宽度都不会互相压**（这正是 `CLAUDE.md` 7.2 记的那类坑的通用治法）。
+        /// 提示文字一律**单独占一行**放在它所属的那排按钮下面，不再与按钮争位置。
+        /// </summary>
+        private void RelayoutAll()
         {
-            int width = ClientSize.Width - 48;
-            int height = ClientSize.Height - 214;
-            if (width < 200) { width = 200; }
-            if (height < 120) { height = 120; }
-            _output.Size = new Size(width, height);
+            int width = ClientSize.Width;
+            if (width < 320 || _output == null) { return; }   // 还没成形，等下一次尺寸事件
+
+            int left = PagePadding;
+            int rightLimit = width - PagePadding;
+            int y = 20;
+
+            SetBoundsIfChanged(_heading, new Point(left, y),
+                new Size(rightLimit - left, _heading.Font.Height + 10));
+            y += _heading.Height + 6;
+
+            y = LayoutHint(_subtitle, y, rightLimit - left) + 10;
+
+            y = LayoutButtonRow(y, new Control[] { _scanButton, _findButton, _previewButton, _markAllyButton },
+                left, rightLimit) + 6;
+            y = LayoutHint(_hintTop, y, rightLimit - left) + 14;
+
+            y = LayoutButtonRow(y, new Control[] { _shroudButton, _harvestButton }, left, rightLimit) + 6;
+            y = LayoutHint(_harvestStatus, y, rightLimit - left) + 14;
+
+            int boxHeight = ClientSize.Height - y - 20;
+            if (boxHeight < 120) { boxHeight = 120; }
+            SetBoundsIfChanged(_output, new Point(left, y), new Size(rightLimit - left, boxHeight));
+        }
+
+        /// <summary>一排按钮：从左到右摆，放不下就换行。返回最后一行按钮的底边 y。</summary>
+        private int LayoutButtonRow(int y, Control[] items, int left, int rightLimit)
+        {
+            int x = left;
+            int rowHeight = 0;
+            for (int i = 0; i < items.Length; i++)
+            {
+                Control control = items[i];
+                if (control == null) { continue; }
+
+                if (x > left && x + control.Width > rightLimit)
+                {
+                    x = left;
+                    y += rowHeight + ButtonRowGap;
+                    rowHeight = 0;
+                }
+
+                SetBoundsIfChanged(control, new Point(x, y), control.Size);
+                x += control.Width + ButtonGap;
+                if (control.Height > rowHeight) { rowHeight = control.Height; }
+            }
+            return y + rowHeight;
+        }
+
+        /// <summary>
+        /// 一行提示文字：宽度撑满页面可用宽，**高度按实测折行结果**定（不写死 20 像素 ——
+        /// 高 DPI 下字变大会只显示上半截，见 `CLAUDE.md` 7.2）。返回控件底边 y。
+        /// </summary>
+        private int LayoutHint(Label label, int y, int width)
+        {
+            if (label == null) { return y; }
+            if (width < 120) { width = 120; }
+
+            Size measured = TextRenderer.MeasureText(label.Text, label.Font,
+                new Size(width, 0), TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+            int height = measured.Height + 4;
+
+            SetBoundsIfChanged(label, new Point(PagePadding, y), new Size(width, height));
+            return y + height;
+        }
+
+        /// <summary>只在真的变了时才赋值 —— 否则每秒一次的刷新会把界面刷得发抖。</summary>
+        private static void SetBoundsIfChanged(Control control, Point location, Size size)
+        {
+            if (control == null) { return; }
+            if (control.Location != location) { control.Location = location; }
+            if (control.Size != size) { control.Size = size; }
+        }
+
+        private static Label MakeHintLabel()
+        {
+            Label label = new Label();
+            label.AutoSize = false;     // 固定尺寸：宽高由 RelayoutAll 按实测文字算
+            label.Font = Theme.Small;
+            label.ForeColor = Theme.Text2;
+            label.BackColor = Color.Transparent;
+            return label;
         }
 
         // ============================================================ 一键采集
@@ -305,6 +379,10 @@ namespace MoTrainer.Ui.Pages
             {
                 _harvestStatus.Text = "采集完成，报告已保存。";
             }
+
+            // 按钮文字与提示文字都变过 → 宽度/高度跟着变，位置必须重算
+            //（否则「停止并保存报告」比「开始采集（3 分钟）」长，会压到旁边的提示）。
+            RelayoutAll();
         }
 
         private static string BuildHarvestDoneText(string path)
