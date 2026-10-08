@@ -27,8 +27,8 @@ namespace MoTrainer.Calibration
         /// <summary>扫描对象头部多少字节（真机上这些对象的字段都挤在前 0x800 里）。</summary>
         public const int ScanBytes = 0x600;
 
-        /// <summary>顺着指针看目标的前多少个双字（找"指向字符串的指针"）。</summary>
-        private const int PeekDwords = 24;
+        /// <summary>顺着指针看目标的前多少个双字（找"指向字符串的指针"）。真机踩过：窗口太浅会漏掉类型对象的 ID。</summary>
+        private const int PeekDwords = 128;
 
         public sealed class Finding
         {
@@ -83,16 +83,15 @@ namespace MoTrainer.Calibration
                 // ① 像指针的值：跟着看一眼
                 if (value >= 0x10000 && value <= 0x7FFFFFFF && memory.Describe(value) != null)
                 {
+                    // **所有**像指针的值都收下。真机教训：早先只收"目标里带字符串"的，
+                    // 结果把真正的"建筑类型指针"漏掉了（它的 ID 字符串在更深处）。
                     string note = PeekTarget(memory, value);
-                    if (note.Length > 0)
-                    {
-                        Finding f = new Finding();
-                        f.ObjectOffset = (uint)offset;
-                        f.Value = value;
-                        f.Kind = note.IndexOf("字符串") >= 0 ? "疑似类型对象" : "指针";
-                        f.Note = note;
-                        pointers.Add(f);
-                    }
+                    Finding f = new Finding();
+                    f.ObjectOffset = (uint)offset;
+                    f.Value = value;
+                    f.Kind = note.Length > 0 ? "疑似类型对象" : "指针";
+                    f.Note = note;
+                    pointers.Add(f);
                     continue;
                 }
 
@@ -153,6 +152,13 @@ namespace MoTrainer.Calibration
             byte[] block = memory.ReadBytesQuiet(target, 0x400);
             if (block == null) { text.AppendLine("      读不动"); return; }
 
+            uint head0 = ReadUInt32(block, 0);
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "      头 4 字节 0x{0:X8}{1}｜前 8 个双字：{2}",
+                head0,
+                (head0 >= 0x400000 && head0 < 0x400000 + 0x793000) ? "（模块内 → 像是虚表，是个 C++ 对象）" : "",
+                DescribeDwords(block, 8)));
+
             // 字符串指针（大概率是名字/ID/EVA 事件名）
             int strings = 0;
             for (int i = 0; i + 4 <= block.Length && strings < 6; i += 4)
@@ -178,7 +184,7 @@ namespace MoTrainer.Calibration
                 if (count > 0) { numbers.Append("、"); }
                 numbers.Append(string.Format(CultureInfo.InvariantCulture, "+0x{0:X3}={1}", i, value));
                 count++;
-                if (count >= 40) { break; }
+                if (count >= 60) { break; }
             }
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "      小整数 {0} 个：{1}", count, numbers.ToString()));
@@ -231,6 +237,18 @@ namespace MoTrainer.Calibration
                 bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
                     || (c >= '0' && c <= '9') || c == '_';
                 if (!ok) { return null; }
+            }
+            return text.ToString();
+        }
+
+        /// <summary>把前 n 个双字排成一行（十六进制），用于快速辨认结构。</summary>
+        private static string DescribeDwords(byte[] block, int count)
+        {
+            StringBuilder text = new StringBuilder();
+            for (int i = 0; i < count && i * 4 + 4 <= block.Length; i++)
+            {
+                if (i > 0) { text.Append(' '); }
+                text.Append(string.Format(CultureInfo.InvariantCulture, "{0:X8}", ReadUInt32(block, i * 4)));
             }
             return text.ToString();
         }
