@@ -1089,11 +1089,27 @@ namespace MoTrainer.Ui.Pages
             }
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "线索单位 {0} 个（金钱锚定确认属于我方），第一个是 0x{1:X8}", hints.Count, hints[0]));
+
+            // 「阵营分布」这条判据必须用**金钱锚定出来的**偏移来算（2026-10-08 晚改）。
+            // 以前用的是配置里那个**人工试出的 +0xF0** —— 真机证明那里读出来的不是阵营，
+            // 于是判据是在噪声上算的（16:46 那次因此选中了一张只有 60 个对象、玩家单位一个都不在里面的假名单）。
+            uint money;
+            uint ownerOffset = 0;
+            if (_selection != null && _selection.TryReadMoney(_profile, out money))
+            {
+                string offsetNote;
+                ownerOffset = TechnoOwnership.ResolveOwnerOffsetForAnalysis(memory, hints, money, out offsetNote);
+                text.AppendLine("阵营字段：" + offsetNote);
+            }
+            else
+            {
+                text.AppendLine("阵营字段：读不到金钱值 → 本次不做「阵营分布」分析（这条判据跳过，其余判据照旧）");
+            }
             text.AppendLine();
 
             int rejectedCode;
             List<TechnoArrayCandidate> found = TechnoArrayFinder.Find(
-                memory, moduleBase, moduleSize, slotAddress, hints, _profile.OffsetTechnoOwner, out rejectedCode);
+                memory, moduleBase, moduleSize, slotAddress, hints, ownerOffset, out rejectedCode);
 
             if (rejectedCode > 0)
             {
@@ -1345,6 +1361,13 @@ namespace MoTrainer.Ui.Pages
                     "**将击杀：{0} 个**｜**放过我方：{1} 个**｜**疑似中立（不杀）：{2} 个**"
                     + "｜**友军不杀：{3} 个**｜归属存疑（不杀）：{4} 个",
                     cls.KillableCount, cls.Mine, cls.NeutralCount, cls.Ally, cls.Unknown));
+
+                if (cls.SingletonSkipped > 0)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  （存疑里有 {0} 个是「全场只有一个对象的阵营」—— 真机实测那类都是垃圾归属，"
+                        + "一并跳过不杀）", cls.SingletonSkipped));
+                }
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                     "血量偏移 +0x{0:X}（写入时每个目标都会先校验、写后回读）",
                     _profile.OffsetTechnoHealth));

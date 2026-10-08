@@ -3493,13 +3493,21 @@ namespace MoTrainer.Diagnostics
                 uint ally1 = scene.Heap + 0x3300;
                 uint ally2 = scene.Heap + 0x3400;
 
+                // 2026-10-08 晚新增：**"孤零零只有一个对象的阵营"** —— 真机实测那几个可疑目标
+                // （金钱读数 3.5 亿 / 8.6 亿 / 97 这种）每个都只对应 1 个对象，大概率根本不是单位
+                // （子弹 / 动画之类），拿它们写血量等于往非单位对象上写。判据：本批里只有 1 个对象的
+                // 阵营一律不杀（宁可少杀，绝不误杀）。
+                uint lonelyHouse = scene.Heap + 0xE600;
+                io.WriteUInt32(lonelyHouse + TechnoOwnership.HouseMoneyOffset, 12345);
+                uint lonelyObject = scene.Heap + 0x3600;
+
                 uint neutral1 = scene.Heap + 0x3000;
                 uint neutral2 = scene.Heap + 0x3100;
                 uint junkOwner = scene.Heap + 0x3200;      // 归属值 = 代码区地址 → 存疑
                 uint myExtra = scene.Heap + 0x4300;        // 我方对象（邻居几何用）
                 uint neighborEnemy = scene.Heap + 0x3D00;  // 敌方对象，其旧 0x1000 窗口含上面的自己人
 
-                uint[] extra = new uint[] { neutral1, neutral2, junkOwner, myExtra, neighborEnemy, ally1, ally2 };
+                uint[] extra = new uint[] { neutral1, neutral2, junkOwner, myExtra, neighborEnemy, ally1, ally2, lonelyObject };
                 for (int i = 0; i < extra.Length; i++)
                 {
                     io.WriteUInt32(extra[i], scene.ModuleBase + 0x2000);   // 共用类型表（像真对象）
@@ -3516,8 +3524,9 @@ namespace MoTrainer.Diagnostics
                 io.WriteUInt32(neighborEnemy + OwnerOffset, scene.EnemyOwner);
                 io.WriteUInt32(ally1 + OwnerOffset, allyHouse);
                 io.WriteUInt32(ally2 + OwnerOffset, allyHouse);
+                io.WriteUInt32(lonelyObject + OwnerOffset, lonelyHouse);
 
-                // 全对象名单：模块内的"格子"（静态地址）→ 扩展数组（原 7 项 + 这 7 个）
+                // 全对象名单：模块内的"格子"（静态地址）→ 扩展数组（原 7 项 + 这 8 个）
                 uint rosterSlot = module + 0x200;
                 uint rosterCount = module + 0x204;
                 uint rosterArray = scene.Arrays + 0x2000;
@@ -3525,10 +3534,10 @@ namespace MoTrainer.Diagnostics
                 {
                     scene.Team[0], scene.Team[1], scene.Team[2],
                     scene.Team[3], scene.Team[4], scene.Team[5], scene.RareObject,
-                    neutral1, neutral2, junkOwner, myExtra, neighborEnemy, ally1, ally2
+                    neutral1, neutral2, junkOwner, myExtra, neighborEnemy, ally1, ally2, lonelyObject
                 });
                 io.WriteUInt32(rosterSlot, rosterArray);
-                io.WriteUInt32(rosterCount, 14);
+                io.WriteUInt32(rosterCount, 15);
 
                 // 选中名单：数量 + 指针槽（槽里放一张只含我方两个对象的数组）
                 uint selCount = module + 0x300;
@@ -3567,6 +3576,25 @@ namespace MoTrainer.Diagnostics
                 Check("秒杀接线：名单齐备时功能被视为已校准",
                     kill.IsCalibrated, "IsCalibrated=" + kill.IsCalibrated);
 
+                // ---- 「孤例阵营」判据（2026-10-08 晚新增）----
+                // 真机依据：预演"将击杀"里那几个可疑单例，每个都只对应 1 个对象（而真敌方阵营有 7~8 个）。
+                // 这里造同款：一个归属**看着像真阵营**（有钱、读得出）但全场只有它自己一个对象的对象。
+                // 断言两件事：① 它被判为存疑而不是可击杀；② 引擎跑完之后它的血量一点没动（见上面 ①）。
+                TechnoWalkResult lonlyRoster = TechnoWalker.WalkArray(
+                    io, rosterArray, 15, scene.ModuleBase, scene.ModuleSize);
+                TechnoOwnership.OwnerClassification lonelyCls = TechnoOwnership.ClassifyOwners(
+                    io, lonlyRoster.Objects, OwnerOffset, scene.MyOwner, scene.ModuleBase, scene.ModuleSize);
+                bool lonelyKillable = false;
+                for (int i = 0; i < lonelyCls.Killable.Count; i++)
+                {
+                    if (lonelyCls.Killable[i].Address == lonelyObject) { lonelyKillable = true; }
+                }
+                Check("分类：「全场只有一个对象的阵营」判为存疑、不进可击杀名单（真机那类都是垃圾归属）",
+                    !lonelyKillable && lonelyCls.SingletonSkipped == 1,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "孤例被判可击杀={0}｜孤例跳过 {1} 个｜存疑合计 {2}｜可击杀 {3}",
+                        lonelyKillable, lonelyCls.SingletonSkipped, lonelyCls.Unknown, lonelyCls.KillableCount));
+
                 kill.Enabled = true;
                 engine.Start();
 
@@ -3581,7 +3609,8 @@ namespace MoTrainer.Diagnostics
                     killed
                         && scene.ReadField(scene.Team[0], HealthOffset) == 100
                         && scene.ReadField(scene.Team[1], HealthOffset) == 100
-                        && scene.ReadField(scene.Team[5], HealthOffset) == 100,
+                        && scene.ReadField(scene.Team[5], HealthOffset) == 100
+                        && scene.ReadField(lonelyObject, HealthOffset) == 100,   // 孤例阵营也不许碰
                     string.Format(CultureInfo.InvariantCulture,
                         "我方 {0}/{1}｜敌方 {2}/{3}/{4}｜归属不明 {5}｜写入 {6} 次｜{7}",
                         scene.ReadField(scene.Team[0], HealthOffset),
@@ -3792,6 +3821,31 @@ namespace MoTrainer.Diagnostics
 
                 // 静态登记处是进程内共享的 —— 用完必须清掉，否则会污染后面的用例
                 AllyGuard.Reset();
+
+                // ================= ⑦ 「阵营分布」分析用的偏移必须由金钱锚定推导 =================
+                //
+                // 真机 10-08 两次查找证明：配置里那个人工试出的偏移（`fieldOffsets.technoOwner`）
+                // 读出来的**不是阵营** —— 于是"阵营聚集成群"这条判据是在噪声上算的，
+                // 16:46 那次因此选中了一张只有 60 个对象、玩家单位一个都不在里面的假名单。
+                List<uint> lonelyHints = new List<uint>();
+                lonelyHints.Add(scene.Team[0]);
+                lonelyHints.Add(scene.Team[1]);
+
+                string offsetNote;
+                uint analysisOffset = TechnoOwnership.ResolveOwnerOffsetForAnalysis(
+                    io, lonelyHints, Money, out offsetNote);
+                Check("自动查找：「阵营分布」用的偏移由金钱锚定推导，不是配置里那个人工值",
+                    analysisOffset == OwnerOffset && offsetNote.IndexOf("锚定") >= 0,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "推导出 +0x{0:X}（期望 +0x{1:X}；配置里的人工值是 +0x{2:X}）｜{3}",
+                        analysisOffset, OwnerOffset, profile.OffsetTechnoOwner, offsetNote));
+
+                string offsetNote2;
+                uint analysisOffset2 = TechnoOwnership.ResolveOwnerOffsetForAnalysis(
+                    io, lonelyHints, 0, out offsetNote2);
+                Check("自动查找：推导不出阵营字段时返回 0（跳过该判据），绝不拿人工值充数",
+                    analysisOffset2 == 0 && offsetNote2.Length > 0,
+                    offsetNote2);
 
                 // ================= ⑥ 环境（游戏版本）检查不过 → 一个字节都不写 =================
                 //

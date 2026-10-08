@@ -85,11 +85,47 @@ namespace MoTrainer.Cheats
             return memory.ReadUInt32(ownerValue + HouseMoneyOffset, out money);
         }
 
+        /// <summary>
+        /// 「自动查找」算"阵营分布"时该用哪个偏移 —— **优先用金钱锚定出来的真偏移**（2026-10-08 晚改）。
+        ///
+        /// 为什么不能沿用配置里那个 `fieldOffsets.technoOwner`（人工试出的 `+0xF0`）：
+        /// 真机 10-08 的两次查找证明，那个位置读出来的**根本不是阵营** —— 于是"阵营聚集成群"
+        /// 这条判据是在噪声上算的。16:46 那次就因此选中了一张只有 60 个对象、玩家 6 个单位
+        /// 一个都不在里面的假名单（当天没出事，是靠另一条独立判据"命中数"兜住的）。
+        ///
+        /// 现在改成：从**线索对象**（金钱锚定确认属于我方的选中单位）里推导真偏移；
+        /// 推导不出来就返回 0 —— 调用方据此**跳过**这条判据。**宁可少一条判据，也不拿人工值充数。**
+        /// </summary>
+        public static uint ResolveOwnerOffsetForAnalysis(
+            MemoryIO memory, IList<uint> hints, uint money, out string note)
+        {
+            note = "";
+            OwnerAnchor anchor;
+            string why;
+            if (!TryBuildAnchor(memory, hints, money, out anchor, out why))
+            {
+                note = "推导不出阵营字段（" + why + "）——本次不做阵营分布分析";
+                return 0;
+            }
+
+            note = string.Format(CultureInfo.InvariantCulture,
+                "由 {0} 个线索对象金钱锚定得出：+0x{1:X} = 0x{2:X8}（**不是**配置里那个人工试出的偏移）",
+                anchor.Samples, anchor.OwnerOffset, anchor.MyHouse);
+            return anchor.OwnerOffset;
+        }
+
         /// <summary>一次"按归属分类"的结果。</summary>
         public sealed class OwnerClassification
         {
             /// <summary>我方对象数。</summary>
             public int Mine;
+
+            /// <summary>
+            /// 因为"所属阵营在本批里只有一个对象"而被判为存疑的对象数（2026-10-08 晚新增）。
+            /// 真机实测那类垃圾归属**每个都只对应 1 个对象**（金钱读数 3.5 亿 / 8.6 亿 / 97 这种），
+            /// 而真正的敌方阵营有 7~8 个 —— 拿它们去写血量，等于往"其实不是单位"的对象上写。
+            /// </summary>
+            public int SingletonSkipped;
 
             /// <summary>**被用户标记为友军**的阵营所拥有的对象数（`AllyGuard`）。这些与"疑似中立"一样绝不杀。</summary>
             public int Ally;
@@ -148,6 +184,19 @@ namespace MoTrainer.Cheats
             OwnerClassification result = new OwnerClassification();
             if (memory == null || objects == null || ownerOffset == 0) { return result; }
 
+            // 先把"每个归属各拥有几个对象"数一遍 —— "孤例阵营"判据要用（见下面的注释）。
+            // 多读一遍的开销可以忽略（真机规模约 250 个对象），换来的是不往可疑对象上写。
+            Dictionary<uint, int> ownerCounts = new Dictionary<uint, int>();
+            for (int i = 0; i < objects.Count; i++)
+            {
+                uint probe;
+                if (!memory.ReadUInt32(objects[i].Address + ownerOffset, out probe)) { continue; }
+                if (probe == 0) { continue; }
+
+                int existing;
+                ownerCounts[probe] = ownerCounts.TryGetValue(probe, out existing) ? existing + 1 : 1;
+            }
+
             for (int i = 0; i < objects.Count; i++)
             {
                 uint address = objects[i].Address;
@@ -179,18 +228,43 @@ namespace MoTrainer.Cheats
                     continue;
                 }
 
-                Dictionary<uint, List<TechnoObject>> groups = money == 0
-                    ? result.NeutralByGroup      // 疑似中立 / 民用（金钱恒为 0）→ 保护，不杀
-                    : result.KillableByGroup;
+                if (money == 0)
+                {
+                    // 疑似中立 / 民用（金钱恒为 0）→ 保护，不杀
+                    List<TechnoObject> neutral;
+                    if (!result.NeutralByGroup.TryGetValue(owner, out neutral))
+                    {
+                        neutral = new List<TechnoObject>();
+                        result.NeutralByGroup[owner] = neutral;
+                    }
+                    neutral.Add(objects[i]);
+                    continue;
+                }
+
+                // 「孤例阵营」判据（2026-10-08 晚新增）：**本批里只拥有 1 个对象的阵营一律不杀**。
+                //
+                // 真机依据：预演"将击杀"里那几个可疑单例（金钱读数 3.5 亿 / 8.6 亿 / 97 这种），
+                // **每个都只对应 1 个对象**，而真正的敌方阵营有 7~8 个 —— 那些对象的 +0x14C
+                // 根本不是"阵营"，它们大概率不是单位（子弹/动画之类）。拿它们去写血量，
+                // 等于往"其实不是单位"的对象上写。
+                // **代价（如实记录）**：真有一个"只剩 1 个东西"的敌方阵营时会被漏掉 —— 宁可少杀，绝不误杀。
+                int owned;
+                if (!ownerCounts.TryGetValue(owner, out owned)) { owned = 1; }
+                if (owned < 2)
+                {
+                    result.Unknown++;
+                    result.SingletonSkipped++;
+                    continue;
+                }
 
                 List<TechnoObject> bucket;
-                if (!groups.TryGetValue(owner, out bucket))
+                if (!result.KillableByGroup.TryGetValue(owner, out bucket))
                 {
                     bucket = new List<TechnoObject>();
-                    groups[owner] = bucket;
+                    result.KillableByGroup[owner] = bucket;
                 }
                 bucket.Add(objects[i]);
-                if (money != 0) { result.Killable.Add(objects[i]); }
+                result.Killable.Add(objects[i]);
             }
             return result;
         }
