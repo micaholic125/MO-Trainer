@@ -6,7 +6,7 @@
   "moduleBase": "0x00400000",
   "moduleSize": "0x00793000",
   "createdAt": "2026-09-21 11:02:04",
-  "updatedAt": "2026-10-08 16:46:36",
+  "updatedAt": "2026-10-08 17:04:17",
   "notes": "powerOutput 由 2026-09-21 11:57 真机报告回填（金钱链 + 相对偏移 0x5098 推导）",
   "locators": {
     "money": {
@@ -213,7 +213,7 @@
       "valueWidth": 4,
       "valueScale": 1,
       "hasStaticAddress": true,
-      "staticAddress": "0x68E9AC",
+      "staticAddress": "0x47F77C",
       "calibrated": true
     },
     "technoArrayCount": {
@@ -225,9 +225,9 @@
       "note": "",
       "valueWidth": 4,
       "valueScale": 1,
-      "hasStaticAddress": true,
-      "staticAddress": "0x68E9B0",
-      "calibrated": true
+      "hasStaticAddress": false,
+      "staticAddress": "",
+      "calibrated": false
     },
     "mapShroud": {
       "chain": [],
