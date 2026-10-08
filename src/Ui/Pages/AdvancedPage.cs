@@ -1161,7 +1161,6 @@ namespace MoTrainer.Ui.Pages
 
             TechnoOwnership.OwnerAnchor anchor = null;
             string why = "";
-            bool reusedAnchor = false;
             bool built = myObjects.Count > 0
                 && TechnoOwnership.TryBuildAnchor(memory, myObjects, money, out anchor, out why);
 
@@ -1190,7 +1189,6 @@ namespace MoTrainer.Ui.Pages
                     return;
                 }
 
-                reusedAnchor = true;
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                     "我方锚点：阵营字段 +0x{0:X} = 0x{1:X8}（**沿用本次会话此前建立的锚点** —— {2}）",
                     anchor.OwnerOffset, anchor.MyHouse,
@@ -1227,74 +1225,78 @@ namespace MoTrainer.Ui.Pages
             TechnoOwnership.OwnerClassification cls = TechnoOwnership.ClassifyOwners(
                 memory, walk.Objects, anchor.OwnerOffset, anchor.MyHouse, LiveModuleBase, LiveModuleSize);
 
-            // 沿用旧锚点时多做一道核对：**名单里必须有我方对象**。
-            // 你自己的部队永远在场上 —— 一个都找不到，说明沿用的锚点是错的（或这份名单不对），
-            // 那么下面的分类结果一并不值得看，宁可不显示。
-            if (reusedAnchor && cls.Mine == 0)
-            {
-                text.AppendLine("⚠ **沿用的锚点没能通过核对**：整份名单里没有一个对象指向你方 House，");
-                text.AppendLine("正常情况一定会有（你自己的部队就在场上）。本次**不做任何判定**。");
-                text.AppendLine("请在游戏里选中你自己的一个单位（或建筑）点一次本按钮，把锚点重新建立起来。");
-                text.AppendLine();
-                text.AppendLine("本次**没有写入任何内存**。");
-                SetOutput(text.ToString());
-                return;
-            }
+            // **名单自检**：你自己的部队永远在场上 —— 整份名单里一个"我方"对象都没有，
+            // 说明这份「全对象名单」不可信（真机 2026-10-08 16:46 抓到：名单里只有 60 个对象，
+            // 玩家的 6 个单位一个都不在里面，而四个数字照样算得出来）。
+            // 这时**照常给出「你选中的对象逐个判定」**（那一节只看选中列表与阵营字段，不依赖名单），
+            // 但不给"将击杀/抽检"这些**以名单为准**的结论。
+            bool rosterSuspect = cls.Mine == 0;
 
-            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "遍历到 {0} 个对象", walk.Count));
-            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "**将击杀：{0} 个**｜**放过我方：{1} 个**｜**疑似中立（不杀）：{2} 个**｜归属存疑（不杀）：{3} 个",
-                cls.KillableCount, cls.Mine, cls.NeutralCount, cls.Unknown));
-            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "血量偏移 +0x{0:X}（写入时每个目标都会先校验、写后回读）",
-                _profile.OffsetTechnoHealth));
-            text.AppendLine();
+            if (rosterSuspect)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "⚠ **名单自检未通过**：遍历到 {0} 个对象，其中**没有一个**指向你方 House ——", walk.Count));
+                text.AppendLine("你自己的部队本该在里面。这份「全对象名单」不可信，**秒杀不要开启**，");
+                text.AppendLine("请回上一步重新点「自动查找总名单」。");
+                text.AppendLine("（下方「你选中的对象逐个判定」不依赖这份名单，仍然有效。）");
+                text.AppendLine();
+            }
 
             // ---- 你选中的对象逐个判定（2026-10-08 新增）----
             // 用途：让你一眼看清"自己选中的东西被判成了哪边"——
             // 单独点一座中立建筑再点本按钮，就能看出它会不会被杀。
-            AppendSelectionVerdicts(text, memory, anchor, walk.Objects);
+            // 放在最前面：**它不依赖名单**，名单不可信时它是唯一还有效的结论。
+            AppendSelectionVerdicts(text, memory, anchor, walk.Objects, rosterSuspect);
 
-            // ---- 将击杀：按阵营拆分（附每个阵营的类型构成）----
-            AppendOwnerGroups(text, memory, "将击杀（按阵营拆分）", cls.KillableByGroup, anchor.OwnerOffset);
-
-            if (cls.NeutralCount > 0)
-            {
-                AppendOwnerGroups(text, memory,
-                    "疑似中立 / 民用（**不会杀**）", cls.NeutralByGroup, anchor.OwnerOffset);
-                text.AppendLine("  说明：这些阵营的「金钱」读数一直是 0 —— 中立 / 民用建筑通常如此，所以默认保护。");
-                text.AppendLine();
-            }
-
-            // ---- 安全抽检：把"判为敌方"的对象拿独立判据复核（与真正要写的名单一致）----
-            int enemySeen;
-            int checkedCount;
-            uint suspect;
-            string verifyWhy;
-            bool verified = TechnoOwnership.VerifyEnemySample(
-                memory, cls.Killable, anchor.OwnerOffset, anchor.MyHouse, 256,
-                out enemySeen, out checkedCount, out suspect, out verifyWhy);
-
-            if (verified)
+            if (!rosterSuspect)
             {
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "安全抽检：复核 {0} 个判为敌方的对象，**没有一个连着你方 House** —— 通过。",
-                    checkedCount));
-            }
-            else
-            {
-                text.AppendLine("安全抽检：**未通过！** " + verifyWhy);
-                text.AppendLine("→ 敌我分类不可靠，**绝不能开启秒杀**。请把这份结果发给开发者。");
-            }
+                    "遍历到 {0} 个对象", walk.Count));
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "**将击杀：{0} 个**｜**放过我方：{1} 个**｜**疑似中立（不杀）：{2} 个**｜归属存疑（不杀）：{3} 个",
+                    cls.KillableCount, cls.Mine, cls.NeutralCount, cls.Unknown));
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "血量偏移 +0x{0:X}（写入时每个目标都会先校验、写后回读）",
+                    _profile.OffsetTechnoHealth));
+                text.AppendLine();
 
-            if (cls.Mine == 0)
-            {
-                text.AppendLine("⚠ 注意：名单里一个「我方」对象都没有 —— 这也是判据出问题的信号，程序会拒绝执行。");
+                // ---- 将击杀：按阵营拆分（附每个阵营的类型构成）----
+                AppendOwnerGroups(text, memory, "将击杀（按阵营拆分）", cls.KillableByGroup, anchor.OwnerOffset);
+
+                if (cls.NeutralCount > 0)
+                {
+                    AppendOwnerGroups(text, memory,
+                        "疑似中立 / 民用（**不会杀**）", cls.NeutralByGroup, anchor.OwnerOffset);
+                    text.AppendLine("  说明：这些阵营的「金钱」读数一直是 0 —— 中立 / 民用建筑通常如此，所以默认保护。");
+                    text.AppendLine();
+                }
+
+                // ---- 安全抽检：把"判为敌方"的对象拿独立判据复核（与真正要写的名单一致）----
+                int enemySeen;
+                int checkedCount;
+                uint suspect;
+                string verifyWhy;
+                bool verified = TechnoOwnership.VerifyEnemySample(
+                    memory, cls.Killable, anchor.OwnerOffset, anchor.MyHouse, 256,
+                    out enemySeen, out checkedCount, out suspect, out verifyWhy);
+
+                if (verified)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "安全抽检：复核 {0} 个判为敌方的对象，**没有一个连着你方 House** —— 通过。",
+                        checkedCount));
+                }
+                else
+                {
+                    text.AppendLine("安全抽检：**未通过！** " + verifyWhy);
+                    text.AppendLine("→ 敌我分类不可靠，**绝不能开启秒杀**。请把这份结果发给开发者。");
+                }
             }
 
             text.AppendLine();
-            text.AppendLine("本次**没有写入任何内存**。确认数字合理（特别是「放过我方」应等于你自己的东西总数）后再开启「秒杀敌人」。");
+            text.AppendLine(rosterSuspect
+                ? "本次**没有写入任何内存**。名单未通过自检，**秒杀不要开启**：请重新「自动查找总名单」后再点本按钮。"
+                : "本次**没有写入任何内存**。确认数字合理（特别是「放过我方」应等于你自己的东西总数）后再开启「秒杀敌人」。");
             SetOutput(text.ToString());
         }
 
@@ -1309,9 +1311,12 @@ namespace MoTrainer.Ui.Pages
         /// 这里用的是**宽松读法**（不要求选中的东西属于我方，见 `TryReadSelectedObjectsLoose`）
         /// 加**名单复核**（对象必须出现在全对象名单里才判定）——
         /// 宽松判据本身不足以定论，宁可不判定，也绝不猜。
+        /// `rosterSuspect`（名单自检没过）时**跳过名单复核**：那时名单本身不可信，
+        /// 拿它当判据只会把正确的结论也一起挡掉（真机 2026-10-08 16:47 正是如此）。
         /// </summary>
         private void AppendSelectionVerdicts(
-            StringBuilder text, MemoryIO memory, TechnoOwnership.OwnerAnchor anchor, IList<TechnoObject> roster)
+            StringBuilder text, MemoryIO memory, TechnoOwnership.OwnerAnchor anchor,
+            IList<TechnoObject> roster, bool rosterSuspect)
         {
             if (_selection == null) { return; }
 
@@ -1338,9 +1343,19 @@ namespace MoTrainer.Ui.Pages
                 if (known.Contains(selected[i])) { inRoster++; }
             }
 
-            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "你选中的对象逐个判定（共 {0} 个，其中 {1} 个能在「全对象名单」里找到）：",
-                selected.Count, inRoster));
+            if (rosterSuspect)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "你选中的对象逐个判定（共 {0} 个；「全对象名单」自检未通过，本节**不做名单交叉核对**）：",
+                    selected.Count));
+            }
+            else
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "你选中的对象逐个判定（共 {0} 个，其中 {1} 个能在「全对象名单」里找到）：",
+                    selected.Count, inRoster));
+            }
+
             for (int i = 0; i < selected.Count && i < 12; i++)
             {
                 uint address = selected[i];
@@ -1349,7 +1364,8 @@ namespace MoTrainer.Ui.Pages
 
                 // 名单复核：宽松读法读到的地址，必须在全对象名单里出现过才敢判定。
                 //（真机两次证明：名单对不对，用"选中的东西在不在里面"一眼就能看出来。）
-                if (!known.Contains(address))
+                // 名单自检没过时跳过这一关 —— 那时名单本身不可信，拿它当判据会把正确结论也挡掉。
+                if (!rosterSuspect && !known.Contains(address))
                 {
                     text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                         "  0x{0:X8}（类型 0x{1:X8}）→ **不在全对象名单里**，无法判定"

@@ -2755,6 +2755,39 @@ namespace MoTrainer.Diagnostics
                         && missingReason.Length > 0,
                     missingReason);
 
+                // ---- 2026-10-08 晚新增：命中数**只许数数组自己的元素** ----
+                //
+                // 真机 16:46 的教训：旧实现把 4096 项的读取窗口**整个**数了一遍，
+                // 而数组**后面**的内存里往往引用着玩家选中的单位（单位彼此引用很常见）——
+                // 于是每张候选名单都显示"命中 6/6"，真假再也分不出来，
+                // 最终选中了一张只有 60 个对象、玩家的 6 个单位**一个都不在**里面的假名单
+                //（随后「扫描」的交叉验证诚实报了 0/6）。
+                // 这里造同款：数组只有 3 项（第 4 项是 0，数组到此为止），紧跟着的内存里放着线索单位。
+                uint arrayLeak = scene.Arrays + 0x9000;
+                uint slotLeak = scene.Arrays + 0x9400;
+                scene.WriteArray(arrayLeak, new uint[] { scene.Team[2], scene.Team[3], scene.Team[4] });
+                io.WriteUInt32(arrayLeak + 0x0C, 0);                // 数组到此为止
+                io.WriteUInt32(arrayLeak + 0x10, scene.Team[0]);    // 数组之后：引用着线索单位
+                io.WriteUInt32(slotLeak, arrayLeak);
+
+                int rejectedLeak;
+                List<TechnoArrayCandidate> leakFound = TechnoArrayFinder.Find(
+                    io, scene.ModuleBase, scene.ModuleSize, slotSelected, hints,
+                    TechnoScene.OwnerOffset, out rejectedLeak);
+
+                TechnoArrayCandidate leakCandidate = null;
+                for (int i = 0; i < leakFound.Count; i++)
+                {
+                    if (leakFound[i].ArrayAddress == arrayLeak) { leakCandidate = leakFound[i]; }
+                }
+                string leakReason = "";
+                Check("自动查找：命中数只数数组自己的元素（数组之后的内存里引用着线索也不算）",
+                    leakCandidate != null && leakCandidate.HintHits == 0 && leakCandidate.ValidObjects == 3
+                        && !TechnoArrayFinder.MeetsAcceptance(leakCandidate, 1, out leakReason),
+                    leakCandidate == null
+                        ? "候选没进前 8 名"
+                        : leakCandidate.Describe() + "｜" + leakReason);
+
                 // ---- 2026-10-07 加固：可执行页里的「格子」必须被排除 ----
                 //
                 // 真机两次实测（09-27、10-07）：代码段里某些 4 字节窗口的值**恰好等于当场的
