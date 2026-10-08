@@ -120,6 +120,9 @@ namespace MoTrainer.Diagnostics
             // 这类问题**本机 96 DPI 复现不出来**（用户显示器有缩放），所以只能靠"用数字量"：
             // 直接造出页面、在几档宽度下量每个控件的位置，断言互不重叠、不出页面。
             CheckAdvancedPageLayout();
+            // 环境（游戏版本）检查：防止"换了引擎还照旧写"。它失效时表面完全看不出来，
+            // 所以算法、三种结论、以及"引擎是否真的停写"都要有断言兜着。
+            CheckEnvironmentCheck();
 
             // 这一条格外重要：采集要靠**用户开一局游戏**才能跑，
             // 而用户的时间是本项目最稀缺的东西。采集本身若有 bug，
@@ -2968,6 +2971,107 @@ namespace MoTrainer.Diagnostics
             return one.Length > 14 ? one.Substring(0, 14) + "…" : one;
         }
 
+        /// <summary>
+        /// 环境（游戏版本）检查的回归（2026-10-08 晚新增）。
+        ///
+        /// 为什么必须有：这是"防止程序在**另一份引擎**上照着旧地址乱写"的唯一一道闸。
+        /// 它一旦失效，表面完全看不出来 —— 功能照常"工作"，写进去的却是别人的内存。
+        /// 所以这里从**算法**（CRC32 用标准校验值钉死）、**取文件**、**三种结论**
+        /// （首次记录 / 一致 / 不一致）到**引擎是否真的停写**，逐层验一遍。
+        /// </summary>
+        private static void CheckEnvironmentCheck()
+        {
+            try
+            {
+                // ① CRC32 算法：用标准校验值钉死（这几个值是 CRC32 的公开测试向量）
+                byte[] check = System.Text.Encoding.ASCII.GetBytes("123456789");
+                uint crc = EnvironmentCheck.Crc32(check, 0, check.Length);
+                Check("版本检查：CRC32 算法与标准测试向量一致（\"123456789\" = 0xCBF43926）",
+                    crc == 0xCBF43926u,
+                    string.Format(CultureInfo.InvariantCulture, "算出 0x{0:X8}", crc));
+
+                byte[] empty = new byte[0];
+                uint emptyCrc = EnvironmentCheck.Crc32(empty, 0, 0);
+                Check("版本检查：空数据的 CRC32 为 0（边界值）",
+                    emptyCrc == 0,
+                    string.Format(CultureInfo.InvariantCulture, "算出 0x{0:X8}", emptyCrc));
+
+                // ② 文件版：写一个临时文件，CRC 必须与"对同样字节的内存版"一致
+                string temp = Path.Combine(Path.GetTempPath(),
+                    "mo_trainer_crc_" + DateTime.Now.Ticks.ToString(CultureInfo.InvariantCulture) + ".bin");
+                byte[] payload = new byte[70000];      // 跨过读缓冲（64KB）的边界，覆盖分块拼接
+                for (int i = 0; i < payload.Length; i++) { payload[i] = (byte)(i * 31 + 7); }
+                File.WriteAllBytes(temp, payload);
+
+                uint fileCrc;
+                string fileError;
+                bool fileOk = EnvironmentCheck.TryComputeFileCrc32(temp, out fileCrc, out fileError);
+                uint memoryCrc = EnvironmentCheck.Crc32(payload, 0, payload.Length);
+                Check("版本检查：文件 CRC 与内存 CRC 一致（分块读取不拼接错）",
+                    fileOk && fileCrc == memoryCrc,
+                    fileOk
+                        ? string.Format(CultureInfo.InvariantCulture, "文件 0x{0:X8}｜内存 0x{1:X8}", fileCrc, memoryCrc)
+                        : fileError);
+
+                string missingError;
+                uint missingCrc;
+                bool missingOk = EnvironmentCheck.TryComputeFileCrc32(temp + ".notexist", out missingCrc, out missingError);
+                Check("版本检查：文件不存在时返回失败而不是抛异常（并说明原因）",
+                    !missingOk && missingError.Length > 0, missingError);
+
+                try { File.Delete(temp); } catch (Exception) { }
+
+                // ③ 三种结论：用**自检程序自己的进程**当被测对象（它的主程序文件就是 _selftest.exe）
+                int pid = Process.GetCurrentProcess().Id;
+                CalibrationProfile profile = new CalibrationProfile();
+
+                EnvironmentCheck.ResetCache();
+                EnvironmentCheck.Result first = EnvironmentCheck.Verify(profile, pid);
+                Check("版本检查：校准文件里没记过 → 判定为「首次记录」，并给出当前指纹",
+                    first.Available && first.FirstRecord && first.Match && first.GameCrc.Length > 0,
+                    first.Detail);
+
+                if (first.Available)
+                {
+                    profile.ExeCrc32 = first.GameCrc;
+                    EnvironmentCheck.ResetCache();
+                    EnvironmentCheck.Result same = EnvironmentCheck.Verify(profile, pid);
+                    Check("版本检查：指纹一致 → 放行（不打扰用户）",
+                        same.Available && same.Match && !same.FirstRecord,
+                        same.Detail);
+
+                    profile.ExeCrc32 = "0xDEADBEEF";
+                    EnvironmentCheck.ResetCache();
+                    EnvironmentCheck.Result diff = EnvironmentCheck.Verify(profile, pid);
+                    Check("版本检查：指纹不一致 → 判为不一致并给出可执行的说明（该拒绝就拒绝）",
+                        diff.Available && !diff.Match && !diff.FirstRecord && diff.Detail.Length > 0,
+                        diff.Detail);
+
+                    profile.ExeCrc32 = "";
+                }
+
+                // ④ 真机文档一致性（本机装了游戏时才有意义）：文档记的是 0x1B499086
+                const string gamePath = @"D:\Mental Omega\gamemd.exe";
+                if (File.Exists(gamePath))
+                {
+                    uint gameCrc;
+                    string gameError;
+                    bool ok = EnvironmentCheck.TryComputeFileCrc32(gamePath, out gameCrc, out gameError);
+                    Check("版本检查：本机 gamemd.exe 的指纹与文档记载一致（0x1B499086）",
+                        ok && gameCrc == 0x1B499086u,
+                        ok ? string.Format(CultureInfo.InvariantCulture, "算出 0x{0:X8}", gameCrc) : gameError);
+                }
+                else
+                {
+                    WarnItem("版本检查：本机未找到游戏主程序，跳过「与文档核对指纹」一项", gamePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                Check("版本检查", false, ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
         private static void CheckTechnoOps()
         {
             SelfHandle self = SelfHandle.Create();
@@ -3688,6 +3792,31 @@ namespace MoTrainer.Diagnostics
 
                 // 静态登记处是进程内共享的 —— 用完必须清掉，否则会污染后面的用例
                 AllyGuard.Reset();
+
+                // ================= ⑥ 环境（游戏版本）检查不过 → 一个字节都不写 =================
+                //
+                // 这是"防止在另一份引擎上照旧乱写"的最后一道闸（见 `EnvironmentCheck`）。
+                // 它失效时表面完全看不出来：功能照常"工作"，写进去的却是别人的内存。
+                for (int i = 2; i <= 4; i++) { io.WriteUInt32(scene.Team[i] + HealthOffset, 100); }
+                io.WriteUInt32(neighborEnemy + HealthOffset, 100);
+
+                engine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature versionBlocked = engine.Add(new CheatFeature(
+                    CheatId.KillEnemies, "秒杀", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+                engine.EnvironmentBlock = "游戏版本与校准记录不一致（测试用）——已停用全部写入功能";
+                versionBlocked.Enabled = true;
+                engine.Start();
+                Thread.Sleep(900);
+
+                Check("秒杀接线：环境（游戏版本）检查不过时拒绝写入，一个字节都没写，并把原因写在卡片上",
+                    scene.ReadField(scene.Team[2], HealthOffset) == 100
+                        && scene.ReadField(scene.Team[3], HealthOffset) == 100
+                        && versionBlocked.LastError.IndexOf("版本") >= 0,
+                    versionBlocked.LastError.Length == 0 ? "居然没有报错" : versionBlocked.LastError);
+
+                engine.Stop();
+                engine = null;
             }
             catch (Exception ex)
             {

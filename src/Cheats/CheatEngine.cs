@@ -269,6 +269,19 @@ namespace MoTrainer.Cheats
                     continue;
                 }
 
+                // 环境（游戏版本）检查没过 → **一个字节都不许写**。
+                //
+                // 上面的只读探测（关闭状态那一支）照旧执行：界面上还能看到数值是否解析正常，
+                // 便于用户判断"是版本不对还是别的问题"；但允许写入的是另一个量级的事 ——
+                // 地址是在另一份引擎上校准出来的，照写等于往随机内存里灌数据。
+                // 理由文本由 `MainForm` 从 `EnvironmentCheck` 取来（它才知道游戏进程与 exe 路径）。
+                if (!string.IsNullOrEmpty(EnvironmentBlock))
+                {
+                    feature.Address = 0;
+                    feature.LastError = EnvironmentBlock;
+                    continue;
+                }
+
                 // 无敌不是"锁一个地址"，而是"遍历选中的每个对象逐一写血量"；
                 // 秒杀敌人同理（整场对象遍历 + 批量写），两者都单独走专用路径，
                 // 绝不复用单地址的读-比-写 —— 否则会拿"名单基地址"当单地址去写值。
@@ -962,6 +975,14 @@ namespace MoTrainer.Cheats
 
         /// <summary>上一拍的"游戏是否已连接"，用于识别（重新）连接并作废会话级缓存。</summary>
         private bool _readyPrev;
+
+        /// <summary>
+        /// 环境（游戏版本）检查给出的"禁止写入"理由；**非空时所有功能一律不写**（只读探测照旧）。
+        ///
+        /// 由 `MainForm` 在附加成功后设置 —— 只有它拿得到游戏进程号与 exe 路径（见 `EnvironmentCheck`）。
+        /// 赋值是引用赋值（原子），锁定线程读到的一定是完整字符串；本条只由界面线程改。
+        /// </summary>
+        public string EnvironmentBlock { get; set; }
 
         /// <summary>秒杀的执行节拍：0.5 秒一拍（按真机规模约 2 秒清完一轮，符合"3 秒内归零"）。</summary>
         private const double KillIntervalSeconds = 0.5;

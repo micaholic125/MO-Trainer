@@ -637,6 +637,74 @@ namespace MoTrainer.Ui
         /// <summary>上次钳制标签宽度时用的窗口宽度，用来避免每次重排都无谓地走一遍控件树。</summary>
         private int _clampedWidth = -1;
 
+        /// <summary>已做过的环境检查针对哪个 pid（0 = 还没做）——同一局只查一次，CRC 要读整个 exe。</summary>
+        private int _environmentCheckedPid;
+
+        /// <summary>环境检查给出的"禁止写入"理由；空串表示放行。</summary>
+        private string _environmentBlock = "";
+
+        /// <summary>
+        /// 环境（游戏版本）检查 —— 附加成功后做一次（见 `EnvironmentCheck` 的类注释）。
+        ///
+        /// 三种结论各自的动作：
+        ///   · 校准文件里没记过指纹 → **记上并存盘**（这是新加的检查，第一次运行会把当前这份记下来）；
+        ///   · 一致 → 放行；
+        ///   · **不一致 → 停用全部写入**（把理由交给引擎，每张卡片上都会显示这句话）。
+        /// 算不出来（取不到路径 / 文件读不了）时**不拦**，但会在日志里留一行，绝不静默。
+        /// </summary>
+        private void EnsureEnvironmentChecked()
+        {
+            bool ready = _attach != null && _attach.State == AttachState.Attached;
+            if (!ready)
+            {
+                _environmentCheckedPid = 0;
+                _environmentBlock = "";
+                if (_engine != null) { _engine.EnvironmentBlock = null; }
+                return;
+            }
+
+            int pid = _attach.ProcessId;
+            if (pid == _environmentCheckedPid) { return; }
+            _environmentCheckedPid = pid;
+
+            EnvironmentCheck.Result result = EnvironmentCheck.Verify(_profile, pid);
+
+            if (!result.Available)
+            {
+                _environmentBlock = "";
+                if (_engine != null) { _engine.EnvironmentBlock = null; }
+                Logger.Warn("Env", "游戏版本检查跳过：" + result.Detail);
+                return;
+            }
+
+            if (result.FirstRecord)
+            {
+                // 首次记录：把当前游戏的指纹写进校准文件（不写这一份，下次换版本就无从对比）。
+                _profile.ExeCrc32 = result.GameCrc;
+                string saveError;
+                if (!_profileStore.Save(_profile, out saveError))
+                {
+                    Logger.Warn("Env", "游戏版本指纹写入校准文件失败：" + saveError);
+                }
+                Logger.Info("Env", result.Detail);
+                _environmentBlock = "";
+                if (_engine != null) { _engine.EnvironmentBlock = null; }
+                return;
+            }
+
+            if (result.Match)
+            {
+                Logger.Info("Env", result.Detail);
+                _environmentBlock = "";
+                if (_engine != null) { _engine.EnvironmentBlock = null; }
+                return;
+            }
+
+            _environmentBlock = result.Detail;
+            if (_engine != null) { _engine.EnvironmentBlock = result.Detail; }
+            Logger.Error("Env", result.Detail);
+        }
+
         private void OnAttachStatusChanged()
         {
             try
@@ -679,6 +747,11 @@ namespace MoTrainer.Ui
             string calibrationText = _profile.IsCalibratedAtAll
                 ? string.Format(CultureInfo.InvariantCulture, "校准 {0}/5 项", _profile.CalibratedItemCount())
                 : "校准 未校准";
+
+            // 环境（游戏版本）检查：附加成功后做一次；不一致就在状态条上直接写出来 ——
+            // 这种"看起来在正常工作、其实地址全不对"的情形，必须让用户在**开功能之前**就看到。
+            EnsureEnvironmentChecked();
+            if (_environmentBlock.Length > 0) { calibrationText += "｜⚠ 游戏版本不符"; }
 
             _statusStrip.UpdateStatus(
                 stateText, Theme.StateColor(state), baseText, calibrationText, "模式 单人");
