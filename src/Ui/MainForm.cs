@@ -273,7 +273,19 @@ namespace MoTrainer.Ui
                 smoke.Tick += delegate
                 {
                     smoke.Stop();
-                    ForceLabelClamp();   // 借退出前这一刻，把当前页面的真实尺寸记进日志
+
+                    // 借退出前这一刻，把**每一页**的真实几何尺寸都记进日志。
+                    //
+                    // 为什么要把每一页都走一遍（2026-10-08 23:38 真机教训）：那次用户手动点了一遍各页面，
+                    // 日志里只有「高级功能」页报 `横条=有`（横向滚动条又冒出来了）—— 而 `--smoke` 原来
+                    // 只记当前那一页（首页），于是"只有某一页出问题"这类情况**一次都抓不到**。
+                    // 逐页走一遍之后，发布前的冒烟自启动就能把这类问题自己抓出来，不必等用户截图。
+                    for (int i = 0; i < _pages.Count; i++)
+                    {
+                        SelectPage(i);   // 内部会 ForceLabelClamp → 把该页的尺寸与滚动条状态写进日志
+                    }
+                    SelectPage(0);
+                    ForceLabelClamp();
 
                     // `--autofind`：自动跑一遍「查找总名单 + 扫描」，结果落进日志后自己退出。
                     // 这套流程需要"游戏里保持选中一个单位"的人工前置，
@@ -625,6 +637,27 @@ namespace MoTrainer.Ui
                 ClientSize.Width, _contentHost.Width, _logHeader.Width, _logTitle.Width,
                 _openLogDirButton.Left, _openLogDirButton.Width,
                 _exportLogButton.Left, _exportLogButton.Width, pageInfo));
+
+            // 页面被撑出横向滚动条时，把页内每个控件的**实际位置**一并写下来。
+            // "谁超出了可用宽度、差多少像素"必须一眼可算 —— 否则又得靠截图猜（`CLAUDE.md` 7.2 的教训）。
+            // 真机 2026-10-08 23:38：只有「高级功能」页报 横条=有，其他页都正常，没有这行数字就只能猜。
+            if (page != null)
+            {
+                ScrollableControl scrollable = page as ScrollableControl;
+                if (scrollable != null && scrollable.HorizontalScroll.Visible)
+                {
+                    for (int i = 0; i < page.Controls.Count; i++)
+                    {
+                        Control child = page.Controls[i];
+                        string label = child.Text == null ? "" : child.Text.Replace("\n", " ");
+                        if (label.Length > 14) { label = label.Substring(0, 14) + "…"; }
+                        Logger.Info("Layout", string.Format(CultureInfo.InvariantCulture,
+                            "    [越界排查] {0}：「{1}」左 {2} 宽 {3} → 右 {4}（页面可用宽 {5}）",
+                            child.GetType().Name, label, child.Left, child.Width, child.Right,
+                            page.ClientSize.Width));
+                    }
+                }
+            }
         }
 
         /// <summary>强制重算一次（切页时用：宽度没变，但新页面的标签还没被钳过）。</summary>

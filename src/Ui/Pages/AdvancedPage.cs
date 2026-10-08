@@ -114,7 +114,9 @@ namespace MoTrainer.Ui.Pages
 
             _subtitle = MakeHintLabel();
             _subtitle.Font = Theme.Body;
-            _subtitle.Text = "秒杀敌人 / 瞬间建造 / 全图视野 —— 本页只读不写；下面「开始采集」是把后续要用的数据一次收齐的校准辅助工具。";
+            // 副标题刻意短：页面高度只有 484 像素（窗口 660 高时），文案一长就把内容顶出竖向滚动条，
+            // 而竖向条会连锁引出横向条（见 `RelayoutAll` 的注释）。
+            _subtitle.Text = "秒杀 / 瞬间建造 / 全图视野 —— 本页只读不写。";
             Controls.Add(_subtitle);
 
             // 第一组：名单与秒杀（四个按钮挨着放，提示文字单独占一行在它们下面）
@@ -186,7 +188,11 @@ namespace MoTrainer.Ui.Pages
             _output.Anchor = AnchorStyles.Top | AnchorStyles.Left;   // 位置与大小都由 RelayoutAll 算
             Controls.Add(_output);
 
+            // 两个事件都要挂：`SizeChanged` 管窗口缩放；`ClientSizeChanged` 管**滚动条出现/消失**
+            //（竖向滚动条一出现，可用宽就少 ~17 像素，但控件的 Size 没变 —— 只挂前者会漏掉这一步，
+            //  横向滚动条就是这么冒出来的，见 `RelayoutAll` 里的注释）。
             SizeChanged += delegate { RelayoutAll(); };
+            ClientSizeChanged += delegate { RelayoutAll(); };
             RelayoutAll();
             RefreshUi();
             UpdateHarvestUi();
@@ -251,8 +257,15 @@ namespace MoTrainer.Ui.Pages
             y = LayoutHint(_harvestStatus, y, rightLimit - left) + 14;
 
             int boxHeight = ClientSize.Height - y - 20;
-            if (boxHeight < 120) { boxHeight = 120; }
+            // 空间不够时**不硬撑**：从前写死 120 的下限，内容一高就把页面顶出竖向滚动条，
+            // 而竖向条一出现，可用宽就从 820 缩到 ~794 —— 按 820 排好的控件瞬间超出，
+            // 于是**横向滚动条也冒出来**（真机 2026-10-08 23:38 报「横条=有」就是这么来的）。
+            if (boxHeight < 60) { boxHeight = 60; }
             SetBoundsIfChanged(_output, new Point(left, y), new Size(rightLimit - left, boxHeight));
+
+            // 排完强制结算一次：滚动条的去留由它重新判定 ——
+            // 否则"曾经超出过"留下的横向条会一直挂着（上面的用例就是：控件早已装得下，条却还在）。
+            PerformLayout();
         }
 
         /// <summary>一排按钮：从左到右摆，放不下就换行。返回最后一行按钮的底边 y。</summary>
