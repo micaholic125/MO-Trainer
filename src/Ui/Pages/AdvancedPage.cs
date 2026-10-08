@@ -77,6 +77,7 @@ namespace MoTrainer.Ui.Pages
         private readonly Button _markAllyButton;
         private readonly Button _shroudButton;
         private readonly Button _powerProbeButton;
+        private readonly Button _powerScoutButton;
         private readonly Button _harvestButton;
         private readonly Label _harvestStatus;
         private readonly Timer _harvestTimer;
@@ -177,6 +178,13 @@ namespace MoTrainer.Ui.Pages
             _powerProbeButton.Click += OnPowerProbeClick;
             Controls.Add(_powerProbeButton);
 
+            // 「电力侦查」：**纯只读**地把选中那座建筑"摊开看一遍"——找它指向的类型对象与像电力读数的字段。
+            // 为什么需要：`+0xD0` 那个候选已被真机试探否掉（写 5000，界面电力读数纹丝不动 260→260→260），
+            // 而真正的来源最可能在**建筑类型对象**里，类型对象整局不变、采集报告里永远看不到它。
+            _powerScoutButton = UiFactory.MakeButton("电力侦查（只读）", 168);
+            _powerScoutButton.Click += OnPowerScoutClick;
+            Controls.Add(_powerScoutButton);
+
             _harvestStatus = MakeHintLabel();
             _harvestStatus.Text = "采集期间你只需要在游戏里正常玩：选几个单位、造点东西、让单位挨点打。程序自己记录。";
             Controls.Add(_harvestStatus);
@@ -255,7 +263,12 @@ namespace MoTrainer.Ui.Pages
             if (width < 320 || _output == null) { return; }   // 还没成形，等下一次尺寸事件
 
             int left = PagePadding;
-            int rightLimit = width - PagePadding;
+            // **预先留出竖向滚动条的宽度**：页面内容一高就会出现竖向条，而它一出现，
+            // 可用宽会立刻少掉 ~17~26 像素 —— 按"没滚动条时的宽度"排好的控件会在那一瞬间超出，
+            // 于是**横向滚动条跟着冒出来**；等重排后早已装得下，那根横条却不一定退场
+            //（真机 10-08 23:38 与 10-09 00:27 两次都栽在这一步）。留出余量后，这个瞬间根本不会发生。
+            int reserve = SystemInformation.VerticalScrollBarWidth + 4;
+            int rightLimit = width - PagePadding - reserve;
             int y = 20;
 
             SetBoundsIfChanged(_heading, new Point(left, y),
@@ -268,7 +281,8 @@ namespace MoTrainer.Ui.Pages
                 left, rightLimit) + 6;
             y = LayoutHint(_hintTop, y, rightLimit - left) + 14;
 
-            y = LayoutButtonRow(y, new Control[] { _shroudButton, _harvestButton, _powerProbeButton },
+            y = LayoutButtonRow(y,
+                new Control[] { _shroudButton, _harvestButton, _powerProbeButton, _powerScoutButton },
                 left, rightLimit) + 6;
             y = LayoutHint(_harvestStatus, y, rightLimit - left) + 14;
 
@@ -1448,6 +1462,53 @@ namespace MoTrainer.Ui.Pages
                 ? "本次**没有写入任何内存**。名单未通过自检，**秒杀不要开启**：请重新「自动查找总名单」后再点本按钮。"
                 : "本次**没有写入任何内存**。确认数字合理（特别是「放过我方」应等于你自己的东西总数）后再开启「秒杀敌人」。");
             SetOutput(text.ToString());
+        }
+
+        /// <summary>
+        /// 「电力侦查」（`[S4-3]` B 方案第三步）：**纯只读**地把选中那座建筑"摊开看一遍"。
+        ///
+        /// 前一阶段的结论：候选字段 `+0xD0` 已被真机试探**否掉**（写 5000，界面电力读数 260→260→260 纹丝不动）。
+        /// 剩下的最可能方向是**建筑类型对象**（尤里的电力是"类型"上的属性、同类建筑共用一份），
+        /// 而类型对象整局不变 —— 采集报告只记"变化过的字段"，永远看不到它。只能现场摊开看：
+        /// 对象头部哪些位置放着指针、指针那头有没有"类型对象"的特征（指向建筑 ID 字符串），
+        /// 以及哪些字段的数值像电力读数（供下一步试探挑选）。
+        /// **全程只读，一个字节都不写。**
+        /// </summary>
+        private void OnPowerScoutClick(object sender, EventArgs e)
+        {
+            StringBuilder text = new StringBuilder();
+
+            List<uint> selected;
+            string note = "";
+            if (_selection == null || !_selection.TryReadSelectedObjectsLoose(_profile, 4, out selected, out note)
+                || selected.Count == 0)
+            {
+                text.AppendLine("=== 电力侦查（只读）===");
+                text.AppendLine("【读不到选中的对象】" + note);
+                text.AppendLine("请先在游戏里**点选一座你自己的建筑**（发电厂最好），再点本按钮。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            string report;
+            try
+            {
+                report = PowerScout.Run(_target.Memory, _profile, LiveModuleBase, selected[0]);
+            }
+            catch (Exception ex)
+            {
+                report = "=== 电力侦查（只读）===\n侦查过程中出错：" + ex.Message;
+            }
+
+            SetOutput(report);
+
+            // 整段落进日志：用户只要说一声，开发者自己读（不必让用户描述或截图）
+            string[] lines = report.Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].TrimEnd('\r');
+                if (line.Length > 0) { Logger.Info("Advanced", line); }
+            }
         }
 
         /// <summary>「电力试探」是否已经解释过一次（点两次：第一次只给说明，第二次才真写）。</summary>

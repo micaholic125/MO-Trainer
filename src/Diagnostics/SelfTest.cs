@@ -125,6 +125,8 @@ namespace MoTrainer.Diagnostics
             CheckEnvironmentCheck();
             // 「电力试探」是全程序唯一往游戏里写**实验值**的地方：中心是"无论如何都还原"与"不该写就一个字节不写"。
             CheckPowerProbe();
+            // 「电力侦查」是只读工具：中心是"能认出类型对象"与"一个字节都不写"。
+            CheckPowerScout();
 
             // 这一条格外重要：采集要靠**用户开一局游戏**才能跑，
             // 而用户的时间是本项目最稀缺的东西。采集本身若有 bug，
@@ -3097,9 +3099,8 @@ namespace MoTrainer.Diagnostics
 
                 MemoryIO io = scene.Io;
                 uint module = scene.ModuleBase;
-                // 真机上"界面电力产出"在 House + 0x53A4；这里改用 0x2000 —— 合成场景的堆块只有 64KB，
-                // 0x53A4 会落到块外读不出来（踩过一次）。本用例考的是**机制**，不是那个具体偏移。
-                const uint OutputOffset = 0x2000;
+                // 注：真机上"界面电力产出"在 House + 0x53A4；合成场景的堆块只有 64KB，照搬会落到块外
+                // 读不出来（踩过一次），所以下面把模拟字段放在堆块内另起一处。本用例考的是**机制**。
 
                 // 场景：我方房子（有钱，供锚定）+ 我方的一座"电厂"（对象 +0xD0 放候选字段）
                 io.WriteUInt32(scene.MyOwner + TechnoOwnership.HouseMoneyOffset, 5000);
@@ -3192,6 +3193,89 @@ namespace MoTrainer.Diagnostics
                 if (scene != null) { scene.Dispose(); }
                 self.Dispose();
             }
+        }
+
+        /// <summary>
+        /// 「电力侦查」的回归（2026-10-09 新增，`[S4-3]` B 方案第三步）。
+        ///
+        /// 它是**只读**工具，所以本节的中心是两件事：
+        ///   ① 真的能认出"类型对象"（顺着指针找到里面的建筑 ID 字符串）—— 这是下一步定位电力来源的线索；
+        ///   ② **一个字节都不许写**（对照扫描前后的原始字节）。
+        /// </summary>
+        private static void CheckPowerScout()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("电力侦查", false, "OpenProcess 失败"); return; }
+
+            TechnoScene scene = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("电力侦查测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+                uint target = scene.Team[1];
+
+                // 造一个"像建筑类型对象"的东西：它 +0x08 处指向一个可打印字符串（真机里就是建筑 ID）
+                uint typeObject = scene.Heap + 0x5000;
+                uint idString = scene.Heap + 0x5200;
+                io.WriteUInt32(typeObject + 0x08, idString);
+                byte[] id = System.Text.Encoding.ASCII.GetBytes("GAPOWR\0");
+                io.WriteRaw((IntPtr)(long)idString, id, 0, id.Length);
+
+                // 目标对象：+0x40 放"指向类型对象"的指针；+0x100 放一个"像电力读数"的小整数
+                io.WriteUInt32(target + 0x40, typeObject);
+                io.WriteUInt32(target + 0x100, 200);
+
+                byte[] before = io.ReadBytesQuiet(target, PowerScout.ScanBytes);
+
+                CalibrationProfile profile = new CalibrationProfile();
+                string report = PowerScout.Run(io, profile, scene.ModuleBase, target);
+
+                byte[] after = io.ReadBytesQuiet(target, PowerScout.ScanBytes);
+                bool identical = before != null && after != null && before.Length == after.Length;
+                if (identical)
+                {
+                    for (int i = 0; i < before.Length; i++)
+                    {
+                        if (before[i] != after[i]) { identical = false; break; }
+                    }
+                }
+
+                Check("电力侦查：能认出「类型对象」（顺着指针找到里面的建筑 ID 字符串）",
+                    report.IndexOf("疑似类型对象") >= 0 && report.IndexOf("GAPOWR") >= 0,
+                    FirstLineWith(report, "疑似类型对象"));
+
+                Check("电力侦查：会列出「数值像电力读数」的字段（供下一步试探挑）",
+                    report.IndexOf("+0x100 = 200") >= 0,
+                    FirstLineWith(report, "+0x100"));
+
+                Check("电力侦查：**一个字节都不写**（扫描前后对象原始字节完全一致）",
+                    identical,
+                    identical ? "扫描前后逐字节一致（共 " + (before == null ? 0 : before.Length) + " 字节）"
+                              : "**字节被改动了！**");
+            }
+            catch (Exception ex)
+            {
+                Check("电力侦查", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        /// <summary>取报告里第一条含关键字的行（断言说明用；取不到就返回空串）。</summary>
+        private static string FirstLineWith(string text, string key)
+        {
+            if (text == null) { return ""; }
+            string[] lines = text.Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].IndexOf(key) >= 0) { return lines[i].Trim(); }
+            }
+            return "";
         }
 
         private static void CheckTechnoOps()
