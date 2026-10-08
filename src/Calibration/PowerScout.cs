@@ -129,10 +129,30 @@ namespace MoTrainer.Calibration
             // 为什么：电力在尤里复仇里是"建筑类型"上的属性（同类建筑共用一份），
             // 而类型对象整局不变、采集报告里永远看不到 —— 只能现场看。
             text.AppendLine();
-            text.AppendLine("—— 深挖：指针目标结构内部（每个最多列 40 个字段）——");
-            for (int i = 0; i < pointers.Count && i < 6; i++)
+            // 深挖分两批：
+            //   ① **模块内**的目标（静态对象 / 类型对象就在这一批里）—— 优先、窗口更大（0x600）；
+            //   ② 其它目标 —— 只取前几个，短窗口。
+            // 真机教训：上一版按顺序只挖了前 6 个，恰好全被 4 个虚表占满，真正要找的类型指针一个没挖到。
+            text.AppendLine("—— 深挖 ①：**模块内**的目标（类型对象大概率在这一批）——");
+            int dumpedModule = 0;
+            for (int i = 0; i < pointers.Count && dumpedModule < 10; i++)
             {
-                AppendTargetDump(text, memory, pointers[i].ObjectOffset, pointers[i].Value);
+                uint v = pointers[i].Value;
+                if (v < 0x400000 || v >= 0x400000 + 0x793000) { continue; }
+                dumpedModule++;
+                AppendTargetDump(text, memory, pointers[i].ObjectOffset, v, 0x600, 80);
+            }
+            if (dumpedModule == 0) { text.AppendLine("  （没找到模块内的目标）"); }
+
+            text.AppendLine();
+            text.AppendLine("—— 深挖 ②：其它目标（前 6 个，短窗口）——");
+            int dumpedOther = 0;
+            for (int i = 0; i < pointers.Count && dumpedOther < 6; i++)
+            {
+                uint v = pointers[i].Value;
+                if (v >= 0x400000 && v < 0x400000 + 0x793000) { continue; }
+                dumpedOther++;
+                AppendTargetDump(text, memory, pointers[i].ObjectOffset, v, 0x400, 40);
             }
 
             // ④ **原始数据整段**：一次点击把对象前 0x800 字节全打出来，
@@ -159,12 +179,13 @@ namespace MoTrainer.Calibration
         /// 把一个"指针目标结构"摊开看（**只读**）：字符串指针（带原文）+ 小整数，
         /// 两类都按"像不像建筑类型的属性"来列（电力值一般就是 50~500 这种小整数）。
         /// </summary>
-        private static void AppendTargetDump(StringBuilder text, MemoryIO memory, uint fromOffset, uint target)
+        private static void AppendTargetDump(
+            StringBuilder text, MemoryIO memory, uint fromOffset, uint target, int windowBytes, int maxNumbers)
         {
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "  · 目标 0x{0:X8}（来自对象 +0x{1:X3}）：", target, fromOffset));
 
-            byte[] block = memory.ReadBytesQuiet(target, 0x400);
+            byte[] block = memory.ReadBytesQuiet(target, windowBytes);
             if (block == null) { text.AppendLine("      读不动"); return; }
 
             uint head0 = ReadUInt32(block, 0);
@@ -199,7 +220,7 @@ namespace MoTrainer.Calibration
                 if (count > 0) { numbers.Append("、"); }
                 numbers.Append(string.Format(CultureInfo.InvariantCulture, "+0x{0:X3}={1}", i, value));
                 count++;
-                if (count >= 60) { break; }
+                if (count >= maxNumbers) { break; }
             }
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "      小整数 {0} 个：{1}", count, numbers.ToString()));
