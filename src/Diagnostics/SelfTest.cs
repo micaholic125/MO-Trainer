@@ -3103,6 +3103,64 @@ namespace MoTrainer.Diagnostics
                     !ok3 && note2.IndexOf("没有选中") >= 0,
                     note2);
                 io.WriteUInt32(countAddress, 2);
+
+                // ⑤ 宽松读取（2026-10-08 晚新增）：**选中的东西里没有本方单位**时必须读得出来。
+                //    真机上的典型情形：玩家单独点了一座中立建筑 ——
+                //    心灵终结里中立单位不能和友军一起选中，所以"选中立建筑看一眼"必然走这条路。
+                //    布置：数量 1；"不属于我方"的对象放在 数量字段 −0x0C 的槽位里；
+                //    配置槽位故意指向一张**内容不像对象**的垃圾数组（宽松版不许盲信它）。
+                uint neutralArray = scene.Arrays + 0x2800;
+                uint garbageArray = scene.Arrays + 0x2C00;
+                uint layoutSlot = countAddress - 0x0C;
+                io.WriteUInt32(neutralArray, scene.Team[2]);          // 只装一个"非我方"对象
+                io.WriteUInt32(garbageArray, 0x00000010);             // 内容不像对象
+                io.WriteUInt32(countAddress, 1);
+                io.WriteUInt32(layoutSlot, neutralArray);
+                io.WriteUInt32(wrongSlot, garbageArray);
+                // 让"我方那张数组"也不再含我方对象 —— 否则严格版会从别的槽位兜到它，测不出差异
+                io.WriteUInt32(realArray, scene.Team[2]);
+                io.WriteUInt32(realArray + 4, scene.Team[3]);
+                io.WriteUInt32(rightSlot, 0);
+
+                SelectionResolver resolver4 = new SelectionResolver(target);
+                List<uint> strict;
+                string strictNote;
+                bool strictFailed = !resolver4.TryReadSelectedObjects(profile, 8, true, out strict, out strictNote);
+
+                SelectionResolver resolver5 = new SelectionResolver(target);
+                List<uint> loose;
+                string looseNote;
+                bool looseOk = resolver5.TryReadSelectedObjectsLoose(profile, 8, out loose, out looseNote);
+                Check("选中读取：只选中「不属于我方」的东西时，宽松版读得出、严格版拒绝",
+                    strictFailed && looseOk && loose.Count == 1 && loose[0] == scene.Team[2],
+                    string.Format(CultureInfo.InvariantCulture,
+                        "严格版{0}｜宽松版读到 {1} 个（{2}）",
+                        strictFailed ? "拒绝" : "居然成功了", loose.Count, looseNote));
+
+                // ⑥ 宽松读取不是"能读就返回"：候选槽位全指向不像对象的东西 → 明确拒绝
+                io.WriteUInt32(layoutSlot, garbageArray);
+                SelectionResolver resolver6 = new SelectionResolver(target);
+                List<uint> loose2;
+                string looseNote2;
+                bool looseRejected = !resolver6.TryReadSelectedObjectsLoose(profile, 8, out loose2, out looseNote2);
+                Check("选中读取：宽松版读到的东西不像对象时明确拒绝（宁可不判定）",
+                    looseRejected && looseNote2.Length > 0,
+                    looseNote2);
+
+                // ⑦ 沿用旧锚点的前提：它必须仍指着**金钱链此刻指向的那个房子**（换局即作废）
+                uint moneyAddress = scene.MyOwner + TechnoOwnership.HouseMoneyOffset;
+                string anchorNote;
+                bool sameHouse = TechnoOwnership.TryVerifyCachedAnchor(
+                    io, 0x14C, scene.MyOwner, moneyAddress, out anchorNote);
+                bool otherHouse = TechnoOwnership.TryVerifyCachedAnchor(
+                    io, 0x14C, scene.EnemyOwner, moneyAddress, out anchorNote);
+                bool noAnchor = TechnoOwnership.TryVerifyCachedAnchor(
+                    io, 0, 0, moneyAddress, out anchorNote);
+                Check("沿用旧锚点：只有「还指着同一个房子」才放行（换了局 / 没建过一律拒绝）",
+                    sameHouse && !otherHouse && !noAnchor && anchorNote.Length > 0,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "同一个房子={0}｜换了房子={1}｜没建过={2}｜最后一条说明：{3}",
+                        sameHouse, otherHouse, noAnchor, anchorNote));
             }
             catch (Exception ex)
             {

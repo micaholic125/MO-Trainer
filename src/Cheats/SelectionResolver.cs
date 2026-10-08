@@ -352,6 +352,171 @@ namespace MoTrainer.Cheats
             return true;
         }
 
+        // ============================================================ 宽松读取（只用于显示）
+
+        /// <summary>
+        /// 读出"当前选中的对象"，**不要求其中有本方单位**（2026-10-08 晚新增）。
+        ///
+        /// 为什么需要它：玩家要确认"我点的这座中立建筑会不会被秒杀"，而**心灵终结里
+        /// 中立单位无法和友军单位同时选中**（2026-10-08 用户实测反馈：点中立单位时友方单位
+        /// 会被取消选中）——"把中立建筑和自己的单位一起选中"这条路根本走不通，
+        /// 只能支持"选中的只有非我方对象"这一种情形。
+        ///
+        /// 代价：认数组不能再用"里面有本方单位"这条最硬的判据（`ResolveArray`），
+        /// 改用**就地的旁证**（见 `ResolveArrayLoose`）。因此本方法的结果**只能用于显示**：
+        /// 调用方必须再用"这个对象在不在全对象名单里"复核一次
+        ///（`AdvancedPage.AppendSelectionVerdicts` 就是这么做的）；**绝不拿它做写入决策**。
+        /// </summary>
+        public bool TryReadSelectedObjectsLoose(
+            CalibrationProfile profile, int maxObjects, out List<uint> objects, out string note)
+        {
+            objects = new List<uint>();
+            note = "";
+
+            uint countAddress;
+            uint slotAddress;
+            if (!TryResolveAddresses(profile, out countAddress, out slotAddress))
+            {
+                note = "选中列表未校准或地址解析失败";
+                return false;
+            }
+
+            uint count;
+            if (!_target.Memory.ReadUInt32(countAddress, out count) || count == 0)
+            {
+                note = "当前没有选中任何对象（先在游戏里点一下要看的东西）";
+                return false;
+            }
+            if (count > SelectionProbe.MaxCount)
+            {
+                note = string.Format(CultureInfo.InvariantCulture,
+                    "选中数量异常（读到 {0}），已拒绝读取", count);
+                return false;
+            }
+
+            uint arrayAddress;
+            if (!ResolveArrayLoose(countAddress, slotAddress, count, out arrayAddress, out note))
+            {
+                return false;
+            }
+
+            HashSet<uint> seen = new HashSet<uint>();
+            int limit = (int)count < maxObjects ? (int)count : maxObjects;
+            int skipped = 0;
+            for (int i = 0; i < limit; i++)
+            {
+                uint raw;
+                if (!_target.Memory.ReadUInt32(arrayAddress + (uint)(i * 4), out raw)) { break; }
+                if (raw < 0x10000) { skipped++; continue; }
+
+                uint address = UnwrapObject(raw);
+                if (!seen.Add(address)) { continue; }
+                if (!LooksLikeObject(address)) { skipped++; continue; }
+
+                objects.Add(address);
+            }
+
+            if (objects.Count == 0)
+            {
+                note = string.Format(CultureInfo.InvariantCulture,
+                    "选中列表里没有一项像游戏对象（跳过 {0} 项）—— 这次读到的大概率不是真的选中列表", skipped);
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 宽松版数组解析：**不要求数组里含本方单位**，改用"内容看起来像对象数组"就地判定。
+        /// 候选顺序从"最可信的旁证"排到"最弱"：
+        ///   ① 本次会话里被**严格判据**验证过的槽位（`_resolvedSlot`）—— 最可信；
+        ///   ② `数量字段 − 0x0C` —— 真机实测的合格槽位（符合 `VectorClass{Items, Capacity, IsInitialized, Count}`）；
+        ///   ③ 配置槽位；
+        ///   ④ 数量字段 ±0x40 内逐个试。
+        /// 注意：这里**不写回** `_resolvedSlot` —— 宽松判据不足以"认下"一个槽位。
+        /// </summary>
+        private bool ResolveArrayLoose(
+            uint countAddress, uint slotAddress, uint count, out uint arrayAddress, out string note)
+        {
+            arrayAddress = 0;
+            note = "";
+            uint candidate;
+            int tried = 0;
+
+            if (_resolvedSlot != 0
+                && _target.Memory.ReadUInt32(_resolvedSlot, out candidate)
+                && ArrayLooksLikeObjects(candidate, count))
+            {
+                arrayAddress = candidate;
+                return true;
+            }
+
+            uint layoutSlot = countAddress >= 0x0C ? countAddress - 0x0C : 0;
+            if (layoutSlot != 0 && layoutSlot != slotAddress)
+            {
+                tried++;
+                if (_target.Memory.ReadUInt32(layoutSlot, out candidate) && ArrayLooksLikeObjects(candidate, count))
+                {
+                    arrayAddress = candidate;
+                    return true;
+                }
+            }
+
+            if (slotAddress != 0
+                && _target.Memory.ReadUInt32(slotAddress, out candidate)
+                && ArrayLooksLikeObjects(candidate, count))
+            {
+                arrayAddress = candidate;
+                return true;
+            }
+
+            uint start = countAddress > 0x40 ? countAddress - 0x40 : 0;
+            uint end = countAddress + 0x40;
+            for (uint slot = start; slot <= end; slot += 4)
+            {
+                if (slot == slotAddress || (layoutSlot != 0 && slot == layoutSlot)) { continue; }
+                tried++;
+                if (!_target.Memory.ReadUInt32(slot, out candidate)) { continue; }
+                if (ArrayLooksLikeObjects(candidate, count)) { arrayAddress = candidate; return true; }
+            }
+
+            note = string.Format(CultureInfo.InvariantCulture,
+                "选中数量读到 {0}，但试过的 {1} 个候选槽位里没有一张数组的内容像游戏对象（选中读取不可靠）",
+                count, tried);
+            return false;
+        }
+
+        /// <summary>
+        /// 候选数组"看起来像对象数组"吗：抽查前几项，要求至少有一项的头 4 字节是**模块区间内的类型标记**，
+        /// 且这样的项不少于抽查数的一半（真机上选中数组的第 0 项偶尔混着"当前操作目标"这类非单位引用）。
+        /// **这是宽松判据** —— 只配用来显示，不配用来做写入决策。
+        /// </summary>
+        private bool ArrayLooksLikeObjects(uint arrayAddress, uint count)
+        {
+            if (arrayAddress < 0x10000) { return false; }
+
+            int limit = count < 4 ? (int)count : 4;
+            int examined = 0;
+            int looked = 0;
+            for (int i = 0; i < limit; i++)
+            {
+                byte[] raw = _target.Memory.ReadBytesQuiet(arrayAddress + (uint)(i * 4), 4);
+                if (raw == null) { break; }
+                uint value = HexUtil.ReadUInt32(raw, 0);
+                if (value < 0x10000) { continue; }
+                examined++;
+                if (LooksLikeObject(UnwrapObject(value))) { looked++; }
+            }
+            return looked > 0 && looked * 2 >= examined;
+        }
+
+        /// <summary>头 4 字节是不是模块区间内的类型标记（"这是个游戏对象"的最低门槛）。</summary>
+        private bool LooksLikeObject(uint address)
+        {
+            uint head;
+            if (!_target.Memory.ReadUInt32(address, out head)) { return false; }
+            return InModule(head);
+        }
+
         /// <summary>
         /// 数组里的一项可能是"包了一层的指针"（真机两种容器都见过）：
         /// 先看它自己的头 4 字节是不是模块内的类型标记；不是就再跳一层。

@@ -168,6 +168,58 @@ namespace MoTrainer.Cheats
             return result;
         }
 
+        /// <summary>
+        /// 校验收到的锚点是否仍然成立（2026-10-08 晚新增）。
+        ///
+        /// 用途：「预演」要支持"选中的东西里没有本方单位"这一种情形 ——
+        /// **心灵终结里中立单位无法和友军单位同时选中**（2026-10-08 用户实测：点中立单位时友军会被取消选中），
+        /// 所以"选中立建筑单独看一眼"时，锚点只能沿用**本次会话此前建立的**那一份。
+        /// 沿用的前提是它仍然指着同一个房子：
+        /// 金钱链当前解析到的字段地址减去 `HouseMoneyOffset`，就是**此刻**我方 HouseClass 的地址
+        ///（profile 里的 8 条候选金钱链最后一段永远是 `House + 0x30C`，无一例外）；
+        /// 与锚点记录的房子不一致 ⇒ 换了局 / 换了房子 ⇒ 作废。宁可拒绝判定，也不拿旧锚点去认人。
+        /// </summary>
+        public static bool TryVerifyCachedAnchor(
+            MemoryIO memory, uint ownerOffset, uint house, uint moneyAddress, out string reason)
+        {
+            reason = "";
+            if (memory == null) { reason = "内存接口不可用"; return false; }
+            if (ownerOffset == 0 || house == 0) { reason = "本次会话还没有建立过锚点"; return false; }
+            if (moneyAddress < HouseMoneyOffset + 0x10000)
+            {
+                reason = "金钱字段地址不可信，无法核对旧锚点";
+                return false;
+            }
+
+            uint fromChain = moneyAddress - HouseMoneyOffset;
+            if (fromChain != house)
+            {
+                reason = string.Format(CultureInfo.InvariantCulture,
+                    "金钱链现在指向的房子是 0x{0:X8}，与旧锚点的 0x{1:X8} 不是同一个（换了局？）——已作废",
+                    fromChain, house);
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 把名单对象的地址收成一个集合 —— 用来判定"某个地址在不在全对象名单里"。
+        ///
+        /// 「预演」的"逐个判定"用它复核**宽松读法**读到的选中对象：
+        /// 宽松读法不要求选中的东西属于我方，判据比严格版弱，所以必须再用
+        /// "它确实在这份名单里"这道旁证兜一次（真机 10-08 两次证明：名单对不对，
+        /// 用"选中的东西在不在里面"一眼就能看出来）。
+        /// </summary>
+        public static HashSet<uint> BuildAddressSet(IList<TechnoObject> objects)
+        {
+            HashSet<uint> set = new HashSet<uint>();
+            if (objects != null)
+            {
+                for (int i = 0; i < objects.Count; i++) { set.Add(objects[i].Address); }
+            }
+            return set;
+        }
+
         /// <summary>把一批对象按"类型表 → 个数"统计出来（显示用；数量多的在前）。</summary>
         public static List<KeyValuePair<uint, int>> CountTypes(IList<TechnoObject> objects)
         {

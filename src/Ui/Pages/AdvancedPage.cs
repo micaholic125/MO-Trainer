@@ -37,6 +37,18 @@ namespace MoTrainer.Ui.Pages
         private readonly SelectionResolver _selection;
 
         /// <summary>
+        /// 本次会话里最后一次**成功建立**的我方锚点（阵营字段偏移 + 我方 House 地址）。
+        ///
+        /// 为什么需要它（2026-10-08 晚）：**心灵终结里中立单位无法和友军单位同时选中**
+        /// （用户实测反馈）——"选中立建筑单独看一眼会不会被秒杀"时，选中的东西里
+        /// 一个本方单位都没有，锚点**当场建不出来**。此时沿用这份旧锚点，
+        /// 但必须先用 `TechnoOwnership.TryVerifyCachedAnchor` 核对"它还指着同一个房子"，
+        /// 再用"名单里还有没有我方对象"复核一次（见 `OnKillPreviewClick`）。
+        /// </summary>
+        private uint _cachedOwnerOffset;
+        private uint _cachedOwnerHouse;
+
+        /// <summary>
         /// 游戏主模块的地址区间。用来判断"指针指向的是不是游戏对象"。
         ///
         /// **必须每次现取，绝不能在构造时缓存成字段。** 真机教训（2026-10-08）：
@@ -1139,32 +1151,53 @@ namespace MoTrainer.Ui.Pages
                 return;
             }
 
-            // ---- 选中的单位（锚点样本；金钱锚定确认属于我方）----
+            // ---- 锚点 ----
+            // 优先：用"你选中的本方单位"**现建**（最硬的判据）。
+            // 退路：这次选中的东西里没有本方单位 —— 典型情形是**单独点了一座中立建筑**
+            //       （心灵终结里中立单位不能和友军单位一起选中，用户 2026-10-08 实测反馈），
+            //       此时沿用本次会话此前建立的锚点，前提是它仍指着同一个房子（换局即作废）。
             string sampleNote;
-            List<uint> myObjects = ReadSelectedObjects(out sampleNote);
-            if (myObjects.Count == 0)
-            {
-                text.AppendLine("【缺前置】读不到你选中的自己的单位 —— " + sampleNote);
-                text.AppendLine("请在游戏里选中一个自己的单位再点这个按钮。");
-                SetOutput(text.ToString());
-                return;
-            }
+            List<uint> myObjects = TryReadMyObjectsQuiet(out sampleNote);
 
-            // ---- 建立锚点（金钱锚定）----
-            TechnoOwnership.OwnerAnchor anchor;
-            string why;
-            if (!TechnoOwnership.TryBuildAnchor(memory, myObjects, money, out anchor, out why))
-            {
-                text.AppendLine("【无法判定敌我】" + why);
-                text.AppendLine();
-                text.AppendLine("本次**没有写入任何内存**。");
-                SetOutput(text.ToString());
-                return;
-            }
+            TechnoOwnership.OwnerAnchor anchor = null;
+            string why = "";
+            bool reusedAnchor = false;
+            bool built = myObjects.Count > 0
+                && TechnoOwnership.TryBuildAnchor(memory, myObjects, money, out anchor, out why);
 
-            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "我方锚点：阵营字段 +0x{0:X} = 0x{1:X8}（由 {2} 个选中单位金钱锚定）",
-                anchor.OwnerOffset, anchor.MyHouse, anchor.Samples));
+            if (built)
+            {
+                _cachedOwnerOffset = anchor.OwnerOffset;
+                _cachedOwnerHouse = anchor.MyHouse;
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "我方锚点：阵营字段 +0x{0:X} = 0x{1:X8}（由 {2} 个选中单位金钱锚定）",
+                    anchor.OwnerOffset, anchor.MyHouse, anchor.Samples));
+            }
+            else
+            {
+                string reuseWhy;
+                bool reused = TryReuseAnchor(memory, moneyAddress, out anchor, out reuseWhy);
+                if (!reused)
+                {
+                    text.AppendLine("【无法判定敌我】" + (myObjects.Count > 0 ? why : sampleNote));
+                    text.AppendLine("（沿用旧锚点也不行：" + reuseWhy + "）");
+                    text.AppendLine();
+                    text.AppendLine("程序靠「你自己选中的东西」确认「我方是谁」。若这次选的是中立建筑这类");
+                    text.AppendLine("不属于你的东西，请**先选中你自己的一个单位或建筑**点一次本按钮，再选中它点一次。");
+                    text.AppendLine();
+                    text.AppendLine("本次**没有写入任何内存**。");
+                    SetOutput(text.ToString());
+                    return;
+                }
+
+                reusedAnchor = true;
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "我方锚点：阵营字段 +0x{0:X} = 0x{1:X8}（**沿用本次会话此前建立的锚点** —— {2}）",
+                    anchor.OwnerOffset, anchor.MyHouse,
+                    myObjects.Count > 0
+                        ? "这次选中里没有可用的我方样本，没法现建"
+                        : "这次选中的东西里没有你自己的单位，没法现建"));
+            }
             text.AppendLine();
 
             // ---- 遍历全场 ----
@@ -1194,6 +1227,20 @@ namespace MoTrainer.Ui.Pages
             TechnoOwnership.OwnerClassification cls = TechnoOwnership.ClassifyOwners(
                 memory, walk.Objects, anchor.OwnerOffset, anchor.MyHouse, LiveModuleBase, LiveModuleSize);
 
+            // 沿用旧锚点时多做一道核对：**名单里必须有我方对象**。
+            // 你自己的部队永远在场上 —— 一个都找不到，说明沿用的锚点是错的（或这份名单不对），
+            // 那么下面的分类结果一并不值得看，宁可不显示。
+            if (reusedAnchor && cls.Mine == 0)
+            {
+                text.AppendLine("⚠ **沿用的锚点没能通过核对**：整份名单里没有一个对象指向你方 House，");
+                text.AppendLine("正常情况一定会有（你自己的部队就在场上）。本次**不做任何判定**。");
+                text.AppendLine("请在游戏里选中你自己的一个单位（或建筑）点一次本按钮，把锚点重新建立起来。");
+                text.AppendLine();
+                text.AppendLine("本次**没有写入任何内存**。");
+                SetOutput(text.ToString());
+                return;
+            }
+
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "遍历到 {0} 个对象", walk.Count));
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
@@ -1206,8 +1253,8 @@ namespace MoTrainer.Ui.Pages
 
             // ---- 你选中的对象逐个判定（2026-10-08 新增）----
             // 用途：让你一眼看清"自己选中的东西被判成了哪边"——
-            // 比如把一座中立建筑和单位一起选中，就能看出中立建筑属于哪个阵营。
-            AppendSelectionVerdicts(text, memory, anchor);
+            // 单独点一座中立建筑再点本按钮，就能看出它会不会被杀。
+            AppendSelectionVerdicts(text, memory, anchor, walk.Objects);
 
             // ---- 将击杀：按阵营拆分（附每个阵营的类型构成）----
             AppendOwnerGroups(text, memory, "将击杀（按阵营拆分）", cls.KillableByGroup, anchor.OwnerOffset);
@@ -1253,29 +1300,63 @@ namespace MoTrainer.Ui.Pages
 
         /// <summary>
         /// 「你选中的对象逐个判定」：列出当前选中（含非我方）的每个对象，以及它被判成了哪一类。
-        /// 用途：把一座中立建筑和单位一起选中点预演，就能直接看到中立建筑属于哪个阵营
-        ///（以及它为什么会被保护）。
+        ///
+        /// 用途：**心灵终结里中立单位不能和友军单位一起选中**（2026-10-08 用户实测），
+        /// 所以"选中立建筑和单位一起看"走不通 —— 改成两次点击：
+        /// **先选中你自己的单位点一次（建立锚点），再单独点那座中立建筑点一次**，
+        /// 就能在这里看到它的判定结果。
+        ///
+        /// 这里用的是**宽松读法**（不要求选中的东西属于我方，见 `TryReadSelectedObjectsLoose`）
+        /// 加**名单复核**（对象必须出现在全对象名单里才判定）——
+        /// 宽松判据本身不足以定论，宁可不判定，也绝不猜。
         /// </summary>
-        private void AppendSelectionVerdicts(StringBuilder text, MemoryIO memory, TechnoOwnership.OwnerAnchor anchor)
+        private void AppendSelectionVerdicts(
+            StringBuilder text, MemoryIO memory, TechnoOwnership.OwnerAnchor anchor, IList<TechnoObject> roster)
         {
             if (_selection == null) { return; }
 
             List<uint> selected;
             string note;
-            if (!_selection.TryReadSelectedObjects(_profile, 16, false, out selected, out note))
+            if (!_selection.TryReadSelectedObjectsLoose(_profile, 16, out selected, out note))
             {
+                Logger.Info("Advanced", "读取选中对象（宽松）失败：" + note);
+                uint dumpSlot;
+                string dumpError;
+                if (_profile.SelectedList.TryResolve(_target.Memory, LiveModuleBase, out dumpSlot, out dumpError))
+                {
+                    DumpSelectionSlots(_target.Memory, dumpSlot);
+                }
                 text.AppendLine("（当前没有读到选中的对象：" + note + "）");
                 text.AppendLine();
                 return;
             }
 
+            HashSet<uint> known = TechnoOwnership.BuildAddressSet(roster);
+            int inRoster = 0;
+            for (int i = 0; i < selected.Count; i++)
+            {
+                if (known.Contains(selected[i])) { inRoster++; }
+            }
+
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "你选中的对象逐个判定（共 {0} 个；同时选中自己的单位与想了解的东西，一次看清）：", selected.Count));
+                "你选中的对象逐个判定（共 {0} 个，其中 {1} 个能在「全对象名单」里找到）：",
+                selected.Count, inRoster));
             for (int i = 0; i < selected.Count && i < 12; i++)
             {
                 uint address = selected[i];
                 uint type;
                 ReadUInt32Retry(memory, address, out type);
+
+                // 名单复核：宽松读法读到的地址，必须在全对象名单里出现过才敢判定。
+                //（真机两次证明：名单对不对，用"选中的东西在不在里面"一眼就能看出来。）
+                if (!known.Contains(address))
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  0x{0:X8}（类型 0x{1:X8}）→ **不在全对象名单里**，无法判定"
+                        + "（要么这份名单不对，要么刚才读到的不是你真正选中的东西）",
+                        address, type));
+                    continue;
+                }
 
                 uint owner;
                 if (!ReadUInt32Retry(memory, address + anchor.OwnerOffset, out owner) || owner == 0)
@@ -1613,6 +1694,65 @@ namespace MoTrainer.Ui.Pages
 
             found.Sort();
             return found;
+        }
+
+        /// <summary>
+        /// 沿用本次会话此前建立的我方锚点 —— 只在"这次选中的东西里没有本方单位"时才走这里
+        ///（典型情形：单独点了一座中立建筑。见 `_cachedOwnerHouse` 的注释）。
+        ///
+        /// 核对：锚点记录的房子必须仍是**此刻金钱链指向的那个房子**
+        ///（`TechnoOwnership.TryVerifyCachedAnchor`）—— 换了局就作废并清掉，宁可拒绝判定。
+        /// 第二道核对（"名单里还有我方对象"）在分类之后做，见 `OnKillPreviewClick`。
+        /// </summary>
+        private bool TryReuseAnchor(
+            MemoryIO memory, uint moneyAddress, out TechnoOwnership.OwnerAnchor anchor, out string why)
+        {
+            anchor = null;
+            why = "";
+            if (_cachedOwnerHouse == 0 || _cachedOwnerOffset == 0)
+            {
+                why = "本次会话里还没有建立过锚点，没法确认「我方是谁」";
+                return false;
+            }
+
+            string reason;
+            if (!TechnoOwnership.TryVerifyCachedAnchor(
+                memory, _cachedOwnerOffset, _cachedOwnerHouse, moneyAddress, out reason))
+            {
+                _cachedOwnerOffset = 0;    // 已作废，别再拿它试
+                _cachedOwnerHouse = 0;
+                why = reason;
+                return false;
+            }
+
+            anchor = new TechnoOwnership.OwnerAnchor();
+            anchor.OwnerOffset = _cachedOwnerOffset;
+            anchor.MyHouse = _cachedOwnerHouse;
+            anchor.Samples = 0;
+            return true;
+        }
+
+        /// <summary>
+        /// 与 `ReadSelectedObjects` 相同，但**失败时不倾倒原始数据**。
+        /// 「预演」用它：在那里"选中的东西不属于我方"是**正常情形**（单独点了一座中立建筑），
+        /// 不该每次失败都往日志里倒一大片原始值。
+        /// </summary>
+        private List<uint> TryReadMyObjectsQuiet(out string note)
+        {
+            note = "";
+            if (_selection == null)
+            {
+                note = "内部错误：选中读取器未初始化";
+                return new List<uint>();
+            }
+
+            List<uint> objects;
+            if (!_selection.TryReadSelectedObjects(_profile, 16, true, out objects, out note))
+            {
+                return new List<uint>();
+            }
+            if (note.Length > 0) { Logger.Info("Advanced", "选中列表：" + note); }
+            return objects;
         }
 
         /// <summary>
