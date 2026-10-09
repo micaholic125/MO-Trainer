@@ -337,6 +337,9 @@ namespace MoTrainer.Cheats
             uint pointer;
             if (!memory.ReadUInt32(objectAddress + TypePointerOffset, out pointer)) { return false; }
             if (pointer < 0x10000) { return false; }
+            // 上界同样要判：名单里存在整串 F 的"空槽位标记"，只判下界就会拿它去读头部
+            // （`TechnoWalker.AddCandidate` 里那条注释记了同一个坑）
+            if (pointer > 0x7FFFFFFF) { return false; }
             // 说明书在堆上；落在模块里的"指针"多半是误读（例如把类型表本身当成了指针）
             if (pointer >= moduleBase && pointer < moduleBase + moduleSize) { return false; }
 

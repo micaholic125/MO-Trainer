@@ -200,6 +200,16 @@ namespace MoTrainer.Cheats
         {
             if (address < 0x10000) { result.Skipped++; return; }
 
+            // **上界也要判**（2026-10-09 补）。
+            //
+            // 名单里存在"空槽位标记"——整串 F 的假地址（0xFFFFFFFF 这种）。
+            // 只判下界的话它们会被当成候选对象，紧接着**拿它去读头部**：
+            // 那次读取必然失败，于是电力功能一开，日志每 1~3 秒就刷一条
+            // `ReadProcessMemory 失败 @0xFFFFFFFF`（真机 23:18 的日志里抓到的）。
+            // 对象随后当然还是被剔除了、判定不受影响，但**红字刷屏会让人以为程序坏了**。
+            // 32 位进程的用户态地址到 0x7FFFFFFF 为止，与工程里其它处的口径一致。
+            if (address > 0x7FFFFFFF) { result.Skipped++; return; }
+
             uint vtable;
             if (!memory.ReadUInt32(address, out vtable) || vtable == 0) { result.Skipped++; return; }
             if (vtable < moduleBase || vtable >= moduleBase + moduleSize) { result.Skipped++; return; }

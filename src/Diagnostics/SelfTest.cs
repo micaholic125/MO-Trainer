@@ -142,6 +142,9 @@ namespace MoTrainer.Diagnostics
             Section("15. 电力功能（改「型号说明书」的发电量）");
             CheckPowerBoost();
 
+            Section("16. 日志噪音回归（越界地址不读 · 重复错误折叠）");
+            CheckLogNoise();
+
             Write("");
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
@@ -1448,6 +1451,110 @@ namespace MoTrainer.Diagnostics
             catch (Exception ex)
             {
                 Check("电力功能", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// 两处「日志噪音」的回归（2026-10-09 用户反馈"启动修改器时弹出来了一些提醒"后新增）。
+        ///
+        /// 两件事都不是功能错误，但都会把日志刷红、让人以为程序坏了 ——
+        /// 而**日志是本项目唯一的现场**，它被噪音淹没就等于没有。所以必须钉住。
+        ///
+        /// ① 名单里的"空槽位标记"（整串 F 的假地址）**一次都不该去读**：
+        ///    判据用 `MemoryIO.ConsecutiveFailures` —— 它每次失败都 +1（日志有节流，这个计数没有），
+        ///    所以只要"最后一项是假地址"，读完对不上就说明真去读了。
+        /// ② 附加失败的重复行要折叠：第一次 WARN、同一个错误码再来就降成 INFO。
+        ///    判据用 `Logger.OnLog` 直接抓级别 —— 验的是**真的调用了**那个函数，不是"代码看起来对"。
+        /// </summary>
+        private static void CheckLogNoise()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady)
+            {
+                Check("日志噪音回归", false, "OpenProcess 失败");
+                return;
+            }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            try
+            {
+                // ---- ① 越界地址不许读 ----
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("日志噪音回归测试内存块", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("日志噪音回归", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = TestBlockSize;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                uint vtable = moduleBase + 0x2000;
+                uint realObject = heap + 0x2000;
+                uint realObject2 = heap + 0x2100;      // 同类要**至少两个** —— 遍历器会把"孤例类型"当假对象剔掉
+                io.WriteUInt32(realObject, vtable);
+                io.WriteUInt32(realObject2, vtable);
+
+                // 名单：两个真对象 + 一个"空槽位标记"。**假地址放最后** ——
+                // 因为 ConsecutiveFailures 会被下一次成功读取清零，放最后才观察得到。
+                uint arrayAddress = heap + 0x3000;
+                io.WriteUInt32(arrayAddress, realObject);
+                io.WriteUInt32(arrayAddress + 4, realObject2);
+                io.WriteUInt32(arrayAddress + 8, 0xFFFFFFFF);
+
+                int failuresBefore = io.ConsecutiveFailures;
+                TechnoWalkResult walk = TechnoWalker.WalkArray(io, arrayAddress, 3, moduleBase, moduleSize);
+
+                Check("日志噪音：名单里的\"空槽位标记\"(0xFFFFFFFF) 一次都不去读",
+                    io.ConsecutiveFailures == failuresBefore,
+                    "越界读取次数 " + (io.ConsecutiveFailures - failuresBefore)
+                    + "（由连续失败计数观察；日志本身有节流，计数没有）");
+                Check("日志噪音：假地址既不算对象、也不影响真对象",
+                    walk.Objects.Count == 2,
+                    walk.Objects.Count + " 个对象（应为 2），跳过 " + walk.Skipped);
+
+                // ---- ② 附加失败的重复行要折叠 ----
+                List<LogLevel> levels = new List<LogLevel>();
+                Action<LogEntry> capture = delegate(LogEntry e)
+                {
+                    if (e.Source == "Attach") { levels.Add(e.Level); }
+                };
+                Logger.OnLog += capture;
+                try
+                {
+                    ProcessAttach.LogAttachRetry("测试用：枚举主模块失败。", 299, 0);      // 第一次
+                    ProcessAttach.LogAttachRetry("测试用：枚举主模块失败。", 299, 299);    // 同一错误码重复
+                    ProcessAttach.LogAttachRetry("测试用：枚举主模块失败。", 5, 299);      // 错误码变了
+                }
+                finally
+                {
+                    Logger.OnLog -= capture;
+                }
+
+                Check("日志噪音：同一条附加错误只喊一次（再重复就降级折叠）",
+                    levels.Count == 3
+                    && levels[0] == LogLevel.Warn && levels[1] == LogLevel.Info && levels[2] == LogLevel.Warn,
+                    "抓到的级别：" + (levels.Count == 0 ? "(无)"
+                        : string.Join(" / ", levels.ConvertAll<string>(delegate(LogLevel l) { return l.ToString(); }).ToArray())));
+            }
+            catch (Exception ex)
+            {
+                Check("日志噪音回归", false, ex.GetType().Name + ": " + ex.Message);
             }
             finally
             {

@@ -196,7 +196,7 @@ namespace MoTrainer.Core
                     string msg = string.Format(CultureInfo.InvariantCulture,
                         "OpenProcess 失败，{0} 请确认本程序以管理员身份运行，且游戏未以更高权限启动。",
                         Win32Api.FormatWin32Error(code));
-                    Logger.Error("Attach", msg);
+                    LogAttachRetry(msg, code, _lastErrorCode);
                     target.Dispose();
                     _state = AttachState.Error;
                     _lastError = msg;
@@ -213,7 +213,7 @@ namespace MoTrainer.Core
                     int code = Win32Api.LastErrorCode();
                     string msg = string.Format(CultureInfo.InvariantCulture,
                         "枚举主模块失败，{0}。", Win32Api.FormatWin32Error(code));
-                    Logger.Error("Attach", msg);
+                    LogAttachRetry(msg, code, _lastErrorCode);
                     Win32Api.CloseHandle(handle);
                     target.Dispose();
                     _state = AttachState.Error;
@@ -247,6 +247,33 @@ namespace MoTrainer.Core
                     Logger.Warn("Attach", "主模块大小为 0，区域枚举与扫描可能受影响");
                 }
                 return true;
+            }
+        }
+
+        /// <summary>
+        /// 附加失败时的日志：**同一个错误码只喊一次**。
+        ///
+        /// 为什么必须折叠（2026-10-09 用户反馈"启动修改器时弹出来了一些提醒"）：
+        /// 看门狗每 1.5 秒试一轮，而游戏**启动中 / 退出中**必然连续失败十几次 ——
+        /// 真机日志里是 **22 条一模一样**的 `[ERR] 枚举主模块失败`，把日志面板刷成一片红。
+        /// 那其实是预期现象（紧接着就 `已连接`），却让人以为程序坏了。
+        ///
+        /// 折叠规则：错误码与上次不同 → **WARN**（说明还在重试）；同一个码再次出现 → **INFO**。
+        /// 连上成功或进程退出时 `_lastErrorCode` 会被清零，所以下一次真出问题仍会照常喊。
+        /// **状态条、`_lastError`、错误文本一个字都没改** —— 折叠掉的只是重复行，不是信息。
+        ///
+        /// 做成 `public static` 并把"上次的错误码"当参数传进来，是为了让**自检能直接验它**
+        /// （订阅 `Logger.OnLog` 抓级别）——否则这条改动就只是一句没人验证过的话。
+        /// </summary>
+        public static void LogAttachRetry(string msg, int code, int lastCode)
+        {
+            if (code == lastCode)
+            {
+                Logger.Info("Attach", msg + "（同一错误重复，已折叠）");
+            }
+            else
+            {
+                Logger.Warn("Attach", msg + "（游戏可能正在启动或退出，程序每 1.5 秒重试一次）");
             }
         }
 
