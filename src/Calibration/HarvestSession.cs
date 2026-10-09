@@ -49,7 +49,22 @@ namespace MoTrainer.Calibration
         public int SeenCount;
         public int DiedAt = -1;
         public readonly List<int> SelectedAt = new List<int>();
-        public readonly List<string> Changes = new List<string>();
+
+        /// <summary>
+        /// 这个对象身上**每一个变过的字段**各自的取值时间线（偏移 → 时间线）。
+        ///
+        /// 2026-10-09 深夜改掉了原来的做法（一个 List&lt;string&gt; 装变化文字、上限 400 条）：
+        /// 真机报告证明那会把**最该看的数据毁掉** —— 新建造的对象出生那一瞬有上百个字段
+        /// 同时初始化（"初始化洪流"），400 条名额当场吃光，之后真正的**建造过程**一条都留不下。
+        /// 按偏移分开记账之后，洪流里每个偏移只占 1~2 条，而变化几十次的"进度字段"照样完整。
+        /// </summary>
+        public readonly Dictionary<int, OffsetSeries> Series = new Dictionary<int, OffsetSeries>();
+
+        /// <summary>变化事件总数（含因上限而未逐条记录的那些），用来判断记录是否完整。</summary>
+        public int ChangeEvents;
+
+        /// <summary>变化事件总数触顶 —— 后面的变化**没有记全**（如实标注，绝不假装完整）。</summary>
+        public bool Truncated;
 
         /// <summary>
         /// 是不是"采集期间新造出来的"（而不是开局就在场上的，也不是用户选中的）。
@@ -59,6 +74,15 @@ namespace MoTrainer.Calibration
         /// 见 `TrackNewObjects`。
         /// </summary>
         public bool NewlyAppeared;
+
+        /// <summary>是不是"我方房子"（`HouseClass`）。生产队列/工厂大概率住在它里面，见 `TrackPlayerHouse`。</summary>
+        public bool IsPlayerHouse;
+
+        /// <summary>来源说明（"我方房子" / "我方房子 → 跟随 +0xNNN"），报告里直接印出来。</summary>
+        public string Source = "";
+
+        /// <summary>本对象每拍 dump 多少字节（房子比普通对象大：金钱 0x30C、电力 0x53A4 都在它身上）。</summary>
+        public int DumpBytes = HarvestSession.DumpBytes;
 
         /// <summary>上一次采样的完整字节镜像（按 uint 存），用来求差。</summary>
         internal uint[] Last;
@@ -108,6 +132,36 @@ namespace MoTrainer.Calibration
         /// <summary>新对象跟踪单独占用的名额上限（其余名额留给"被选中的对象"）。</summary>
         public const int MaxNewTracked = 24;
 
+        /// <summary>
+        /// 我方房子（`HouseClass`）dump 多少字节。
+        ///
+        /// 比普通对象大得多：已知的金钱在 +0x30C、电力产出/消耗在 +0x53A4/+0x53A8，
+        /// 而"生产队列 / 工厂"这类东西按引擎惯例都挂在这个对象身上 —— 它在哪一段还没定论，
+        /// 所以整个对象一起盯，别让它落在窗口外面。
+        /// </summary>
+        public const int HouseDumpBytes = 0x6000;
+
+        /// <summary>从房子里找"可以跟随的指针"时，扫它这么多字节。</summary>
+        public const int HousePointerScanBytes = 0x6000;
+
+        /// <summary>
+        /// 从我方房子**跟随**（再盯一层）的对象个数上限。
+        ///
+        /// 为什么要有这个设计：生产进度**未必**记在房子对象内部 —— 按引擎惯例，
+        /// 它更可能记在房子里某个指针指向的"生产队列/工厂"对象里。只盯房子本体的话，
+        /// 一旦它在外面，这一局用户就白玩了。跟随一层是最划算的兜底。
+        /// </summary>
+        public const int MaxFollowedFromHouse = 8;
+
+        /// <summary>指针要在同一个位置上连续出现这么多拍，才认为它是"稳定的成员指针"并跟随过去。</summary>
+        public const int FollowStableSamples = 3;
+
+        /// <summary>
+        /// 单个对象最多记这么多"变化事件"（纯内存保护；撞上了就在报告里如实标注"没记全"）。
+        /// 取这个数是因为"初始化洪流"一次就有上千条 —— 上限必须远离它，否则等于没改。
+        /// </summary>
+        public const int MaxChangeEventsPerObject = 8000;
+
         /// <summary>采样的最短/最长间隔与最长时长，防止界面传入离谱的值。</summary>
         public const int MinIntervalMs = 200;
         public const int MaxIntervalMs = 5000;
@@ -137,6 +191,30 @@ namespace MoTrainer.Calibration
         private readonly Dictionary<uint, uint> _newbornVtable = new Dictionary<uint, uint>();
         private int _newTracked;
         private bool _rosterEverRead;
+
+        // ---- 我方房子 + "跟随一层"（[S6-2] 瞬间建造用）----
+        // 生产进度未必记在建筑对象身上 —— 按引擎惯例，它更可能记在房子的生产队列/工厂里。
+        // 所以除了盯新建造的对象，还要盯**我方房子**，并从房子里跟随一层指针。
+        private uint _houseAddress;
+        private int _followedFromHouse;
+        private readonly Dictionary<int, FollowSlot> _followSlots = new Dictionary<int, FollowSlot>();
+
+        /// <summary>
+        /// "我方房子认出没认出来"的一句话结论 —— 报告头部会原样印出来。
+        ///
+        /// 为什么必须有：认不出房子时，如果什么都不写，用户那一局就**白玩了而且查不出原因**
+        /// （表现只是"报告里没有房子那一段"）。本项目最忌讳的失败模式就是"看起来做了、
+        /// 实际没做、且无从查证"，所以这一句必须写清楚是"认出来了"还是"没认出来、卡在哪一步"。
+        /// </summary>
+        private string _houseNote = "";
+
+        /// <summary>房子里某个偏移上"连续几拍都是同一个指针"的记账。</summary>
+        private sealed class FollowSlot
+        {
+            public uint Target;
+            public int Streak;
+            public bool Promoted;
+        }
 
         /// <summary>自动巡检算出来的报告段落（在采样线程里算好，报告落盘时直接接上去）。</summary>
         private string _inspectionText = "";
@@ -235,6 +313,10 @@ namespace MoTrainer.Calibration
                 _newbornVtable.Clear();
                 _newTracked = 0;
                 _rosterEverRead = false;
+                _houseAddress = 0;
+                _followedFromHouse = 0;
+                _followSlots.Clear();
+                _houseNote = "";
                 _inspectionText = "";
                 _finalizing = false;
                 _rosterSlot = 0;
@@ -359,6 +441,18 @@ namespace MoTrainer.Calibration
             // 主链反查是全内存扫描，给个上限（真机内存画像约 347 MB）
             text.Append(AutoInspection.RefitMainChain(_target, _profile, 30));
 
+            // 「六、施工进度候选字段」（[S6-2] 瞬间建造用）——
+            // 把"哪个字段像建造进度"当场排好序写进报告，用户下一次开局的采集就能直接给答案。
+            List<HarvestTracked> trackedSnapshot;
+            List<HarvestSample> sampleSnapshot;
+            lock (_lock)
+            {
+                trackedSnapshot = new List<HarvestTracked>(_tracked);
+                sampleSnapshot = new List<HarvestSample>(_samples);
+            }
+            text.Append(ProgressHunter.Format(trackedSnapshot, sampleSnapshot,
+                _target.ModuleBase, _target.ModuleSize));
+
             _inspectionText = text.ToString();
             Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
                 "自动巡检结束，耗时 {0:0.0} 秒", (DateTime.UtcNow - started).TotalSeconds));
@@ -384,6 +478,13 @@ namespace MoTrainer.Calibration
 
             // 「新出现的对象」自动跟踪（瞬间建造用）：用户不必先选中它，程序自己盯
             TrackNewObjects(roster, memory, sample);
+
+            // 我方房子（HouseClass）——生产队列/工厂大概率住在它里面（[S6-2] 用）。
+            // 放在"刷新被跟踪对象"之前，这样它这一拍就能拿到第一份快照。
+            TrackPlayerHouse(memory, moduleBase, moduleSize, sample);
+
+            // 从房子里跟随一层指针（生产队列也可能是房子里的指针指向的另一个对象）
+            FollowHousePointers(memory, moduleBase, moduleSize, sample);
 
             // 阵营分组（用来判断阵营偏移是否有效：有效的表现是"少数几个阵营、各自聚集大量单位"）
             if (_profile.OffsetTechnoOwner != 0 && roster.Count > 0)
@@ -414,7 +515,7 @@ namespace MoTrainer.Calibration
             // 刷新每个被跟踪对象的字节差别
             for (int i = 0; i < _tracked.Count; i++)
             {
-                UpdateTracked(_tracked[i], memory, sample.Index, sample.Seconds);
+                UpdateTracked(_tracked[i], memory, sample.Index);
             }
 
             lock (_lock) { _samples.Add(sample); }
@@ -589,6 +690,154 @@ namespace MoTrainer.Calibration
             }
         }
 
+        /// <summary>
+        /// 开始跟踪**我方房子**（`HouseClass`）—— `[S6-2]` 瞬间建造用。
+        ///
+        /// 为什么必须盯它：2026-10-09 的真机报告里，建造中的建筑身上每秒在变的只有
+        /// +0x0C4/+0x0C8 那两个"永不停歇"的计数器，看不到进度字段的影子。而按引擎惯例，
+        /// 生产队列（在造什么、还差多久）是记在**房子**身上的 —— 金钱与电力都住在那里，
+        /// 生产队列没有理由例外。所以这一项把房子整个盯起来。
+        ///
+        /// 怎么认出房子：金钱地址减去 0x30C（与「主链反查」同一口径），
+        /// 再验一条硬条件 —— 头 4 字节必须是**模块区间内的类型表指针**（C++ 对象的样子）。
+        /// 验不过就不跟踪：宁可少盯一个对象，也不要盯上一个"看起来像"的地址。
+        /// </summary>
+        private void TrackPlayerHouse(MemoryIO memory, uint moduleBase, uint moduleSize, HarvestSample sample)
+        {
+            if (_profile.Money == null || !_profile.Money.IsCalibrated)
+            {
+                _houseNote = "金钱未校准 —— 认不出我方房子（生产队列那一段会缺数据）";
+                return;
+            }
+
+            uint moneyAddress;
+            string error;
+            if (!_profile.Money.TryResolve(memory, moduleBase, out moneyAddress, out error))
+            {
+                _houseNote = "金钱地址当前解析不出来（" + error + "）—— 本拍没盯上房子";
+                return;
+            }
+            if (moneyAddress < MoTrainer.Cheats.TechnoOwnership.HouseMoneyOffset + 0x10000) { return; }
+
+            uint house = moneyAddress - MoTrainer.Cheats.TechnoOwnership.HouseMoneyOffset;
+            if (_byAddress.ContainsKey(house)) { return; }
+
+            uint vtable;
+            if (!memory.ReadUInt32(house, out vtable))
+            {
+                _houseNote = string.Format(CultureInfo.InvariantCulture,
+                    "金钱地址 0x{0:X8} − 0x{1:X} = 0x{2:X8}，但那里读不动 —— 本拍没盯上房子",
+                    moneyAddress, MoTrainer.Cheats.TechnoOwnership.HouseMoneyOffset, house);
+                return;
+            }
+            if (vtable < moduleBase || vtable >= moduleBase + moduleSize)
+            {
+                // 这条**如果出现在真机报告里，就是一条要发回来的线索**：说明"房子"的认法要改。
+                _houseNote = string.Format(CultureInfo.InvariantCulture,
+                    "金钱地址 0x{0:X8} − 0x{1:X} = 0x{2:X8}，但那里头 4 字节是 0x{3:X8}，"
+                    + "不像类型表指针（模块区间 0x{4:X8}~0x{5:X8}）—— 没有按房子跟踪。"
+                    + "**请把这一行发回来**，说明房子的认法要改。",
+                    moneyAddress, MoTrainer.Cheats.TechnoOwnership.HouseMoneyOffset, house, vtable,
+                    moduleBase, moduleBase + moduleSize);
+                return;
+            }
+
+            HarvestTracked tracked = new HarvestTracked();
+            tracked.Address = house;
+            tracked.FirstSeen = sample.Index;
+            tracked.FirstVTable = vtable;
+            tracked.IsPlayerHouse = true;
+            tracked.Source = "我方房子";
+            tracked.DumpBytes = HouseDumpBytes;
+            _byAddress[house] = tracked;
+            _tracked.Add(tracked);
+            _houseAddress = house;
+            _houseNote = string.Format(CultureInfo.InvariantCulture,
+                "已跟踪 0x{0:X8}（金钱地址 0x{1:X8} − 0x{2:X}），每拍盯 {3} 字节",
+                house, moneyAddress, MoTrainer.Cheats.TechnoOwnership.HouseMoneyOffset, HouseDumpBytes);
+
+            Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
+                "开始跟踪「我方房子」0x{0:X8}（金钱地址 0x{1:X8} 减去 0x{2:X}）—— 生产队列大概率住在这里",
+                house, moneyAddress, MoTrainer.Cheats.TechnoOwnership.HouseMoneyOffset));
+        }
+
+        /// <summary>
+        /// 从**我方房子**里"跟随一层"：把房子身上那些**稳定的指针成员**指向的对象也盯起来。
+        ///
+        /// 为什么要有这一层：生产队列/工厂按引擎惯例很可能是**独立的对象**，
+        /// 房子身上只存一个指向它的指针。只盯房子本体的话，进度字段会落在视野之外，
+        /// 而这一局用户就白玩了 —— 用户的时间是本项目最稀缺的东西。
+        ///
+        /// 三道硬门，宁可漏也不许跟错：
+        ///   · 同一个偏移上连续 <see cref="FollowStableSamples"/> 拍都是同一个值（排除临时值）；
+        ///   · 值 ≥ 0x100000（排除"金钱"这类小数字被当成地址 —— 金钱 50000 正好落在指针范围里）；
+        ///   · **目标对象的头 4 字节必须是模块区间内的类型表指针**（确认它真的是个 C++ 对象）。
+        /// 名额上限 <see cref="MaxFollowedFromHouse"/> 个，报告里逐个标明是"从哪个偏移跟过来的"。
+        /// </summary>
+        private void FollowHousePointers(MemoryIO memory, uint moduleBase, uint moduleSize, HarvestSample sample)
+        {
+            if (_houseAddress == 0) { return; }
+
+            byte[] block = memory.ReadBytesQuiet(_houseAddress, HousePointerScanBytes);
+            if (block == null || block.Length < 8) { return; }
+
+            for (int offset = 4; offset + 4 <= block.Length; offset += 4)
+            {
+                FollowSlot slot;
+                bool known = _followSlots.TryGetValue(offset, out slot);
+                if (known && slot.Promoted) { continue; }
+
+                uint value = ReadUInt32(block, offset);
+
+                if (value < 0x100000 || value > 0x7FFFFFFF)
+                {
+                    if (known) { _followSlots.Remove(offset); }   // 这一格不是指针
+                    continue;
+                }
+
+                if (!known)
+                {
+                    FollowSlot fresh = new FollowSlot();
+                    fresh.Target = value;
+                    fresh.Streak = 1;
+                    _followSlots[offset] = fresh;
+                    continue;
+                }
+
+                if (slot.Target != value)
+                {
+                    // 值变了 —— 不是"稳定的成员指针"，重新计数
+                    slot.Target = value;
+                    slot.Streak = 1;
+                    continue;
+                }
+
+                slot.Streak++;
+                if (slot.Streak < FollowStableSamples) { continue; }
+
+                slot.Promoted = true;                 // 这一格从此不再处理（跟过或明确放弃）
+                if (_followedFromHouse >= MaxFollowedFromHouse) { continue; }
+                if (_byAddress.ContainsKey(value) || value == _houseAddress) { continue; }
+
+                uint targetVtable;
+                if (!memory.ReadUInt32(value, out targetVtable)) { continue; }
+                if (targetVtable < moduleBase || targetVtable >= moduleBase + moduleSize) { continue; }
+
+                HarvestTracked tracked = new HarvestTracked();
+                tracked.Address = value;
+                tracked.FirstSeen = sample.Index;
+                tracked.FirstVTable = targetVtable;
+                tracked.Source = string.Format(CultureInfo.InvariantCulture, "我方房子 → 跟随 +0x{0:X}", offset);
+                _byAddress[value] = tracked;
+                _tracked.Add(tracked);
+                _followedFromHouse++;
+
+                Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
+                    "从「我方房子」跟随到对象 0x{0:X8}（房子 +0x{1:X} 指向它，类型表 0x{2:X8}）",
+                    value, offset, targetVtable));
+            }
+        }
+
         private void ReadSelection(MemoryIO memory, uint moduleBase, HarvestSample sample)        {
             // **与引擎 / 高级功能页共用同一套"金钱锚定 + 自动更正"的读法**（2026-10-08 起）。
             //
@@ -627,11 +876,12 @@ namespace MoTrainer.Calibration
             }
         }
 
-        private static void UpdateTracked(HarvestTracked tracked, MemoryIO memory, int sampleIndex, double seconds)
+        private static void UpdateTracked(HarvestTracked tracked, MemoryIO memory, int sampleIndex)
         {
-            byte[] block = memory.ReadBytesQuiet(tracked.Address, DumpBytes);
+            int dumpBytes = tracked.DumpBytes;
+            byte[] block = memory.ReadBytesQuiet(tracked.Address, dumpBytes);
 
-            if (block == null || block.Length < DumpBytes)
+            if (block == null || block.Length < dumpBytes)
             {
                 if (tracked.DiedAt < 0) { tracked.DiedAt = sampleIndex; }
                 return;
@@ -650,7 +900,7 @@ namespace MoTrainer.Calibration
 
             if (!tracked.HasLast)
             {
-                tracked.Last = new uint[DumpBytes / 4];
+                tracked.Last = new uint[dumpBytes / 4];
                 for (int i = 0; i < tracked.Last.Length; i++) { tracked.Last[i] = ReadUInt32(block, i * 4); }
                 tracked.HasLast = true;
                 tracked.FirstVTable = head;
@@ -665,11 +915,24 @@ namespace MoTrainer.Calibration
                 if (value == tracked.Last[i]) { continue; }
 
                 int offset = i * 4;
-                if (tracked.Changes.Count < 400)   // 单个对象的变化条数封顶，防止异常对象把报告撑爆
+                if (tracked.ChangeEvents >= MaxChangeEventsPerObject)
                 {
-                    tracked.Changes.Add(string.Format(CultureInfo.InvariantCulture,
-                        "t={0:0.0}s  采样#{1}  +0x{2:X3}  0x{3:X8} → 0x{4:X8}  ({3} → {4})",
-                        seconds, sampleIndex, offset, tracked.Last[i], value));
+                    // 记不下了：**如实标注"没记全"**，而不是悄悄丢掉后面的变化。
+                    // （旧版就是悄悄丢的：400 条名额被出生瞬间的"初始化洪流"吃光，
+                    //   之后真正的建造过程一条都没留下 —— 报告看起来却是完整的。）
+                    tracked.Truncated = true;
+                }
+                else
+                {
+                    OffsetSeries series;
+                    if (!tracked.Series.TryGetValue(offset, out series))
+                    {
+                        // 第一次看到它变化：把"变化之前"的那个值当作序列起点
+                        series = new OffsetSeries(offset, sampleIndex, tracked.Last[i]);
+                        tracked.Series[offset] = series;
+                    }
+                    series.Record(sampleIndex, value);
+                    tracked.ChangeEvents++;
                 }
                 tracked.Last[i] = value;
             }
@@ -689,9 +952,13 @@ namespace MoTrainer.Calibration
         /// </summary>
         private string WriteReport(bool dumpToLog)
         {
-            string text = BuildReport();
             try
             {
+                // **生成报告也要在 try 里**（2026-10-10 自检抓到）：这一段跑在收尾线程上，
+                // 一旦异常逃到线程外，整个进程会被带走 —— 用户那一局的采集数据就**全丢了**，
+                // 而且因为报告没落盘，事后什么都查不到。宁可少一段，也不能没有报告。
+                string text = BuildReport();
+
                 if (_reportPath.Length == 0)
                 {
                     string folder = _store != null ? _store.ReportsFolder : "reports";
@@ -782,6 +1049,16 @@ namespace MoTrainer.Calibration
                 text.AppendLine("对象名单：**整个采集期间一次都没解析成功**（详见下方时间线里的「！」行）");
             }
 
+            // 「我方房子」认出来了没有 —— 必须写出来。
+            // 认不出来时若什么都不写，用户那一局就白玩了、而且事后查不出原因。
+            text.AppendLine("我方房子：" + (_houseNote.Length > 0 ? _houseNote : "（采集期间还没轮到认房子）"));
+            if (_followedFromHouse > 0)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "  从房子里跟随到 {0} 个对象（上限 {1}）—— 生产队列很可能是其中之一，见「二」里的「来源：我方房子 → 跟随」",
+                    _followedFromHouse, MaxFollowedFromHouse));
+            }
+
             // ---- 一、时间线 ----
             text.AppendLine();
             text.AppendLine("=== 一、时间线 ===");
@@ -808,8 +1085,8 @@ namespace MoTrainer.Calibration
             // ---- 二、被跟踪对象 ----
             text.AppendLine();
             text.AppendLine("=== 二、被跟踪对象 ===");
-            text.AppendLine("（来源有两种：**你选中过的**，以及**本次采集期间新造出来的**（后者自动收进来，不必先选中）。");
-            text.AppendLine("  两种都会一直跟到采集结束，取消选中也不丢。）");
+            text.AppendLine("（来源有三种：**你选中过的**、**本次采集期间新造出来的**（后者自动收进来、不必先选中）、");
+            text.AppendLine("  以及**我方房子与它跟随出来的对象**（生产队列大概率在那里）。都会一直跟到采集结束。）");
             if (tracked.Count == 0)
             {
                 text.AppendLine("本次没有跟踪到任何对象 —— 采集期间你既没有选中过单位，也没有造过东西。");
@@ -818,11 +1095,14 @@ namespace MoTrainer.Calibration
             for (int i = 0; i < tracked.Count; i++)
             {
                 HarvestTracked t = tracked[i];
+                try
+                {
                 text.AppendLine();
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "对象 #{0}  地址 0x{1:X8}  类型表 0x{2:X8}{3}",
+                    "对象 #{0}  地址 0x{1:X8}  类型表 0x{2:X8}{3}{4}",
                     i + 1, t.Address, t.FirstVTable,
-                    t.NewlyAppeared ? "  ← **采集期间新造出来的**" : ""));
+                    t.NewlyAppeared ? "  ← **采集期间新造出来的**" : "",
+                    t.Source.Length > 0 ? "  ｜ 来源：" + t.Source : ""));
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                     "  首次出现：采样 #{0}｜共成功读到 {1} 次｜其中被选中 {2} 次",
                     t.FirstSeen, t.SeenCount, t.SelectedAt.Count));
@@ -836,19 +1116,50 @@ namespace MoTrainer.Calibration
                         "  ⚠ 从采样 #{0} 起读不到了（对象已被摧毁，或该地址被其它对象复用）", t.DiedAt));
                 }
 
-                if (t.Changes.Count == 0)
+                // 变化**按偏移分组**列（每个偏移一行 + 它的取值序列）。
+                // 旧版是一条变化一行、且总条数封顶 400 —— 出生瞬间的"初始化洪流"会把名额吃光，
+                // 真正要看的建造过程一条都留不下（2026-10-09 报告实测到）。
+                List<OffsetSeries> top = ProgressHunter.TopOffsets(t, 12);
+                if (top.Count == 0)
                 {
                     text.AppendLine("  字段变化：无（整个采集期间这个对象的字节一个都没动）");
                 }
                 else
                 {
-                    text.AppendLine("  字段变化：");
-                    for (int k = 0; k < t.Changes.Count; k++)
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  变过的字段共 {0} 个，变化最多的 {1} 个（完整序列见「六」）：",
+                        t.Series.Count, top.Count));
+                    for (int k = 0; k < top.Count; k++)
                     {
-                        text.AppendLine("    " + t.Changes[k]);
+                        OffsetSeries s = top[k];
+                        // 三样都给：第一次变化的"从哪到哪"（十六进制，便于和日志/其它报告对上）、
+                        // 末值、以及完整取值序列（十进制，判断"是不是一路推进"就看它）。
+                        string firstStep = s.Values.Count > 0
+                            ? string.Format(CultureInfo.InvariantCulture,
+                                "首次 0x{0:X8} → 0x{1:X8}", s.FirstValue, s.Values[0])
+                            : "（无变化点）";
+                        text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                            "    +0x{0:X3}  变了 {1} 次  ｜ {2} ｜ 末值 0x{3:X8} ｜ 序列：{4}",
+                            s.Offset, s.Changes, firstStep, s.LastValue,
+                            ProgressHunter.FormatSeries(s, 16)));
                     }
                 }
+                if (t.Truncated)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  ⚠ 本对象变化太多，只记下了前 {0} 条 —— **后面的变化没有记全**（如实标注，别当成完整的）",
+                        MaxChangeEventsPerObject));
+                }
                 text.AppendLine("  常见字段偏移对照：+0x06C 血量｜+0x0F0 阵营｜+0x07D 最大血量");
+                }
+                catch (Exception ex)
+                {
+                    // 一个对象的数据再怪，也不许把**整份报告**毁掉：如实记一行，继续下一个。
+                    // （2026-10-10 序列打印越界那次就是这条思路救的场：错了也要留下"哪里错了"。）
+                    Logger.Error("Harvest", "报告：对象 #" + (i + 1) + " 这段生成失败", ex);
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  ！（本对象这段生成失败：{0} —— 其余对象不受影响）", ex.GetType().Name));
+                }
             }
 
             // ---- 三、全对象名单 ----

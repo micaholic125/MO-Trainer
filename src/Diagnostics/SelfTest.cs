@@ -145,6 +145,13 @@ namespace MoTrainer.Diagnostics
             Section("16. 日志噪音回归（越界地址不读 · 重复错误折叠）");
             CheckLogNoise();
 
+            // [S6-2] 瞬间建造：差的就剩「建造进度」这一个字段。猎手负责把它从采集数据里挑出来，
+            // 房子跟踪与"跟随一层"负责别让进度字段落在视野之外（它未必记在建筑对象身上）。
+            // 用户的时间最稀缺，所以要保证"下一次开局就该拿到答案"，而不是"多开几局试试"。
+            Section("17. 施工进度猎手（[S6-2] 瞬间建造）");
+            CheckProgressHunter();
+            CheckHarvestHouseTracking();
+
             Write("");
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
@@ -4897,6 +4904,30 @@ namespace MoTrainer.Diagnostics
                     session.NewTrackedCount == 1,
                     "新跟踪 " + session.NewTrackedCount + " 个（应为 1 —— 只有那个新造的建筑）");
 
+                // ---- 回归：「初始化洪流」不许再把建造过程冲掉（2026-10-09 修掉的真缺陷）----
+                // 旧版把变化记在一个**上限 400 条**的清单里，而新建造的对象出生那一瞬
+                // 有上百个字段同时被初始化 —— 名额当场吃光，之后真正的建造过程一条都留不下，
+                // 而报告看起来却是完整的（真机报告里 29 个对象有 10 个撞上这个上限）。
+                // 这里照着那个形态造：先来一波 500 个字段同时变化，再让一个"进度字段"每拍推进。
+                uint burst = heap + 0x9000;
+                io.WriteUInt32(burst, vtable);
+                io.WriteUInt32(burst + OwnerOffset, owner);
+                io.WriteUInt32(burst + HealthOffset, 100);
+                io.WriteUInt32(rosterArray + 20, burst);        // 名单第 6 项
+
+                WaitUntil(delegate { return session.NewTrackedCount == 2; }, 8000);
+
+                byte[] flood = new byte[500 * 4];
+                for (int i = 0; i < flood.Length; i++) { flood[i] = (byte)(0x40 + (i & 0x3F)); }
+                io.Write(burst + 0x100, flood, 0, flood.Length);    // 出生瞬间的洪流（一次改 500 个字段）
+
+                for (int step = 0; step < 4; step++)
+                {
+                    io.WriteUInt32(burst + 0x900, (uint)(20 - step * 5));   // 每拍推进一次"进度"
+                    int tick = session.SampleCount;
+                    WaitUntil(delegate { return session.SampleCount > tick; }, 3000);
+                }
+
                 reportPath = session.Stop();
 
                 Check("一键采集：采样按时钟持续推进", taken >= 3, taken + " 次");
@@ -4929,6 +4960,17 @@ namespace MoTrainer.Diagnostics
                 Check("一键采集：报告里能看出那 3 个对象属于同一个阵营",
                     text.IndexOf("0x" + owner.ToString("X8"), StringComparison.Ordinal) >= 0,
                     "阵营 0x" + owner.ToString("X8"));
+
+                // 「初始化洪流」回归：洪流之后，进度字段的变化必须还在。
+                // 旧版在这里会一条不剩（500 条洪流把 400 条名额吃光，后面的变化全丢）。
+                Check("一键采集：初始化洪流之后，建造进度的变化仍然记得下来",
+                    text.IndexOf("+0x900", StringComparison.Ordinal) >= 0,
+                    text.IndexOf("+0x900", StringComparison.Ordinal) >= 0
+                        ? "在（洪流没把它冲掉）" : "报告里找不到 +0x900 的变化（又被上限吃掉了）");
+                Check("一键采集：变化条数没有触顶（「没记全」的标注不许被误触发）",
+                    text.IndexOf("后面的变化没有记全", StringComparison.Ordinal) < 0,
+                    text.IndexOf("后面的变化没有记全", StringComparison.Ordinal) < 0
+                        ? "未触顶" : "触顶了（上限设得太小，会把真数据挤掉）");
             }
             catch (Exception ex)
             {
@@ -4939,6 +4981,326 @@ namespace MoTrainer.Diagnostics
                 if (session != null) { try { session.Dispose(); } catch { } }
                 SelectionProbe.ModuleBaseHint = savedBase;
                 SelectionProbe.ModuleSizeHint = savedSize;
+                if (reportPath.Length > 0 && File.Exists(reportPath))
+                {
+                    try { File.Delete(reportPath); } catch (Exception) { }
+                }
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// 「施工进度猎手」的分析部分（纯函数：不需要游戏、不需要线程）。
+        ///
+        /// 场景照着**真机报告的样子**搭（2026-10-09 那份 431 KB 的报告）：
+        ///   · 一个"建造中"的对象：进度每拍推进、造完后停下；
+        ///   · 一个"永不停歇"的计数器 —— 真机里建筑 +0x0C4/+0x0C8 就是这样（每秒 +2000）；
+        ///   · 一个"取值像地址"的指针字段（它也单调、也会停，只有"像地址"这条能挡掉它）；
+        ///   · 一个只变过两次的字段（说明不了什么，不该进候选）。
+        /// 断言的中心是**宁可漏、不要错**：假的必须进不来，真的必须排第一。
+        /// </summary>
+        private static void CheckProgressHunter()
+        {
+            // 20 拍：第 12 拍电力跳一次（= 有一座发电厂造好了）
+            List<HarvestSample> samples = new List<HarvestSample>();
+            for (int i = 0; i < 20; i++)
+            {
+                HarvestSample s = new HarvestSample();
+                s.Index = i;
+                s.Seconds = i;
+                s.Money = 5000;
+                s.PowerOutput = i < 12 ? 60u : 210u;
+                samples.Add(s);
+            }
+
+            HarvestTracked building = new HarvestTracked();
+            building.Address = 0x2CD0ADC8;
+            building.FirstVTable = 0x007E3EBC;
+            building.NewlyAppeared = true;
+
+            // 真进度：22 → 0（每拍 -2），最后一次变化在第 11 拍 —— 正好贴着第 12 拍的电力跳变
+            OffsetSeries progress = new OffsetSeries(0x534, 0, 22);
+            for (int i = 1; i <= 11; i++) { progress.Record(i, (uint)(22 - i * 2)); }
+            building.Series[0x534] = progress;
+
+            OffsetSeries counter = new OffsetSeries(0x0C4, 0, 4256);
+            for (int i = 1; i < 20; i++) { counter.Record(i, (uint)(4256 + i * 2000)); }
+            building.Series[0x0C4] = counter;
+
+            OffsetSeries pointer = new OffsetSeries(0x0E0, 0, 0x2CB30000);
+            for (int i = 1; i <= 11; i++) { pointer.Record(i, (uint)(0x2CB30000 + i * 0x100)); }
+            building.Series[0x0E0] = pointer;
+
+            OffsetSeries barely = new OffsetSeries(0x6C, 0, 100);
+            barely.Record(5, 99);
+            barely.Record(6, 98);
+            building.Series[0x6C] = barely;
+
+            List<HarvestTracked> tracked = new List<HarvestTracked>();
+            tracked.Add(building);
+
+            List<ProgressCandidate> candidates = ProgressHunter.Rank(tracked, samples, 0x400000, 0x793000, 15, new List<string>());
+
+            bool sawProgress = false;
+            bool sawCounter = false;
+            bool sawPointer = false;
+            bool sawBarely = false;
+            bool nearMoment = false;
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                int offset = candidates[i].Series.Offset;
+                if (offset == 0x534) { sawProgress = true; nearMoment = candidates[i].NearCompletionMoment; }
+                if (offset == 0x0C4) { sawCounter = true; }
+                if (offset == 0x0E0) { sawPointer = true; }
+                if (offset == 0x6C) { sawBarely = true; }
+            }
+
+            Check("施工进度猎手：真进度字段（+0x534）排在第一",
+                candidates.Count > 0 && candidates[0].Series.Offset == 0x534,
+                candidates.Count == 0
+                    ? "一个候选都没有"
+                    : "第一名 +0x" + candidates[0].Series.Offset.ToString("X", CultureInfo.InvariantCulture));
+            Check("施工进度猎手：进度字段进了候选（不是被误排除）", sawProgress,
+                sawProgress ? "在" : "没进去");
+            Check("施工进度猎手：「每拍都在变、从不停」的计数器被排除（+0x0C4）", !sawCounter,
+                sawCounter ? "混进候选了" : "已排除");
+            Check("施工进度猎手：「取值像地址」的字段被排除（+0x0E0）", !sawPointer,
+                sawPointer ? "混进候选了" : "已排除");
+            Check("施工进度猎手：只变过两次的字段不进候选（+0x6C）", !sawBarely,
+                sawBarely ? "混进候选了" : "已排除");
+            Check("施工进度猎手：认出「停下时刻正对着电力跳变」", nearMoment,
+                nearMoment ? "已对齐" : "没对上");
+
+            string text = ProgressHunter.Format(tracked, samples, 0x400000, 0x793000);
+            Check("施工进度猎手：报告段落里同时有「造好了」时刻、候选明细与结论",
+                text.IndexOf("电力产出 60 → 210", StringComparison.Ordinal) >= 0
+                    && text.IndexOf("结论：", StringComparison.Ordinal) >= 0
+                    && text.IndexOf("+0x534", StringComparison.Ordinal) >= 0,
+                "段落 " + text.Length + " 字符");
+
+            // ---- 锯齿：用户一件接一件地造（进度降到底立刻跳回高点）----
+            // 这一条很重要：真玩起来用户多半是连着造的，进度字段**没有平台期**。
+            // 只认"平台期"的话，最常见的那种玩法反而找不到字段。
+            List<HarvestSample> flat = new List<HarvestSample>();
+            for (int i = 0; i < 20; i++)
+            {
+                HarvestSample s = new HarvestSample();
+                s.Index = i;
+                s.Seconds = i;
+                s.Money = 5000;
+                s.PowerOutput = 60;
+                flat.Add(s);
+            }
+
+            HarvestTracked builder = new HarvestTracked();
+            builder.Address = 0x1F36B320;
+            builder.FirstVTable = 0x007E3354;
+            builder.NewlyAppeared = true;
+            OffsetSeries saw = new OffsetSeries(0x100, 0, 30);
+            int at = 0;
+            for (int cycle = 0; cycle < 3; cycle++)
+            {
+                for (int k = 1; k <= 5; k++) { at++; saw.Record(at, (uint)(30 - k * 5)); }
+                at++;
+                saw.Record(at, 30);                       // 下一件开始，跳回高点
+            }
+            builder.Series[0x100] = saw;
+
+            List<HarvestTracked> sawTracked = new List<HarvestTracked>();
+            sawTracked.Add(builder);
+            List<ProgressCandidate> sawCandidates = ProgressHunter.Rank(sawTracked, flat, 0x400000, 0x793000, 15, new List<string>());
+            Check("施工进度猎手：一件接一件地造（锯齿、没有平台期）也认得出",
+                sawCandidates.Count == 1 && sawCandidates[0].Series.Offset == 0x100,
+                sawCandidates.Count == 0 ? "没认出来" : "认出来了（" + sawCandidates.Count + " 个候选）");
+
+            // ---- 缺数据时必须说得出为什么，而不是给一段空话 ----
+            string emptyText = ProgressHunter.Format(new List<HarvestTracked>(), samples, 0x400000, 0x793000);
+            Check("施工进度猎手：没有任何候选时如实说明（不静默给空结果）",
+                emptyText.IndexOf("一个都没有", StringComparison.Ordinal) >= 0,
+                emptyText.Replace("\n", " ").Replace("\r", ""));
+
+            // 看不出"造好了"迹象时要说实话，但**不能因此就不给候选**
+            string noMoment = ProgressHunter.Format(tracked, flat, 0x400000, 0x793000);
+            Check("施工进度猎手：看不出「造好了」迹象时如实说明，但候选照给",
+                noMoment.IndexOf("没有出现", StringComparison.Ordinal) >= 0
+                    && noMoment.IndexOf("+0x534", StringComparison.Ordinal) >= 0,
+                "段落 " + noMoment.Length + " 字符");
+
+            // ---- 「金钱停止下降」也是一条造好了的迹象 ----
+            List<HarvestSample> drain = new List<HarvestSample>();
+            for (int i = 0; i < 12; i++)
+            {
+                HarvestSample s = new HarvestSample();
+                s.Index = i;
+                s.Seconds = i;
+                s.PowerOutput = 60;
+                s.Money = (uint)(5000 - (i <= 5 ? i * 40 : 200));
+                drain.Add(s);
+            }
+            List<int> moments = ProgressHunter.FindCompletionMoments(drain);
+            Check("施工进度猎手：认出「金钱停止下降」这个造好了的迹象",
+                moments.Contains(6), "识别到 " + moments.Count + " 处");
+
+            List<int> powerMoments = ProgressHunter.FindCompletionMoments(samples);
+            Check("施工进度猎手：认出「电力产出跳变」这个造好了的迹象",
+                powerMoments.Contains(12), "识别到 " + powerMoments.Count + " 处");
+
+            // ---- 序列打印：重复折叠 / 超长省略 / 截断标注 ----
+            OffsetSeries repeats = new OffsetSeries(0x10, 0, 7);
+            for (int i = 1; i <= 10; i++) { repeats.Record(i, 0); }
+            string repeatsText = ProgressHunter.FormatSeries(repeats, 40);
+            Check("施工进度猎手：序列把连续重复的取值折叠起来（0(×…）",
+                repeatsText.IndexOf("(×", StringComparison.Ordinal) >= 0, repeatsText);
+
+            OffsetSeries capped = new OffsetSeries(0x20, 0, 1);
+            for (int i = 1; i <= OffsetSeries.MaxPoints + 5; i++) { capped.Record(i, (uint)i); }
+            string cappedText = ProgressHunter.FormatSeries(capped, 40);
+            Check("施工进度猎手：记账被截断时如实标注（不假装完整）",
+                cappedText.IndexOf("未逐条记录", StringComparison.Ordinal) >= 0,
+                capped.Changes + " 次变化 / " + capped.Values.Count + " 个点");
+
+            string longText = ProgressHunter.FormatSeries(capped, 20);
+            Check("施工进度猎手：超长序列保留头尾并标明省略了多少个",
+                longText.IndexOf("个省略", StringComparison.Ordinal) >= 0, longText);
+        }
+
+        /// <summary>
+        /// 采集器对**我方房子**的跟踪与"跟随一层"（[S6-2] 瞬间建造用）。
+        ///
+        /// 为什么值得单测：生产进度**未必**记在建筑对象身上 —— 按引擎惯例它更可能记在
+        /// 房子的生产队列/工厂里，而那又可能是房子身上某个指针指向的**另一个对象**。
+        /// 这条链路（认出房子 → 跟随稳定指针 → 拒绝"看着像但不是对象"的指针）错一环，
+        /// 用户那一局就白玩了（用户的时间是本项目最稀缺的东西）。
+        /// </summary>
+        private static void CheckHarvestHouseTracking()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("采集器：我方房子跟踪", false, "OpenProcess 失败"); return; }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            string reportPath = "";
+            HarvestSession session = null;
+
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("采集器：我方房子跟踪（测试内存块）", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("采集器：我方房子跟踪", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = TestBlockSize;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                const uint MoneyOffset = 0x30C;
+                uint houseVtable = moduleBase + 0x2000;
+                uint house = heap + 0x1000;              // 房子本体（dump 窗口 0x1000~0x7000）
+                uint followed = heap + 0x8000;           // 房子 +0x200 指向它 → 该被跟随
+                uint bogus = heap + 0x9000;              // 房子 +0x204 指向它 → 头不是类型表，不许跟
+
+                io.WriteUInt32(house, houseVtable);              // 头部：模块区间内的类型表（C++ 对象的样子）
+                io.WriteUInt32(house + MoneyOffset, 12345);      // 金钱
+                io.WriteUInt32(house + 0x200, followed);
+                io.WriteUInt32(house + 0x204, bogus);
+                io.WriteUInt32(followed, moduleBase + 0x2010);   // 目标确实是个 C++ 对象
+                io.WriteUInt32(bogus, 0xDEADBEEF);               // 目标头 4 字节不是模块区间指针
+
+                // 金钱链：静态根 → 房子 → +0x30C（与真机口径一致：金钱地址减 0x30C 就是房子）
+                io.WriteUInt32(moduleBase + 0x100, house);
+
+                // 全对象名单（采集靠它枚举对象；本用例只要它别报错）
+                uint rosterSlot = heap + 0x5000;
+                uint rosterArray = heap + 0x4000;
+                uint someObject = heap + 0x2000;
+                io.WriteUInt32(someObject, houseVtable);
+                io.WriteUInt32(rosterSlot, rosterArray);
+                io.WriteUInt32(rosterArray, someObject);
+                io.WriteUInt32(rosterArray + 4, someObject);
+
+                CalibrationProfile profile = new CalibrationProfile();
+                profile.ModuleBase = moduleBase;
+                profile.ModuleSize = moduleSize;
+                profile.TechnoArray.SetStaticAddress(rosterSlot - moduleBase);
+                profile.Money.SetOffsets(new uint[] { 0x100, MoneyOffset });
+                profile.OffsetTechnoOwner = 0xF0;
+                profile.OffsetTechnoHealth = 0x6C;
+
+                List<MemoryRegion> regions = new List<MemoryRegion>();
+                regions.Add(MakeRegion(moduleBase, TestBlockSize));
+                regions.Add(MakeRegion(heap, TestBlockSize));
+                SyntheticTarget target = new SyntheticTarget(io, moduleBase, moduleSize, regions, regions);
+                ProfileStore store = new ProfileStore(AppDomain.CurrentDomain.BaseDirectory);
+
+                session = new HarvestSession(target, profile, store);
+                string started = session.Start(60, 200);
+                Check("采集器：我方房子跟踪场景能启动", started.Length == 0,
+                    started.Length > 0 ? started : "已启动");
+
+                // "跟随"要求同一个指针连续 3 拍不动，所以至少等 4 拍
+                int n0 = session.SampleCount;
+                WaitUntil(delegate { return session.SampleCount > n0 + 4; }, 8000);
+
+                reportPath = session.Stop();
+                string text = (reportPath.Length > 0 && File.Exists(reportPath))
+                    ? File.ReadAllText(reportPath, Encoding.UTF8) : "";
+
+                Check("采集器：报告落了盘", text.Length > 0, reportPath);
+
+                // 房子：金钱地址 − 0x30C，且头 4 字节是模块区间内的类型表
+                Check("采集器：认出并跟踪了我方房子（金钱地址 − 0x30C）",
+                    text.IndexOf("来源：我方房子", StringComparison.Ordinal) >= 0
+                        && text.IndexOf("我方房子：已跟踪", StringComparison.Ordinal) >= 0,
+                    text.IndexOf("来源：我方房子", StringComparison.Ordinal) >= 0 ? "已在跟踪" : "报告里没有房子的踪迹");
+
+                Check("采集器：从房子里跟随到那个稳定指针指向的对象（+0x200）",
+                    text.IndexOf("跟随 +0x200", StringComparison.Ordinal) >= 0,
+                    text.IndexOf("跟随 +0x200", StringComparison.Ordinal) >= 0 ? "已跟随" : "没有跟随");
+
+                Check("采集器：指向「头不是类型表」的指针没有被跟随（宁可漏，不许跟错）",
+                    text.IndexOf("跟随 +0x204", StringComparison.Ordinal) < 0,
+                    text.IndexOf("跟随 +0x204", StringComparison.Ordinal) < 0 ? "已拒绝" : "跟错了");
+
+                // ---- 负面用例：认不出房子时，必须**说得出卡在哪一步** ----
+                // 这是本项目最忌讳的失败模式的正面防线：用户开一局、点一次采集，
+                // 如果房子没认出来而报告只字不提，那一局就白玩了、而且事后查不出原因。
+                session.Dispose();
+                session = null;
+                io.WriteUInt32(house, 0xDEADBEEF);      // 头 4 字节不再是类型表指针
+
+                HarvestSession second = new HarvestSession(target, profile, store);
+                second.Start(60, 200);
+                int n1 = second.SampleCount;
+                WaitUntil(delegate { return second.SampleCount > n1 + 1; }, 5000);
+                string path2 = second.Stop();
+                string text2 = (path2.Length > 0 && File.Exists(path2))
+                    ? File.ReadAllText(path2, Encoding.UTF8) : "";
+                Check("采集器：认不出房子时如实说明卡在哪一步（不静默什么都不做）",
+                    text2.IndexOf("不像类型表指针", StringComparison.Ordinal) >= 0
+                        && text2.IndexOf("请把这一行发回来", StringComparison.Ordinal) >= 0,
+                    text2.IndexOf("不像类型表指针", StringComparison.Ordinal) >= 0
+                        ? "已说明（含要发回来的提示）" : "报告里只字未提 —— 那样用户就白玩了");
+                if (path2.Length > 0 && File.Exists(path2)) { try { File.Delete(path2); } catch (Exception) { } }
+                second.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Check("采集器：我方房子跟踪", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (session != null) { try { session.Dispose(); } catch { } }
                 if (reportPath.Length > 0 && File.Exists(reportPath))
                 {
                     try { File.Delete(reportPath); } catch (Exception) { }
