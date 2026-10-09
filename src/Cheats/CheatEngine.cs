@@ -198,6 +198,23 @@ namespace MoTrainer.Cheats
                 _stop = null;
             }
 
+            // 退出前把电力改过的地方**还原**。
+            // 不还原的话，游戏会在这一局里一直带着被放大的发电量 —— 那是我们留下的痕迹，
+            // 而玩家已经关掉修改器了。还原失败也不拦退出（进程走的时候游戏自有它的下场）。
+            if (_powerBoost.HasChanges && _target != null && _target.IsReady)
+            {
+                try
+                {
+                    int restored = _powerBoost.Restore(_target.Memory);
+                    Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                        "退出前还原电力改动：{0} 个型号的发电量已改回原值", restored));
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn("Engine", "退出前还原电力改动失败：" + ex.Message);
+                }
+            }
+
             Logger.Info("Engine", "锁定线程已停止，累计 " + Ticks + " 轮");
         }
 
@@ -263,7 +280,17 @@ namespace MoTrainer.Cheats
                     {
                         if (feature.Id == CheatId.SelectedInvincible) { PeekSelection(feature); }
                         else if (feature.Id == CheatId.KillEnemies) { PeekTechnoArray(feature); }
+                        else if (feature.Id == CheatId.PowerOutput) { PeekPower(feature); }
                         else { PeekValue(feature); }
+                    }
+
+                    // 电力关掉时**要把说明书改回去**：我们改的是游戏自己的数据，
+                    // 不还原的话这一局会一直带着被放大的发电量（而且敌方也一起受益）。
+                    if (feature.Id == CheatId.PowerOutput && _powerBoost.HasChanges)
+                    {
+                        int restored = _powerBoost.Restore(_target.Memory);
+                        Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                            "电力已关闭：把 {0} 个型号的发电量改回原值", restored));
                     }
 
                     // 秒杀一旦关闭就把"已抽检"标记作废：下次开启会重新做一次安全抽检。
@@ -289,11 +316,150 @@ namespace MoTrainer.Cheats
                 }
 
                 // 无敌不是"锁一个地址"，而是"遍历选中的每个对象逐一写血量"；
-                // 秒杀敌人同理（整场对象遍历 + 批量写），两者都单独走专用路径，
-                // 绝不复用单地址的读-比-写 —— 否则会拿"名单基地址"当单地址去写值。
+                // 秒杀敌人同理（整场对象遍历 + 批量写）；电力同样 —— 它改的是
+                // "同型号共用一份的说明书"（类型对象）里的发电量，见 PowerBoost。
+                // 三者都**必须**单独走专用路径，绝不复用单地址的读-比-写 ——
+                // 否则会拿"名单基地址"当单地址去写值（`CLAUDE.md` 7.1 那个雷）。
                 if (feature.Id == CheatId.SelectedInvincible) { ApplySelectedInvincible(feature); }
                 else if (feature.Id == CheatId.KillEnemies) { ApplyKillEnemies(feature); }
+                else if (feature.Id == CheatId.PowerOutput) { ApplyPower(feature); }
                 else { ApplyFeature(feature); }
+            }
+        }
+
+        // ============================================================ 电力（S4-3，2026-10-09 定位成功）
+
+        /// <summary>
+        /// 关闭状态下的只读探测：把"你名下有几座发电建筑、现在发电量是多少"显示到卡片上。
+        ///
+        /// 刻意**不做整套遍历**：这一拍每秒一次，完整流程要遍历几百个对象、逐份读说明书。
+        /// </summary>
+        private void PeekPower(CheatFeature feature)
+        {
+            uint slotAddress;
+            uint arrayAddress;
+            uint count;
+            string reason;
+            if (!TryResolveTechnoArray(out slotAddress, out arrayAddress, out count, out reason))
+            {
+                feature.Address = 0;
+                feature.LastError = reason;
+                return;
+            }
+
+            uint first;
+            uint vtable;
+            if (!_target.Memory.ReadUInt32(arrayAddress, out first) || first < 0x10000
+                || !_target.Memory.ReadUInt32(first, out vtable)
+                || vtable < _target.ModuleBase || vtable >= _target.ModuleBase + _target.ModuleSize)
+            {
+                feature.Address = 0;
+                feature.LastError = "名单内容异常（首项不是游戏对象）——可能需要重新查找总名单";
+                return;
+            }
+
+            feature.Address = slotAddress;
+            feature.LastSeenValue = count;
+            if (feature.LastError.Length > 0) { feature.LastError = ""; }
+        }
+
+        /// <summary>
+        /// 电力：把我方发电建筑对应的"型号说明书"里的发电量改大。
+        ///
+        /// 节拍刻意放到 **1 秒一次**（不是 30Hz）：改的是游戏自己的型号数据，
+        /// 游戏不会去覆盖它，没必要每 33ms 盯一遍；而整套流程要遍历几百个对象再逐份读说明书，
+        /// 按 30Hz 跑会把游戏帧率拖垮。
+        ///
+        /// **一旦任何一步对不上，就一个字节都不写**（fail-closed，与秒杀同一标准）——
+        /// 认不出"哪些建筑是我的"、名单不可信、读到不可写页，都直接拒绝并说明原因。
+        /// </summary>
+        private void ApplyPower(CheatFeature feature)
+        {
+            if (_profile == null) { feature.LastError = "缺少校准配置"; return; }
+
+            if ((DateTime.UtcNow - _lastPowerRun).TotalSeconds < PowerIntervalSeconds) { return; }
+            _lastPowerRun = DateTime.UtcNow;
+
+            uint slotAddress;
+            uint arrayAddress;
+            uint count;
+            string reason;
+            if (!TryResolveTechnoArray(out slotAddress, out arrayAddress, out count, out reason))
+            {
+                feature.Address = 0;
+                feature.LastError = reason;
+                LogPowerNote(reason);
+                return;
+            }
+            feature.Address = slotAddress;
+
+            TechnoWalkResult walk = TechnoWalker.WalkArray(
+                _target.Memory, arrayAddress, count, _target.ModuleBase, _target.ModuleSize);
+            if (!TechnoOps.IsTrustworthy(walk, out reason))
+            {
+                feature.Address = 0;
+                feature.LastError = "对象名单不可信（" + reason + "），已拒绝执行";
+                LogPowerNote(feature.LastError);
+                return;
+            }
+
+            // "哪些建筑是我的"靠**金钱锚定**（不猜、不硬编码偏移）：见 PowerBoost.Apply 第 2 步。
+            uint money;
+            if (!_selection.TryReadMoney(_profile, out money))
+            {
+                feature.LastError = "读不到金钱值（要靠它认「哪些建筑是我的」）——请确认金钱仍处于已校准状态";
+                LogPowerNote(feature.LastError);
+                return;
+            }
+
+            PowerBoostResult result = _powerBoost.Apply(
+                _target.Memory, _target.ModuleBase, _target.ModuleSize,
+                walk.Objects, money, feature.TargetValue);
+
+            if (result.Error.Length > 0)
+            {
+                feature.LastError = result.Error;
+                LogPowerNote(result.Error);
+                return;
+            }
+
+            if (result.Writes > 0) { feature.WriteCount += result.Writes; }
+            feature.LastSeenValue = (uint)result.Buildings;
+            feature.LastError = "";
+
+            // 心跳：每 5 秒一条。"到底有没有在改"在日志里必须看得见（与无敌/秒杀同一套路数）。
+            if ((DateTime.UtcNow - _lastPowerLog).TotalSeconds >= 5.0)
+            {
+                _lastPowerLog = DateTime.UtcNow;
+                Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                    "电力：{0}｜提升 {1} 个型号 / {2} 座建筑｜本拍写入 {3}｜累计写入 {4}{5}",
+                    result.Note, result.Types, result.Buildings, result.Writes, feature.WriteCount,
+                    result.SharedTypes > 0
+                        ? string.Format(CultureInfo.InvariantCulture,
+                            "｜⚠ 其中 {0} 个型号敌方也有 —— 同型号共用说明书，敌方同样受益", result.SharedTypes)
+                        : ""));
+            }
+        }
+
+        /// <summary>
+        /// 把电力的结论写进日志，但只在**结论变化**时记一行
+        /// （一秒一拍，不这么做会把日志刷爆；完全不记又会让"没生效"变成悬案）。
+        /// </summary>
+        private void LogPowerNote(string note)
+        {
+            if (note == null) { note = ""; }
+            if (note == _lastPowerNote) { return; }
+
+            bool wasFailing = _lastPowerNote.Length > 0;
+            _lastPowerNote = note;
+
+            if (note.Length == 0)
+            {
+                Logger.Info("Engine", wasFailing ? "电力：已恢复正常执行" : "电力：已开始执行");
+            }
+            else
+            {
+                Logger.Warn("Engine", "电力：" + note);
             }
         }
 
@@ -958,6 +1124,21 @@ namespace MoTrainer.Cheats
 
         // ---------------- 秒杀敌人（S6-1）的运行时状态 ----------------
 
+        /// <summary>上次执行电力的时刻。整套流程要遍历几百个对象，不能按 30Hz 跑。</summary>
+        private DateTime _lastPowerRun = DateTime.MinValue;
+
+        /// <summary>上次电力心跳日志的时刻。</summary>
+        private DateTime _lastPowerLog = DateTime.MinValue;
+
+        /// <summary>上一条已记录的电力结论（去重）。初值故意非空，让第一条也能记上。</summary>
+        private string _lastPowerNote = "(未开始)";
+
+        /// <summary>电力功能的执行体：改"型号说明书"里的发电量，并记账以便还原。</summary>
+        private readonly PowerBoost _powerBoost = new PowerBoost();
+
+        /// <summary>电力的执行节拍（秒）。改的是游戏自己的型号数据，1 秒一次足够。</summary>
+        private const double PowerIntervalSeconds = 1.0;
+
         /// <summary>上次执行秒杀的时刻。整场遍历 + 上千次读取太重，不能按 30Hz 跑。</summary>
         private DateTime _lastKillRun = DateTime.MinValue;
 
@@ -1022,6 +1203,13 @@ namespace MoTrainer.Cheats
             _lastKillRun = DateTime.MinValue;
             _healthPeak.Clear();
             _selection.Reset();
+
+            // 电力：**丢弃记账，但绝不做写回**。
+            // 新一局的内存是重建的，记账里那些"说明书地址"早就不是原来那份了 ——
+            // 拿它们回写等于往随机位置写值。旧的那一局已经随进程一起没了，无需还原。
+            _powerBoost.ForgetWithoutRestoring();
+            _lastPowerRun = DateTime.MinValue;
+            _lastPowerNote = "(未开始)";
 
             // 「标记友军」的名单同样是**会话级**的：阵营地址每局重新分配，
             // 跨局沿用 = 可能保护到别的阵营（该杀的没杀），甚至保护到真正的敌人。

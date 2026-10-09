@@ -139,6 +139,9 @@ namespace MoTrainer.Diagnostics
             Section("14. 自动巡检（找类型对象 · 主链反查）");
             CheckAutoInspection();
 
+            Section("15. 电力功能（改「型号说明书」的发电量）");
+            CheckPowerBoost();
+
             Write("");
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
@@ -1262,6 +1265,183 @@ namespace MoTrainer.Diagnostics
             }
         }
 
+        /// <summary>
+        /// 电力功能的真链路自检（2026-10-09 定位成功当天新增）。
+        ///
+        /// 为什么必须在这里先证明它对：这是**全项目第二个会批量改写游戏对象状态的功能**
+        /// （第一个是秒杀），而且改的是"同型号共用一份的型号说明书" —— 一旦认错了型号，
+        /// 影响的是全场的建筑，不只是自己那几座。所以这一组的重点和秒杀一样：
+        /// **该拒绝的时候一定拒绝、该只改我方的时候绝不多碰一个**。
+        ///
+        /// 场景刻意搭成"真机该有的样子"：
+        ///   · 两个阵营，各自有钱（金钱锚定就是靠它认"哪个阵营是我"）；
+        ///   · 我方两种发电型号（150 / 60）、敌方一种发电型号（150，**故意与我方同型号号**）、
+        ///     外加我方一种"不发电"的型号（0，必须**不碰**）；
+        ///   · 另有一个"归属指向代码区"的假对象（名单里真机抓到过这种）。
+        /// </summary>
+        private static void CheckPowerBoost()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady)
+            {
+                Check("电力功能", false, "OpenProcess 失败");
+                return;
+            }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("电力功能测试内存块", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("电力功能", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = TestBlockSize;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                const uint MoneyOffset = TechnoOwnership.HouseMoneyOffset;   // 0x30C
+                const uint MyMoney = 11111;
+                const uint EnemyMoney = 22222;
+
+                uint vtable = moduleBase + 0x2000;
+                uint myHouse = heap + 0xA000;
+                uint enemyHouse = heap + 0xB000;
+                io.WriteUInt32(myHouse + MoneyOffset, MyMoney);
+                io.WriteUInt32(enemyHouse + MoneyOffset, EnemyMoney);
+
+                // 型号说明书（头部要像真说明书：4 字节类型表在模块内 + ID 字符串）
+                uint myType150 = heap + 0x1000;
+                uint myType60 = heap + 0x2000;
+                uint myTypeZero = heap + 0x3000;    // 我方"不发电"的型号
+                uint sharedType = heap + 0x4000;    // **敌方也有**的型号
+                uint junkType = moduleBase + 0x3000; // 故意给个落在模块里的"假说明书"
+
+                uint[] types = new uint[] { myType150, myType60, myTypeZero, sharedType, junkType };
+                string[] ids = new string[] { "MY150", "MY060", "MY000", "SHARED", "JUNK" };
+                for (int i = 0; i < types.Length; i++)
+                {
+                    io.WriteUInt32(types[i], vtable);
+                    byte[] id = Encoding.ASCII.GetBytes(ids[i] + "\0");
+                    io.Write(types[i] + 0x24, id, 0, id.Length);
+                }
+                const uint Target = 5000;
+                io.WriteUInt32(myType150 + PowerBoost.TypePowerOffset, 150);
+                io.WriteUInt32(myType60 + PowerBoost.TypePowerOffset, 60);
+                io.WriteUInt32(myTypeZero + PowerBoost.TypePowerOffset, 0);      // 不发电
+                io.WriteUInt32(sharedType + PowerBoost.TypePowerOffset, 150);
+                io.WriteUInt32(junkType + PowerBoost.TypePowerOffset, 150);      // 不该被当成说明书
+
+                // 建筑对象：+0x520 → 说明书，+0x14C → 阵营
+                uint myA = heap + 0x2100, myB = heap + 0x2200, myC = heap + 0x2300;
+                uint enemyA = heap + 0x2400, enemyB = heap + 0x2500;
+                uint junkObj = heap + 0x2600;       // 归属指向代码区 → 不是真阵营
+                // **我方的**一座建筑，但它的"说明书指针"指向游戏模块里 ——
+                // 真机名单里混着大量非建筑对象，它们的 +0x520 位置什么值都有。
+                // 没有"说明书必须在堆上"这道确认，这个假说明书会被当成真的去写。
+                uint myD = heap + 0x2700;
+                uint[] objs = new uint[] { myA, myB, myC, enemyA, enemyB, junkObj, myD };
+                for (int i = 0; i < objs.Length; i++) { io.WriteUInt32(objs[i], vtable); }
+                io.WriteUInt32(myA + PowerBoost.TypePointerOffset, myType150);
+                io.WriteUInt32(myB + PowerBoost.TypePointerOffset, myType150);
+                io.WriteUInt32(myC + PowerBoost.TypePointerOffset, myTypeZero);
+                io.WriteUInt32(enemyA + PowerBoost.TypePointerOffset, sharedType);
+                io.WriteUInt32(enemyB + PowerBoost.TypePointerOffset, sharedType);
+                io.WriteUInt32(junkObj + PowerBoost.TypePointerOffset, myType60);
+                io.WriteUInt32(myD + PowerBoost.TypePointerOffset, junkType);
+
+                io.WriteUInt32(myA + PowerBoost.OwnerOffset, myHouse);
+                io.WriteUInt32(myB + PowerBoost.OwnerOffset, myHouse);
+                io.WriteUInt32(myC + PowerBoost.OwnerOffset, myHouse);
+                io.WriteUInt32(enemyA + PowerBoost.OwnerOffset, enemyHouse);
+                io.WriteUInt32(enemyB + PowerBoost.OwnerOffset, enemyHouse);
+                io.WriteUInt32(junkObj + PowerBoost.OwnerOffset, moduleBase + 0x800);  // 代码区里的值
+                io.WriteUInt32(myD + PowerBoost.OwnerOffset, myHouse);                 // **是我的**
+
+                List<TechnoObject> list = new List<TechnoObject>();
+                for (int i = 0; i < objs.Length; i++)
+                {
+                    TechnoObject o = new TechnoObject();
+                    o.Address = objs[i];
+                    o.VTable = vtable;
+                    list.Add(o);
+                }
+
+                // ---- 正路：只提升我方两个发电型号 ----
+                PowerBoost boost = new PowerBoost();
+                PowerBoostResult r = boost.Apply(io, moduleBase, moduleSize, list, MyMoney, Target);
+
+                Check("电力：认得出「哪些建筑是我的」（金钱锚定，不靠配置里那个人工偏移）",
+                    r.Error.Length == 0 && r.Types == 1 && r.Buildings == 2,
+                    r.Error.Length > 0 ? r.Error
+                        : r.Types + " 个型号 / " + r.Buildings + " 座建筑（我方只有 150 那个型号在发电，"
+                        + "另一个是 0 = 不发电，还有一座归属指向代码区、不该被算进来）");
+
+                Check("电力：**只**改了我方发电型号（150 那个已到目标值）",
+                    io.ReadUInt32Or(myType150 + PowerBoost.TypePowerOffset, 0) == Target,
+                    "现值 " + io.ReadUInt32Or(myType150 + PowerBoost.TypePowerOffset, 0));
+
+                Check("电力：发电量本来就是 0 的型号**一个字节都不碰**",
+                    io.ReadUInt32Or(myTypeZero + PowerBoost.TypePowerOffset, 0xFFFF) == 0,
+                    "现值 " + io.ReadUInt32Or(myTypeZero + PowerBoost.TypePowerOffset, 0xFFFF));
+
+                Check("电力：敌方独有型号没被动（敌方那两份说明书保持原值）",
+                    io.ReadUInt32Or(sharedType + PowerBoost.TypePowerOffset, 0) == 150,
+                    "现值 " + io.ReadUInt32Or(sharedType + PowerBoost.TypePowerOffset, 0));
+
+                Check("电力：落在游戏模块里的「假说明书」没有被当成说明书去写",
+                    io.ReadUInt32Or(junkType + PowerBoost.TypePowerOffset, 0) == 150,
+                    "现值 " + io.ReadUInt32Or(junkType + PowerBoost.TypePowerOffset, 0)
+                    + "（我方那座建筑的说明书指针被故意指向模块，必须被这道确认挡下）");
+
+                // ---- 还原：关掉开关必须把说明书改回去 ----
+                int restored = boost.Restore(io);
+                Check("电力：关闭时把改过的型号**逐个还原**",
+                    restored == 1 && io.ReadUInt32Or(myType150 + PowerBoost.TypePowerOffset, 0) == 150,
+                    "还原 " + restored + " 个｜现值 " + io.ReadUInt32Or(myType150 + PowerBoost.TypePowerOffset, 0));
+
+                Check("电力：还原之后不再记账（不会重复回写）", !boost.HasChanges, "ok");
+
+                // ---- 拒绝路径：认不出我方时，一个字节都不许写 ----
+                PowerBoost stranger = new PowerBoost();
+                PowerBoostResult r2 = stranger.Apply(io, moduleBase, moduleSize, list, 999999, Target);
+                Check("电力：认不出「哪个阵营是我」时拒绝执行，并说明原因",
+                    r2.Error.Length > 0 && r2.Writes == 0
+                    && io.ReadUInt32Or(myType150 + PowerBoost.TypePowerOffset, 0) == 150,
+                    r2.Error);
+
+                // ---- 拒绝路径：名单是空的 ----
+                PowerBoost empty = new PowerBoost();
+                PowerBoostResult r3 = empty.Apply(io, moduleBase, moduleSize, new List<TechnoObject>(), MyMoney, Target);
+                Check("电力：名单为空时拒绝执行（不会悄悄什么都不做）", r3.Error.Length > 0, r3.Error);
+
+                // ---- 拒绝路径：目标值离谱 ----
+                PowerBoost silly = new PowerBoost();
+                PowerBoostResult r4 = silly.Apply(io, moduleBase, moduleSize, list, MyMoney, PowerBoost.MaxTarget + 1);
+                Check("电力：目标值超过上限时拒绝执行", r4.Error.Length > 0, r4.Error);
+            }
+            catch (Exception ex)
+            {
+                Check("电力功能", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
+            }
+        }
+
         private static void CheckPointerScanner()
         {            SelfHandle self = SelfHandle.Create();
             if (self == null || !self.IsReady)
@@ -1450,8 +1630,9 @@ namespace MoTrainer.Diagnostics
 
                 CalibrationProfile profile = new CalibrationProfile();
                 profile.Money.SetOffsets(new uint[] { 0x100, 0x30 });
-                profile.PowerOutput.SetOffsets(new uint[] { 0x100, 0x50 });
-                profile.PowerOutput.ValueWidth = 2;
+                // 2 字节宽度那条用例挂在「黑幕」定位器上（见下面 narrow 的注释）
+                profile.MapShroud.SetOffsets(new uint[] { 0x100, 0x50 });
+                profile.MapShroud.ValueWidth = 2;
 
                 TrainerSettings settings = new TrainerSettings();
                 CheatEngine engine = new CheatEngine(target, settings);
@@ -1461,10 +1642,14 @@ namespace MoTrainer.Diagnostics
                 money.TargetValue = 123456;
                 money.Enabled = true;                       // 故意先开启，验证绑定时的兜底
 
-                CheatFeature power = engine.Add(new CheatFeature(
-                    CheatId.PowerOutput, "电力", "测试用", SynchRisk.Low, true));
-                power.TargetValue = 100;
-                power.Enabled = true;
+                // 2 字节宽度的用例改用「全图视野」的功能位。
+                // 原先借的是「电力」的位 —— 但 2026-10-09 起电力改走**专用执行路径**
+                //（改型号说明书，不再走单地址读-比-写），借它测"宽度信息生效"就测不到了。
+                // 这里要的是"通用单地址路径"，换一个没有专用分支的功能位即可。
+                CheatFeature narrow = engine.Add(new CheatFeature(
+                    CheatId.RevealMap, "窄字段", "测试用", SynchRisk.Low, true));
+                narrow.TargetValue = 100;
+                narrow.Enabled = true;
 
                 CheatFeature uncalibrated = engine.Add(new CheatFeature(
                     CheatId.SelectedInvincible, "未校准项", "测试用", SynchRisk.High, false));
@@ -1496,7 +1681,10 @@ namespace MoTrainer.Diagnostics
                     CheatId.PowerOutput, "停用项", "测试用", SynchRisk.Low, true));
                 disabled.TargetValue = 999;
                 disabled.Enabled = true;                      // 故意先开启，验证绑定时的兜底
-                disabled.UnavailableReason = FeatureAvailability.ReasonFor(CheatId.PowerOutput);
+                // 停用位用的是**写死的测试原因**，不再从 `FeatureAvailability` 取 ——
+                // 2026-10-09 电力解除停用后，那里已经没有"当前被停用的功能"了。
+                // 这条断言测的是**机制**，不该依赖"此刻恰好有谁被停用"。
+                disabled.UnavailableReason = "测试用：这条路已被实测推翻";
                 disabledEngine.BindProfile(disabledProfile);
 
                 Check("刻意停用的功能在绑定时被自动关闭（即使它是「已校准」的）",
@@ -1653,18 +1841,15 @@ namespace MoTrainer.Diagnostics
         }
 
         /// <summary>
-        /// 「刻意停用」的功能必须**处处都点不动**（2026-10-09 新增）。
+        /// 「刻意停用」这个**机制**必须一直是好的（2026-10-09 新增，同日电力解除停用后**改成不依赖具体功能**）。
         ///
-        /// 背景：电力原来的做法（锁游戏界面的显示值）被真机实测推翻，可 `profile.json` 里
-        /// 它仍然是"已校准"的 —— 于是 `IsCalibrated` 这一条**根本拦不住它**：
-        /// 开关照旧能打开、引擎照旧往那块内存里写。这正是 `CLAUDE.md` §4.2 点名禁止的
-        /// "开关能点、实际没用"（而且比"没用"更糟：它真的在改内存）。
+        /// 背景：电力那次"校准数据看着是好的、实际没用"，逼出了这个状态 ——
+        /// 只判 `IsCalibrated` 拦不住它，必须有一个显式的停用位（`CLAUDE.md` §4.2）。
         ///
-        /// 这里钉死三件事：
-        ///   ① 电力**确实**被声明为停用（依据是 `FeatureAvailability`，不是某处一句界面文案）；
-        ///   ② 卡片上写明原因、开关点不动；
-        ///   ③ 别的功能没有被误伤。
-        /// 引擎层"一个字节都不写"在 `CheckCheatEngine` 里单独验。
+        /// 今天的处境变了：电力已经定位成功、**不再停用**。但机制本身还要留着 ——
+        /// 以后再出现"已知走不通"的功能，得能一键停干净。所以这里**用一个合成功能来测机制**，
+        /// 不再绑在电力身上；另加一条"当前没有任何功能被停用"的现状断言 ——
+        /// 哪天有人真的停用了某个功能，这条会转红，逼他回来看一眼是不是有意的。
         /// </summary>
         private static void CheckUnavailableFeature()
         {
@@ -1672,40 +1857,39 @@ namespace MoTrainer.Diagnostics
             FeatureCard control = null;
             try
             {
-                string reason = FeatureAvailability.ReasonFor(CheatId.PowerOutput);
-                Check("电力被显式声明为「暂不可用」（依据是代码里的声明，不是界面文案）",
-                    reason.Length > 0, "原因：" + reason);
-
-                // 状态行只有一行位置：太长会被卡片底边压掉。
-                // 布局这类事一律用数字量，别靠看（CLAUDE.md 7.2）。
-                Check("停用原因足够短、放得进卡片状态行",
-                    reason.Length <= 40, reason.Length + " 字");
-
-                int wrongly = 0;
+                // ---- 现状：当前没有任何功能被刻意停用 ----
+                List<string> stopped = new List<string>();
                 CheatId[] all = (CheatId[])Enum.GetValues(typeof(CheatId));
                 for (int i = 0; i < all.Length; i++)
                 {
-                    if (all[i] == CheatId.PowerOutput) { continue; }
-                    if (FeatureAvailability.ReasonFor(all[i]).Length > 0) { wrongly++; }
+                    if (FeatureAvailability.ReasonFor(all[i]).Length > 0)
+                    {
+                        stopped.Add(all[i] + "：" + FeatureAvailability.ReasonFor(all[i]));
+                    }
                 }
-                Check("其它功能没有被误标为停用", wrongly == 0, "误标 " + wrongly + " 项");
+                Check("当前没有任何功能被刻意停用（有的话这条会转红，提醒来更新测试）",
+                    stopped.Count == 0,
+                    stopped.Count == 0 ? "无" : string.Join("｜", stopped.ToArray()));
 
-                // 卡片：**故意给它一份完整合法的定位信息**，模拟电力现在的真实处境
-                //（校准数据看着是好的）。若哪天有人把"停用"判断挪到"未校准"后面，
-                // 这条会立刻转红 —— 那正是本轮要防的回归。
-                CheatFeature power = new CheatFeature(
-                    CheatId.PowerOutput, "电力", "测试用", SynchRisk.Low, true);
-                power.TargetValue = 30000;
-                power.Locator = new FieldLocator();
-                power.Locator.SetOffsets(new uint[] { 0x100, 0x53A4 });
-                power.UnavailableReason = reason;
+                // ---- 机制：用合成功能验证"停用位"真的挡得住 ----
+                const string reason = "测试用：这条路已被实测推翻";
+                Check("停用原因足够短、放得进卡片状态行", reason.Length <= 40, reason.Length + " 字");
+
+                // **故意给它一份完整合法的定位信息**，模拟真实处境（校准看着是好的）
+                CheatFeature stoppedFeature = new CheatFeature(
+                    CheatId.InstantBuild, "合成停用项", "测试用", SynchRisk.Low, true);
+                stoppedFeature.TargetValue = 30000;
+                stoppedFeature.Locator = new FieldLocator();
+                stoppedFeature.Locator.SetOffsets(new uint[] { 0x100, 0x53A4 });
+                stoppedFeature.UnavailableReason = reason;
 
                 Check("（前提）被停用的功能确实是「已校准」状态 —— 否则这条断言测不到东西",
-                    power.IsCalibrated && !power.IsUsable,
-                    "IsCalibrated=" + power.IsCalibrated + "｜IsUsable=" + power.IsUsable);
+                    stoppedFeature.IsCalibrated && !stoppedFeature.IsUsable,
+                    "IsCalibrated=" + stoppedFeature.IsCalibrated
+                    + "｜IsUsable=" + stoppedFeature.IsUsable);
 
                 card = new FeatureCard();
-                card.Bind(power);
+                card.Bind(stoppedFeature);
                 Check("已校准但被停用的功能：开关置灰",
                     card.Toggle.ReadOnly && !card.Toggle.Checked, "ok");
 
@@ -1714,8 +1898,6 @@ namespace MoTrainer.Diagnostics
                     !card.Toggle.Checked && !card.DesiredEnabled,
                     "Checked=" + card.Toggle.Checked + "｜意图=" + card.DesiredEnabled);
 
-                // 状态行必须**说得出原因**。只断言"开关点不动"是不够的 ——
-                // 玩家看到灰开关却不知道下一步该干什么，一样是白搭。
                 Check("停用功能的状态行写明了原因（不是一句空话）",
                     card.StatusText.IndexOf("暂不可用") >= 0
                     && card.StatusText.IndexOf(reason) >= 0,
@@ -1729,7 +1911,7 @@ namespace MoTrainer.Diagnostics
                 try
                 {
                     CheatFeature both = new CheatFeature(
-                        CheatId.PowerOutput, "又停用又未校准", "测试用", SynchRisk.Low, true);
+                        CheatId.RevealMap, "又停用又未校准", "测试用", SynchRisk.Low, true);
                     both.UnavailableReason = reason;
                     bothCard.Bind(both);
                     Check("「又停用、又没校准」时，状态行说的是停用（而不是让人白跑一趟校准）",
@@ -1745,14 +1927,15 @@ namespace MoTrainer.Diagnostics
                 // 对照组：同一份定位信息，只把停用位摘掉，开关就该恢复正常。
                 // 没有这一条，"开关打不开"就无法证明是**因为停用**，而不是因为别的原因。
                 control = new FeatureCard();
-                power.UnavailableReason = "";
-                control.Bind(power);
+                stoppedFeature.UnavailableReason = "";
+                control.Bind(stoppedFeature);
                 Check("对照组：摘掉停用位后开关恢复可操作（证明上面确实是停用挡住的）",
-                    !control.Toggle.ReadOnly && power.IsUsable, "IsUsable=" + power.IsUsable);
+                    !control.Toggle.ReadOnly && stoppedFeature.IsUsable,
+                    "IsUsable=" + stoppedFeature.IsUsable);
             }
             catch (Exception ex)
             {
-                Check("刻意停用功能", false, ex.GetType().Name + ": " + ex.Message);
+                Check("刻意停用机制", false, ex.GetType().Name + ": " + ex.Message);
             }
             finally
             {

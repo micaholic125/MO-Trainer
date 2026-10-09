@@ -341,27 +341,30 @@ namespace MoTrainer.Ui
                 + "属于延迟性不一致 —— 具体会不会掉线，需要实测才敢下结论。\n"
                 + "单人战役 / 遭遇战打 AI：完全可靠。";
 
-            // 电力：**刻意停用**（原因与证据链见 `Cheats\FeatureAvailability.cs`）。
-            //
-            // 为什么不能只靠"未校准"这一条：`profile.json` 里 `powerOutput` 是**已校准**的
-            // （当年是"读数核对通过"定位到的），可真机实测证明那个位置只是**界面显示值** ——
-            // 只判 IsCalibrated 会一路放行，开关能点、玩家以为开了、实际毫无作用。
-            // 这正是 `CLAUDE.md` §4.2 点名禁止的失败模式，所以给它一个显式的停用位。
-            //
-            // 重新启用时要做两件事：① 删掉 `FeatureAvailability` 里那一条；
-            // ② 把下面的说明改回风险描述（原文见本文件 git 历史与 开发日志/2026-10-09.md）。
+            // 电力：**2026-10-09 定位成功并接线**（`PowerBoost`）。
+            // 产出值不在建筑身上，而在"同型号共用一份的说明书"里 —— 所以这条的代价必须写在明面上：
+            // 提升了某个型号的发电量，同一局里别人（含 AI）的同型号建筑也会一起变强。
+            // 这不是实现偷懒，是这条路绕不开的性质；藏起来才是坑人。
             CheatFeature power = _engine.Add(new CheatFeature(CheatId.PowerOutput, "电力",
-                "修改发电厂的产出，让电力够用。（正在换方案重做，暂不可用）", SynchRisk.Low, true));
-            power.MinValue = 0;
-            power.MaxValue = 100000;
+                "把你名下发电建筑的发电量改大，电力基本用不完。", SynchRisk.Low, true));
+            power.MinValue = 1;
+            power.MaxValue = 200000;
             power.TargetValue = _settings.GetValue(CheatId.PowerOutput, 30000);
-            power.UnavailableReason = FeatureAvailability.ReasonFor(CheatId.PowerOutput);
-            power.Detail = FeatureAvailability.DetailFor(CheatId.PowerOutput);
-            // 不恢复上次的开启状态，并把落盘的那一份也清掉：
-            // 旧版本可能把它存成"开"，而那时候它**是真会往游戏内存里写的**。
-            // 留着 true 只会让每次启动都走一遍"打开 → 被关掉"，白添噪音。
-            power.Enabled = false;
-            _settings.SetEnabled(CheatId.PowerOutput, false);
+            power.Enabled = _settings.GetEnabled(CheatId.PowerOutput);
+            power.Detail =
+                "做法：把**你名下**发电建筑对应的「型号说明书」里的发电量改大，"
+                + "让游戏自己算出更多的电。\n"
+                + "（不改界面上的数字 —— 那条路 2026-09-22 已被真机推翻：改了显示值，游戏照样判「电力不足」。）\n"
+                + "\n"
+                + "⚠ **代价（同型号共用说明书）**：说明书是同一型号所有建筑共用一份的，\n"
+                + "所以被你提升的型号，**同一局里别人（包括电脑）的同型号建筑也会一起变强**。\n"
+                + "执行时程序会数一遍有几个这样的型号，写进卡片状态行与日志。\n"
+                + "要避免这一点：用与你不同阵营的对手，或干脆用不同型号的电厂。\n"
+                + "\n"
+                + "什么时候需要先做点什么：程序靠「全对象名单」找你的建筑。\n"
+                + "若提示找不到名单，请先到「高级功能」页点一次「自动查找总名单」。\n"
+                + "\n"
+                + "关掉这个开关、或退出程序时，程序会把改动**逐个还原**。";
 
             CheatFeature invincible = _engine.Add(new CheatFeature(CheatId.SelectedInvincible, "选中单位无敌",
                 "框选单位后开启，让选中的单位血量持续保持满血。", SynchRisk.High, true));
