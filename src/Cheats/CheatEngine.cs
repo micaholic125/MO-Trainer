@@ -416,6 +416,22 @@ namespace MoTrainer.Cheats
                 _target.Memory, _target.ModuleBase, _target.ModuleSize,
                 walk.Objects, money, feature.TargetValue);
 
+            // 认不出"我方"时，**重读一次金钱再试一遍**。
+            //
+            // 真机日志（2026-10-09 16:56:53）抓到过一次瞬时失败：判据是"某个阵营的金钱 == 我此刻的金钱"，
+            // 而这两次读不是同一瞬间 —— 玩家正在花钱/进账时就会对不上，一拍之后自己又好了。
+            // 那种失败虽然是 fail-closed（一个字节都没写），但会让功能断断续续，所以补一次重试。
+            if (result.AnchorMiss)
+            {
+                uint retryMoney;
+                if (_selection.TryReadMoney(_profile, out retryMoney) && retryMoney != money)
+                {
+                    result = _powerBoost.Apply(
+                        _target.Memory, _target.ModuleBase, _target.ModuleSize,
+                        walk.Objects, retryMoney, feature.TargetValue);
+                }
+            }
+
             if (result.Error.Length > 0)
             {
                 feature.LastError = result.Error;

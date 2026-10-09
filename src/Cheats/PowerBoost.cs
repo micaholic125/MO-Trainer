@@ -25,6 +25,16 @@ namespace MoTrainer.Cheats
         /// <summary>非空 = 本次什么都没改，这句话是**给玩家看的原因**。</summary>
         public string Error = "";
 
+        /// <summary>
+        /// 失败原因属于"**这一帧对不上、下一帧多半就好了**"那一类（认不出哪个阵营是我）。
+        ///
+        /// 为什么要单独标出来：判据是"某个阵营的金钱 == 我此刻的金钱"，而这两次读**不是同一瞬间**——
+        /// 玩家正在花钱/进账时就会对不上。真机日志 2026-10-09 16:56:53 抓到过一次，一拍之后自己恢复。
+        /// 这种失败是 fail-closed（一个字节都没写），但会让功能断断续续，所以调用方据此**重读金钱再试一次**。
+        /// 用布尔量而不是去匹配错误文本 —— 文本改一个字就失效了。
+        /// </summary>
+        public bool AnchorMiss;
+
         /// <summary>给日志/界面看的简短结论；空串表示"这一拍什么都没发生"。</summary>
         public string Note = "";
     }
@@ -168,6 +178,7 @@ namespace MoTrainer.Cheats
 
             if (matches == 0)
             {
+                result.AnchorMiss = true;
                 result.Error = "认不出「哪些建筑是我的」（名单里没有任何阵营的金钱与当前金钱相符）——"
                     + "已拒绝执行，一个字节都没写。请确认金钱仍处于已校准状态，并重新点一次「自动查找总名单」";
                 return result;
@@ -224,13 +235,21 @@ namespace MoTrainer.Cheats
                 if (!memory.ReadUInt32(typeAddress + TypePowerOffset, out current)) { continue; }
                 if (current == 0) { continue; }          // 不发电的型号，不碰
 
+                // 原值**只记一次**，之后一直用它还原。
+                //
+                // 这里曾经多写了一句 `if (original != current) { original = current; ... }`，
+                // 本意是"值被外部改动过就重新同步"——**方向恰好写反了**：
+                // 我们自己写进去目标值之后，下一拍 current 就等于目标值、必然与记录的原值不同，
+                // 于是**每跑一拍就把原值覆盖成目标值**，还原功能在第二拍就废了。
+                // 真机日志抓到了它：第一拍 `60→30000`（原值对），第二拍变成 `30000→30000`，
+                // 关功能时 `还原 0 个`。**这就是"看起来做了、其实没做"的典型形态。**
+                // 教训：记账这种东西，**写下之后就不该再被任何一拍修改**。
                 uint original;
                 if (!_originals.TryGetValue(typeAddress, out original))
                 {
-                    _originals[typeAddress] = current;    // 先记原值，再动手
                     original = current;
+                    _originals[typeAddress] = original;   // 只记一次
                 }
-                if (original != current) { original = current; _originals[typeAddress] = current; }
 
                 result.Types++;
                 result.Buildings += count;

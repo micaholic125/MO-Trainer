@@ -1405,10 +1405,25 @@ namespace MoTrainer.Diagnostics
                     + "（我方那座建筑的说明书指针被故意指向模块，必须被这道确认挡下）");
 
                 // ---- 还原：关掉开关必须把说明书改回去 ----
+                //
+                // **必须"多跑几拍"再还原** —— 这是真机日志（2026-10-09 16:56）打脸打出来的：
+                // 当时只测了"跑一拍就还原"，而真实引擎是**每秒跑一拍**；
+                // 结果第二拍就把记录的原值覆盖成了目标值，关功能时"还原 0 个"，游戏一直带着被放大的发电量。
+                // 所以这里连跑三拍，再还原。
+                PowerBoostResult again = boost.Apply(io, moduleBase, moduleSize, list, MyMoney, Target);
+                PowerBoostResult third = boost.Apply(io, moduleBase, moduleSize, list, MyMoney, Target);
+                // 判据是**结论里记着的原值**（`150→5000`），不是"字段现在等于目标值" ——
+                // 后者在有 bug 时照样成立，等于没验（这条断言的名字原先把话说大了，已改正）。
+                Check("电力：反复执行多拍，记账里的「原值」仍然是最初那个",
+                    again.Error.Length == 0 && third.Error.Length == 0
+                    && third.Note.IndexOf("150→5000", StringComparison.Ordinal) >= 0,
+                    "第三拍的结论：" + third.Note + "（原值应始终是 150，不能被覆盖成 5000）");
+
                 int restored = boost.Restore(io);
-                Check("电力：关闭时把改过的型号**逐个还原**",
+                Check("电力：跑了多拍之后关闭，仍能把型号**还原到真正的原值**",
                     restored == 1 && io.ReadUInt32Or(myType150 + PowerBoost.TypePowerOffset, 0) == 150,
-                    "还原 " + restored + " 个｜现值 " + io.ReadUInt32Or(myType150 + PowerBoost.TypePowerOffset, 0));
+                    "还原 " + restored + " 个｜现值 " + io.ReadUInt32Or(myType150 + PowerBoost.TypePowerOffset, 0)
+                    + "（应为 150 = 最初的发电量，不是 5000）");
 
                 Check("电力：还原之后不再记账（不会重复回写）", !boost.HasChanges, "ok");
 
