@@ -86,6 +86,7 @@ namespace MoTrainer.Diagnostics
             CheckTrainerSettings();
             CheckCheatEngine();
             CheckFeatureCardInteraction();
+            CheckUnavailableFeature();
 
             Section("10. 单位校准（S5 模块）");
             CheckStaticAddressLocator();
@@ -134,6 +135,9 @@ namespace MoTrainer.Diagnostics
             // 所以必须在没有游戏的情况下先证明它整条链路都通。
             Section("13. 一键采集（校准辅助）");
             CheckHarvestSession();
+
+            Section("14. 自动巡检（找类型对象 · 主链反查）");
+            CheckAutoInspection();
 
             Write("");
             Write("=================================================");
@@ -1077,9 +1081,189 @@ namespace MoTrainer.Diagnostics
             public string DescribeEnvironment() { return "合成环境（自检）"; }
         }
 
-        private static void CheckPointerScanner()
+        /// <summary>
+        /// 「自动巡检」的自检（2026-10-09 新增）。
+        ///
+        /// 为什么必须在这里先证明它是对的：这一整套东西的产出是**一份报告**，
+        /// 而报告是拿去离线分析、进而**改真机地址**的依据。它要是悄悄算错了，
+        /// 后果不是"这次没采到"，而是"我照着错的结论把地址固化下来"——
+        /// 那正是 `CLAUDE.md` 7.3 里"没有任何线索却把最像的候选存进配置"那一类事故。
+        ///
+        /// 场景刻意做成"真机该有的样子"：
+        ///   · 6 个同类型表对象，其中 +0x0E4 是**共用的类型对象指针**、+0xF0 是**共用的阵营指针**、
+        ///     +0x10 是**各自不同**的指针（按对象，不是按类型）；
+        ///   · 类型对象里放一个建造 ID 字符串（GAPOWR），阵营对象在金钱偏移处放你的金钱。
+        /// 期望：认出 +0x0E4 并给出 ID 字符串；把 +0xF0 标成"像房子"排除；
+        ///       偏移 0（类型表本身）与 +0x10（按对象）都不该出现在候选里。
+        /// </summary>
+        private static void CheckAutoInspection()
         {
             SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady)
+            {
+                Check("自动巡检", false, "OpenProcess 失败");
+                return;
+            }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("自动巡检测试内存块", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("自动巡检", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = TestBlockSize;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                const uint TypeOffset = 0x0E4;      // 该被认出来的那个
+                const uint OwnerOffset = 0xF0;      // 应该被"像房子"排除掉
+                const uint PerObjectOffset = 0x10;  // 按对象，不该出现在候选里
+                const uint MoneyOffset = 0x30C;
+
+                uint vtable = moduleBase + 0x2000;          // 类型表（偏移 0），必须被跳过
+                uint typeObject = heap + 0x9000;            // "说明书"：同型号共用一份
+                uint idString = heap + 0x9400;
+                uint house = heap + 0xA000;                 // 阵营房子
+                const uint MyMoney = 5000;
+
+                // 对象之间刻意隔开 0x1000：否则各自的 0x800 头部窗口会互相重叠，
+                // 读到的"共用值"其实来自邻居 —— 那是场景没搭好，不是被测代码有问题。
+                uint[] objects = new uint[6];
+                for (int i = 0; i < objects.Length; i++)
+                {
+                    objects[i] = heap + 0x2000 + (uint)(i * 0x1000);
+                    io.WriteUInt32(objects[i], vtable);
+                    io.WriteUInt32(objects[i] + TypeOffset, typeObject);      // 共用的"说明书"
+                    io.WriteUInt32(objects[i] + OwnerOffset, house);          // 共用的"阵营"
+                    io.WriteUInt32(objects[i] + PerObjectOffset, heap + 0xC000 + (uint)(i * 0x10)); // 各自不同
+                }
+
+                // 类型对象：里面有一个指向建造 ID 字符串的指针
+                io.WriteUInt32(typeObject + 0x10, idString);
+                byte[] name = Encoding.ASCII.GetBytes("GAPOWR\0");
+                io.Write(idString, name, 0, name.Length);
+
+                // 阵营房子：金钱偏移处正好是"你的金钱" —— 这就是把阵营指针认出来的判据
+                io.WriteUInt32(house + MoneyOffset, MyMoney);
+
+                List<HarvestObjectRow> roster = new List<HarvestObjectRow>();
+                for (int i = 0; i < objects.Length; i++)
+                {
+                    HarvestObjectRow row = new HarvestObjectRow();
+                    row.Address = objects[i];
+                    row.VTable = vtable;
+                    roster.Add(row);
+                }
+
+                TypePointerAnalysis analysis = AutoInspection.FindTypePointers(
+                    io, moduleBase, moduleSize, roster, MoneyOffset, MyMoney);
+
+                Check("自动巡检：统计到了对象（没把名单读空）",
+                    analysis.Groups == 1 && analysis.MembersScanned == objects.Length,
+                    analysis.Groups + " 组 / " + analysis.MembersScanned + " 个对象");
+
+                TypePointerHit type = null;
+                TypePointerHit owner = null;
+                bool sawOffset0 = false;
+                bool sawPerObject = false;
+                for (int i = 0; i < analysis.Hits.Count; i++)
+                {
+                    if (analysis.Hits[i].Offset == TypeOffset) { type = analysis.Hits[i]; }
+                    if (analysis.Hits[i].Offset == OwnerOffset) { owner = analysis.Hits[i]; }
+                    if (analysis.Hits[i].Offset == 0) { sawOffset0 = true; }
+                    if (analysis.Hits[i].Offset == PerObjectOffset) { sawPerObject = true; }
+                }
+
+                Check("自动巡检：认出「多个对象共用同一取值」的字段（+0x0E4）",
+                    type != null, type == null ? "没找到" : "找到");
+                Check("自动巡检：在候选里找到了建造 ID 字符串（GAPOWR）",
+                    type != null && type.IdString == "GAPOWR",
+                    type == null ? "—" : "「" + type.IdString + "」");
+                Check("自动巡检：把「阵营指针」认出来并标注为像房子（不能当类型对象）",
+                    owner != null && owner.LooksLikeHouse,
+                    owner == null ? "没找到 +0xF0" : "像房子=" + owner.LooksLikeHouse);
+
+                // 偏移 0 是类型表本身：它同样"同类相同"，但它是**假阳性**，
+                // 不排掉就会排在候选第一位，把人引到完全错误的结论上去。
+                Check("自动巡检：偏移 0（类型表本身）没有混进候选",
+                    !sawOffset0, sawOffset0 ? "混进来了" : "已排除");
+
+                // 每个对象各不相同的指针 = 按对象的东西，不是按类型
+                Check("自动巡检：按对象的指针（各自不同）没有混进候选",
+                    !sawPerObject, sawPerObject ? "混进来了" : "已排除");
+
+                Check("自动巡检：结论指向正确的那个字段（+0x0E4）",
+                    analysis.Best != null && analysis.Best.Offset == TypeOffset,
+                    analysis.Best == null ? "没有结论"
+                        : "结论 +0x" + analysis.Best.Offset.ToString("X", CultureInfo.InvariantCulture));
+
+                string text = AutoInspection.FormatTypePointers(analysis, true);
+                Check("自动巡检：报告段落写得出结论（含字段偏移与 ID）",
+                    text.IndexOf("结论：") >= 0 && text.IndexOf("GAPOWR") >= 0,
+                    "段落 " + text.Length + " 字符");
+
+                // 名单读空时必须**说得出为什么**，不能悄悄给一份空分析
+                TypePointerAnalysis empty = AutoInspection.FindTypePointers(
+                    io, moduleBase, moduleSize, new List<HarvestObjectRow>(), MoneyOffset, MyMoney);
+                Check("自动巡检：名单为空时如实说明（不静默给空结果）",
+                    empty.Note.Length > 0 && empty.Hits.Count == 0, empty.Note);
+
+                // ---- 主链反查（[S3]）----
+                // 真链路：在内存里造一条"静态根 → 中转 → 房子"的指针链，
+                // 让反查必须能把它找出来。只断言"不报错"是不够的 ——
+                // 那样把扫描整个删掉也照样绿。
+                uint hop = heap + 0x8000;
+                io.WriteUInt32(hop + 0x8, house);              // 中转 +0x8 → 房子
+                io.WriteUInt32(moduleBase + 0x100, hop);       // 静态根 → 中转
+
+                List<MemoryRegion> regions = new List<MemoryRegion>();
+                regions.Add(MakeRegion(moduleBase, TestBlockSize));
+                regions.Add(MakeRegion(heap, TestBlockSize));
+                SyntheticTarget target = new SyntheticTarget(io, moduleBase, moduleSize, regions, regions);
+
+                CalibrationProfile moneyProfile = new CalibrationProfile();
+                moneyProfile.Money.SetOffsets(new uint[] { 0x100, 0x8, MoneyOffset });
+
+                string refit = AutoInspection.RefitMainChain(target, moneyProfile, 5);
+                Check("自动巡检：主链反查能从真实房子地址反推出静态根",
+                    refit.IndexOf("反查成功", StringComparison.Ordinal) >= 0
+                        && refit.IndexOf(
+                            "0x" + house.ToString("X8", CultureInfo.InvariantCulture),
+                            StringComparison.Ordinal) >= 0,
+                    refit.Replace("\n", " ").Replace("\r", ""));
+
+                // 缺前置时必须说得出缺什么，不能悄悄返回一段空话
+                string noMoney = AutoInspection.RefitMainChain(target, new CalibrationProfile(), 5);
+                Check("自动巡检：金钱未校准时主链反查如实说明（不静默什么都不做）",
+                    noMoney.IndexOf("无法反查", StringComparison.Ordinal) >= 0,
+                    noMoney.Replace("\n", " ").Replace("\r", ""));
+            }
+            catch (Exception ex)
+            {
+                Check("自动巡检", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
+            }
+        }
+
+        private static void CheckPointerScanner()
+        {            SelfHandle self = SelfHandle.Create();
             if (self == null || !self.IsReady)
             {
                 Check("指针回溯", false, "OpenProcess 失败");
@@ -1295,6 +1479,41 @@ namespace MoTrainer.Diagnostics
                 Check("引擎登记了全部功能项", engine.Features.Count == 3,
                     engine.Features.Count + " 项");
 
+                // ---- 刻意停用（2026-10-09）：**校准数据齐全也不许碰内存** ----
+                //
+                // 电力就是这种形态：`profile.json` 里是"已校准"（当年读数核对通过），
+                // 真机实测却证明那个位置只是界面显示值。只判 IsCalibrated 的写法
+                // 会一路放行到写入 —— 所以这里给它一份**完全合法**的定位信息，
+                // 只把停用位挂上，验证引擎确实一个字节都不写。
+                uint disabledAddress = houseAddress + 0x60;
+                io.WriteUInt32(disabledAddress, 4242);
+
+                CalibrationProfile disabledProfile = new CalibrationProfile();
+                disabledProfile.PowerOutput.SetOffsets(new uint[] { 0x100, 0x60 });
+
+                CheatEngine disabledEngine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature disabled = disabledEngine.Add(new CheatFeature(
+                    CheatId.PowerOutput, "停用项", "测试用", SynchRisk.Low, true));
+                disabled.TargetValue = 999;
+                disabled.Enabled = true;                      // 故意先开启，验证绑定时的兜底
+                disabled.UnavailableReason = FeatureAvailability.ReasonFor(CheatId.PowerOutput);
+                disabledEngine.BindProfile(disabledProfile);
+
+                Check("刻意停用的功能在绑定时被自动关闭（即使它是「已校准」的）",
+                    !disabled.Enabled && disabled.IsCalibrated,
+                    "Enabled=" + disabled.Enabled + "｜IsCalibrated=" + disabled.IsCalibrated);
+
+                // 再强行打开一次：模拟"有人绕过界面、直接改标志"或"旧配置里存着开启状态"
+                disabled.Enabled = true;
+                disabledEngine.Start();
+                Thread.Sleep(250);
+                disabledEngine.Stop();
+
+                Check("刻意停用的功能即使被强行打开，也一个字节都不写",
+                    io.ReadUInt32Or(disabledAddress, 0) == 4242 && disabled.WriteCount == 0,
+                    "当前 " + io.ReadUInt32Or(disabledAddress, 0)
+                    + "（期望 4242）｜写入 " + disabled.WriteCount + " 次");
+
                 // 无敌的必要条件里不再有"满血值"。
                 // 满血值因单位类型而异（动员兵 125、坦克几百），拿某个单位的满血值去锁别的单位，
                 // 会被"绝不往下压"的安全判断全部跳过 —— 表现为"开了无敌完全没用"。
@@ -1430,6 +1649,115 @@ namespace MoTrainer.Diagnostics
             {
                 card.Dispose();
                 uncalibratedCard.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// 「刻意停用」的功能必须**处处都点不动**（2026-10-09 新增）。
+        ///
+        /// 背景：电力原来的做法（锁游戏界面的显示值）被真机实测推翻，可 `profile.json` 里
+        /// 它仍然是"已校准"的 —— 于是 `IsCalibrated` 这一条**根本拦不住它**：
+        /// 开关照旧能打开、引擎照旧往那块内存里写。这正是 `CLAUDE.md` §4.2 点名禁止的
+        /// "开关能点、实际没用"（而且比"没用"更糟：它真的在改内存）。
+        ///
+        /// 这里钉死三件事：
+        ///   ① 电力**确实**被声明为停用（依据是 `FeatureAvailability`，不是某处一句界面文案）；
+        ///   ② 卡片上写明原因、开关点不动；
+        ///   ③ 别的功能没有被误伤。
+        /// 引擎层"一个字节都不写"在 `CheckCheatEngine` 里单独验。
+        /// </summary>
+        private static void CheckUnavailableFeature()
+        {
+            FeatureCard card = null;
+            FeatureCard control = null;
+            try
+            {
+                string reason = FeatureAvailability.ReasonFor(CheatId.PowerOutput);
+                Check("电力被显式声明为「暂不可用」（依据是代码里的声明，不是界面文案）",
+                    reason.Length > 0, "原因：" + reason);
+
+                // 状态行只有一行位置：太长会被卡片底边压掉。
+                // 布局这类事一律用数字量，别靠看（CLAUDE.md 7.2）。
+                Check("停用原因足够短、放得进卡片状态行",
+                    reason.Length <= 40, reason.Length + " 字");
+
+                int wrongly = 0;
+                CheatId[] all = (CheatId[])Enum.GetValues(typeof(CheatId));
+                for (int i = 0; i < all.Length; i++)
+                {
+                    if (all[i] == CheatId.PowerOutput) { continue; }
+                    if (FeatureAvailability.ReasonFor(all[i]).Length > 0) { wrongly++; }
+                }
+                Check("其它功能没有被误标为停用", wrongly == 0, "误标 " + wrongly + " 项");
+
+                // 卡片：**故意给它一份完整合法的定位信息**，模拟电力现在的真实处境
+                //（校准数据看着是好的）。若哪天有人把"停用"判断挪到"未校准"后面，
+                // 这条会立刻转红 —— 那正是本轮要防的回归。
+                CheatFeature power = new CheatFeature(
+                    CheatId.PowerOutput, "电力", "测试用", SynchRisk.Low, true);
+                power.TargetValue = 30000;
+                power.Locator = new FieldLocator();
+                power.Locator.SetOffsets(new uint[] { 0x100, 0x53A4 });
+                power.UnavailableReason = reason;
+
+                Check("（前提）被停用的功能确实是「已校准」状态 —— 否则这条断言测不到东西",
+                    power.IsCalibrated && !power.IsUsable,
+                    "IsCalibrated=" + power.IsCalibrated + "｜IsUsable=" + power.IsUsable);
+
+                card = new FeatureCard();
+                card.Bind(power);
+                Check("已校准但被停用的功能：开关置灰",
+                    card.Toggle.ReadOnly && !card.Toggle.Checked, "ok");
+
+                card.Toggle.Toggle();
+                Check("已校准但被停用的功能：点了也开不起来",
+                    !card.Toggle.Checked && !card.DesiredEnabled,
+                    "Checked=" + card.Toggle.Checked + "｜意图=" + card.DesiredEnabled);
+
+                // 状态行必须**说得出原因**。只断言"开关点不动"是不够的 ——
+                // 玩家看到灰开关却不知道下一步该干什么，一样是白搭。
+                Check("停用功能的状态行写明了原因（不是一句空话）",
+                    card.StatusText.IndexOf("暂不可用") >= 0
+                    && card.StatusText.IndexOf(reason) >= 0,
+                    card.StatusText);
+
+                // 顺序回归：一个功能"又被停用、又没校准"时，必须先说"暂不可用"。
+                // 说成"尚未校准"，玩家会跑到校准页反复折腾一个根本修不好的东西。
+                // （这条是改坏验证逼出来的：原来只测"已校准+停用"，把停用分支挪到
+                //   未校准分支之后照样全绿 —— 因为那时前一个分支根本不会命中。）
+                FeatureCard bothCard = new FeatureCard();
+                try
+                {
+                    CheatFeature both = new CheatFeature(
+                        CheatId.PowerOutput, "又停用又未校准", "测试用", SynchRisk.Low, true);
+                    both.UnavailableReason = reason;
+                    bothCard.Bind(both);
+                    Check("「又停用、又没校准」时，状态行说的是停用（而不是让人白跑一趟校准）",
+                        bothCard.StatusText.IndexOf("暂不可用") >= 0
+                        && bothCard.StatusText.IndexOf("尚未校准") < 0,
+                        bothCard.StatusText);
+                }
+                finally
+                {
+                    bothCard.Dispose();
+                }
+
+                // 对照组：同一份定位信息，只把停用位摘掉，开关就该恢复正常。
+                // 没有这一条，"开关打不开"就无法证明是**因为停用**，而不是因为别的原因。
+                control = new FeatureCard();
+                power.UnavailableReason = "";
+                control.Bind(power);
+                Check("对照组：摘掉停用位后开关恢复可操作（证明上面确实是停用挡住的）",
+                    !control.Toggle.ReadOnly && power.IsUsable, "IsUsable=" + power.IsUsable);
+            }
+            catch (Exception ex)
+            {
+                Check("刻意停用功能", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (card != null) { card.Dispose(); }
+                if (control != null) { control.Dispose(); }
             }
         }
 
@@ -4223,6 +4551,47 @@ namespace MoTrainer.Diagnostics
 
                 int taken = session.SampleCount;
                 int tracked = session.TrackedCount;
+
+                // ---- 新出现的对象自动跟踪（瞬间建造用）----
+                // 往名单里加一个"采集期间才造出来的"对象：用户**没有选中它**，
+                // 程序应当自己发现它、等它活过观察期、然后开始跟踪它的字段变化。
+                // 这正是"造东西时不必先选中它"那条自动化。
+                uint newborn = heap + 0x8000;
+                io.WriteUInt32(newborn, vtable);
+                io.WriteUInt32(newborn + OwnerOffset, owner);
+                io.WriteUInt32(newborn + HealthOffset, 100);
+                io.WriteUInt32(rosterArray + 12, newborn);      // 名单第 4 项
+
+                WaitUntil(delegate { return session.NewTrackedCount > 0; }, 6000);
+
+                Check("一键采集：采集期间新造出来的对象会被自动跟踪（不必先选中它）",
+                    session.NewTrackedCount == 1,
+                    "新跟踪 " + session.NewTrackedCount + " 个｜已采 " + session.SampleCount + " 次");
+                Check("一键采集：它确实进了跟踪集合（不只是记了个数）",
+                    session.TrackedCount == tracked + 1,
+                    "跟踪数 " + tracked + " → " + session.TrackedCount);
+
+                // ---- 负面用例：短命对象不许占跟踪名额 ----
+                // 战场上每秒都有大量子弹/碎片/动画冒出来、转眼就没了。
+                // 若"一出现就跟踪"，跟踪名额（MaxTracked）会被它们瞬间占满，
+                // 真正要看的"正在造的那座建筑"一个都进不来 —— 那样这功能就白做了。
+                uint mayfly = heap + 0x8800;
+                io.WriteUInt32(mayfly, vtable);
+                io.WriteUInt32(mayfly + OwnerOffset, owner);
+                io.WriteUInt32(mayfly + HealthOffset, 100);
+                io.WriteUInt32(rosterArray + 16, mayfly);       // 名单第 5 项，冒个头
+
+                int beforeMayfly = session.SampleCount;
+                WaitUntil(delegate { return session.SampleCount > beforeMayfly; }, 3000);   // 让它被看见一次
+                io.WriteUInt32(rosterArray + 16, 0);            // 下一拍就"死"了
+
+                int afterMayfly = session.SampleCount;
+                WaitUntil(delegate { return session.SampleCount > afterMayfly + 3; }, 6000);
+
+                Check("一键采集：只冒一下就没的对象不会占跟踪名额（子弹/碎片要挡掉）",
+                    session.NewTrackedCount == 1,
+                    "新跟踪 " + session.NewTrackedCount + " 个（应为 1 —— 只有那个新造的建筑）");
+
                 reportPath = session.Stop();
 
                 Check("一键采集：采样按时钟持续推进", taken >= 3, taken + " 次");
@@ -4240,6 +4609,10 @@ namespace MoTrainer.Diagnostics
                         && text.IndexOf("二、被跟踪对象", StringComparison.Ordinal) >= 0
                         && text.IndexOf("三、全对象名单", StringComparison.Ordinal) >= 0,
                     text.Length + " 字符");
+
+                Check("一键采集：报告里标出了「采集期间新造出来的」那个对象",
+                    text.IndexOf("采集期间新造出来的", StringComparison.Ordinal) >= 0,
+                    "已标注");
 
                 // 核心断言：血量 100 → 87 这次改动必须被记下来。
                 // 用完整的一对值来匹配，避免"恰好命中文档里的偏移对照表"这种假通过。

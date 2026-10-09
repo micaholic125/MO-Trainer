@@ -32,6 +32,10 @@ namespace MoTrainer.Calibration
         public int ObjectCount;
         public int WalkSkipped;
         public readonly List<string> OwnerGroups = new List<string>();
+
+        /// <summary>本拍**新出现**的对象（采集期间才被造出来的）—— 会自动进入跟踪集合。</summary>
+        public readonly List<uint> NewObjects = new List<uint>();
+
         public string Note = "";
     }
 
@@ -46,6 +50,15 @@ namespace MoTrainer.Calibration
         public int DiedAt = -1;
         public readonly List<int> SelectedAt = new List<int>();
         public readonly List<string> Changes = new List<string>();
+
+        /// <summary>
+        /// 是不是"采集期间新造出来的"（而不是开局就在场上的，也不是用户选中的）。
+        ///
+        /// 这是"瞬间建造"要用的一类数据：用户造东西时**不必先选中它**，
+        /// 程序自己盯着新出现的对象看它每一秒的字节变化 —— 建造进度就该在里面。
+        /// 见 `TrackNewObjects`。
+        /// </summary>
+        public bool NewlyAppeared;
 
         /// <summary>上一次采样的完整字节镜像（按 uint 存），用来求差。</summary>
         internal uint[] Last;
@@ -83,6 +96,18 @@ namespace MoTrainer.Calibration
         /// <summary>对象数量字段未校准时，按这个上限探测（与高级页口径一致）。</summary>
         private const uint ProbeObjectCount = 4096;
 
+        /// <summary>
+        /// "新出现的对象"要连续存活这么多拍才真正开始跟踪。
+        ///
+        /// 为什么必须有个观察期：战场上每秒都有大量**短命对象**冒出来（子弹、碎片、动画），
+        /// 它们同样会出现在对象名单里。若"一出现就跟踪"，跟踪名额会被这些东西瞬间占满，
+        /// 真正要看的"正在造的那座建筑"反而一个都进不来。多活几秒的才值得跟。
+        /// </summary>
+        private const int NewObjectMinAge = 3;
+
+        /// <summary>新对象跟踪单独占用的名额上限（其余名额留给"被选中的对象"）。</summary>
+        public const int MaxNewTracked = 24;
+
         /// <summary>采样的最短/最长间隔与最长时长，防止界面传入离谱的值。</summary>
         public const int MinIntervalMs = 200;
         public const int MaxIntervalMs = 5000;
@@ -103,6 +128,20 @@ namespace MoTrainer.Calibration
         private readonly ManualResetEvent _stop = new ManualResetEvent(false);
 
         private List<HarvestObjectRow> _lastRoster = new List<HarvestObjectRow>();
+
+        // ---- "新出现的对象"跟踪（瞬间建造用）----
+        /// <summary>已经见过的对象地址（用来判断"新出现"）。只增不减，见 TrackNewObjects 的注释。</summary>
+        private readonly HashSet<uint> _knownObjects = new HashSet<uint>();
+        /// <summary>刚出现、还在观察期的对象：地址 → 已经活了几拍。</summary>
+        private readonly Dictionary<uint, int> _newborn = new Dictionary<uint, int>();
+        private readonly Dictionary<uint, uint> _newbornVtable = new Dictionary<uint, uint>();
+        private int _newTracked;
+        private bool _rosterEverRead;
+
+        /// <summary>自动巡检算出来的报告段落（在采样线程里算好，报告落盘时直接接上去）。</summary>
+        private string _inspectionText = "";
+        private bool _finalizing;
+
         private uint _rosterSlot;
         private uint _rosterArray;
         private uint _rosterFirstArray;
@@ -138,6 +177,17 @@ namespace MoTrainer.Calibration
         public int TrackedCount { get { lock (_lock) { return _tracked.Count; } } }
         public string ReportPath { get { return _reportPath; } }
         public int PlannedSeconds { get { return _plannedSeconds; } }
+
+        /// <summary>
+        /// 采样已经结束、正在做收尾（自动巡检 + 写报告）。
+        ///
+        /// 界面靠它区分"还在采"和"在收尾"：收尾要跑一次全内存反查，可能要十几秒，
+        /// 这段时间里 `IsRunning` 仍然是 true（线程还活着），不区分的话用户会以为卡住了。
+        /// </summary>
+        public bool IsFinalizing { get { return _finalizing; } }
+
+        /// <summary>本次采集期间**新出现**（不是开局就有的）的对象个数 —— 界面与报告都要能说出来。</summary>
+        public int NewTrackedCount { get { lock (_lock) { return _newTracked; } } }
 
         public double ElapsedSeconds
         {
@@ -180,6 +230,13 @@ namespace MoTrainer.Calibration
                 _tracked.Clear();
                 _byAddress.Clear();
                 _lastRoster = new List<HarvestObjectRow>();
+                _knownObjects.Clear();
+                _newborn.Clear();
+                _newbornVtable.Clear();
+                _newTracked = 0;
+                _rosterEverRead = false;
+                _inspectionText = "";
+                _finalizing = false;
                 _rosterSlot = 0;
                 _rosterArray = 0;
                 _rosterFirstArray = 0;
@@ -203,20 +260,29 @@ namespace MoTrainer.Calibration
             return "";
         }
 
-        /// <summary>停止采集并把报告落盘。返回报告路径（失败时返回空串，原因写进日志）。</summary>
+        /// <summary>停止采集并返回报告路径；**报告还没写完时返回空串**（见下方注释）。</summary>
         public string Stop()
         {
             if (!IsRunning && SampleCount == 0) { return ""; }
 
+            bool wasRunning = IsRunning;
             _stop.Set();
-            Thread t = _thread;
-            if (t != null) { t.Join(5000); }
 
-            string path = WriteReport();
-            Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
-                "采集结束：{0} 次采样，跟踪 {1} 个对象，报告 {2}",
-                SampleCount, TrackedCount, path.Length > 0 ? path : "（写入失败）"));
-            return path;
+            Thread t = _thread;
+            if (t != null) { t.Join(8000); }   // 采样循环每轮只睡一个间隔，会立刻退出来
+
+            // 报告现在**由采样线程自己写**（见 Loop 的注释）。
+            // 为什么不在这里等：收尾要先跑「自动巡检」，其中主链反查要全内存扫十几秒，
+            // 在这里 Join 住就把界面冻住了。所以等不到就返回空串，
+            // 由界面按 `IsRunning` 继续轮询 —— 线程一结束，报告就一定已经落盘了。
+            if (wasRunning)
+            {
+                Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
+                    "采集结束：{0} 次采样，跟踪 {1} 个对象（其中新出现 {2} 个），报告 {3}",
+                    SampleCount, TrackedCount, NewTrackedCount,
+                    _reportPath.Length > 0 ? _reportPath : "（正在收尾，稍后自动落盘）"));
+            }
+            return _reportPath;
         }
 
         // ============================================================ 采样
@@ -237,6 +303,65 @@ namespace MoTrainer.Calibration
                     Logger.Error("Harvest", "单次采样异常", ex);
                 }
             }
+
+            // ---- 收尾：自动巡检 + 写报告 ----
+            //
+            // 这两件事都放在采样线程里做，而不是让 Stop() 去干：
+            // 自动巡检里有一次**全内存反查指针链**（可能要十几秒），放到界面上等就是界面假死。
+            // 放在这里，界面该怎么转还怎么转，只是按钮上多显示一句"正在收尾"。
+            _finalizing = true;
+
+            // 先落一版**不含巡检**的报告。
+            // 为什么值得写两遍：收尾里那次全内存反查要十几秒，用户完全可能在这期间
+            // 把修改器关掉 —— 只写一次的话，这一局的采集数据就整个没了。
+            // 先落一版，最坏情况也只是少最后两节。
+            WriteReport(false);
+
+            try
+            {
+                RunInspection();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Harvest", "自动巡检出错（报告照常出，只是少一段）", ex);
+                _inspectionText = "（自动巡检出错：" + ex.Message + " —— 本次报告缺这一段）\n\n";
+            }
+            finally
+            {
+                _finalizing = false;
+            }
+
+            // 收尾完成，把带巡检的那一版覆盖上去（写进日志的只有这一次，免得日志翻倍）
+            WriteReport(true);
+        }
+
+        /// <summary>
+        /// 自动巡检：把"本来要用户再开一局、再点几次"的几项一次算完（见 `AutoInspection`）。
+        /// 纯只读，不写游戏内存。
+        /// </summary>
+        private void RunInspection()
+        {
+            List<HarvestObjectRow> roster;
+            uint myMoney;
+            lock (_lock) { roster = new List<HarvestObjectRow>(_lastRoster); }
+
+            myMoney = ResolveAndRead(_target.Memory, _target.ModuleBase, _profile.Money);
+
+            Logger.Info("Harvest", "自动巡检开始：找类型对象 + 主链反查（只读）");
+            DateTime started = DateTime.UtcNow;
+
+            StringBuilder text = new StringBuilder();
+            TypePointerAnalysis analysis = AutoInspection.FindTypePointers(
+                _target.Memory, _target.ModuleBase, _target.ModuleSize,
+                roster, MoTrainer.Cheats.TechnoOwnership.HouseMoneyOffset, myMoney);
+            text.Append(AutoInspection.FormatTypePointers(analysis, roster.Count > 0));
+
+            // 主链反查是全内存扫描，给个上限（真机内存画像约 347 MB）
+            text.Append(AutoInspection.RefitMainChain(_target, _profile, 30));
+
+            _inspectionText = text.ToString();
+            Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
+                "自动巡检结束，耗时 {0:0.0} 秒", (DateTime.UtcNow - started).TotalSeconds));
         }
 
         private void TakeSample()
@@ -256,6 +381,9 @@ namespace MoTrainer.Calibration
             // 全对象名单：地址、类型表、阵营、血量（紧凑记录，只留关键字段）
             List<HarvestObjectRow> roster = ReadRoster(memory, moduleBase, moduleSize, sample);
             lock (_lock) { _lastRoster = roster; }
+
+            // 「新出现的对象」自动跟踪（瞬间建造用）：用户不必先选中它，程序自己盯
+            TrackNewObjects(roster, memory, sample);
 
             // 阵营分组（用来判断阵营偏移是否有效：有效的表现是"少数几个阵营、各自聚集大量单位"）
             if (_profile.OffsetTechnoOwner != 0 && roster.Count > 0)
@@ -376,8 +504,92 @@ namespace MoTrainer.Calibration
             }
         }
 
-        private void ReadSelection(MemoryIO memory, uint moduleBase, HarvestSample sample)
+        /// <summary>
+        /// 把"采集期间**新出现的**对象"自动收进跟踪集合 —— 这就是「瞬间建造」要的数据。
+        ///
+        /// 原来想看某个东西的字段变化，玩家必须**先在游戏里选中它**；造东西的时候
+        /// 根本没空去选中它（而且建造中的建筑常常选不中）。这一条把它变成全自动：
+        /// 只要你造了，它就自己进跟踪名单，每秒记一次字节变化。
+        ///
+        /// 两个刻意的设计：
+        ///   · **第一轮名单不算"新出现"**：开局本来就有几百个对象，全记下来等于没筛。
+        ///     开局已有的只登记进 `_knownObjects`，之后才冒出来的才算新。
+        ///   · **观察期**：新地址要先连续活过 <see cref="NewObjectMinAge"/> 拍才真正开始跟踪。
+        ///     战场上每秒都有大量短命对象（子弹、碎片、动画）冒出来，不筛的话
+        ///     跟踪名额会被它们瞬间占满，"正在造的那座建筑"一个都进不来。
+        /// </summary>
+        private void TrackNewObjects(List<HarvestObjectRow> roster, MemoryIO memory, HarvestSample sample)
         {
+            if (roster.Count == 0) { return; }
+
+            // 第一轮：只登记，不跟踪
+            if (!_rosterEverRead)
+            {
+                for (int i = 0; i < roster.Count; i++) { _knownObjects.Add(roster[i].Address); }
+                _rosterEverRead = true;
+                return;
+            }
+
+            HashSet<uint> current = new HashSet<uint>();
+            for (int i = 0; i < roster.Count; i++) { current.Add(roster[i].Address); }
+
+            // 第一遍：本次新冒出来的，进入观察期
+            for (int i = 0; i < roster.Count; i++)
+            {
+                uint address = roster[i].Address;
+                if (_knownObjects.Contains(address)) { continue; }
+                _knownObjects.Add(address);
+                _newborn[address] = 1;
+                _newbornVtable[address] = roster[i].VTable;
+            }
+
+            if (_newborn.Count == 0) { return; }
+
+            // 第二遍：给观察期里的对象计数。先取一份键的快照再改字典（遍历中不能改）。
+            List<uint> keys = new List<uint>(_newborn.Keys);
+            for (int i = 0; i < keys.Count; i++)
+            {
+                uint address = keys[i];
+
+                if (!current.Contains(address))
+                {
+                    // 观察期内就没了 —— 多半是子弹/碎片这类短命对象，丢掉
+                    _newborn.Remove(address);
+                    _newbornVtable.Remove(address);
+                    continue;
+                }
+
+                int age = _newborn[address] + 1;
+                if (age < NewObjectMinAge) { _newborn[address] = age; continue; }
+
+                uint vtable = 0;
+                _newbornVtable.TryGetValue(address, out vtable);
+                _newborn.Remove(address);
+                _newbornVtable.Remove(address);
+
+                if (_byAddress.ContainsKey(address)) { continue; }
+                if (_tracked.Count >= MaxTracked || _newTracked >= MaxNewTracked) { continue; }
+
+                HarvestTracked tracked = new HarvestTracked();
+                tracked.Address = address;
+                tracked.FirstSeen = sample.Index;
+                tracked.FirstVTable = vtable;
+                tracked.NewlyAppeared = true;
+                uint head;
+                if (memory.ReadUInt32(address, out head) && head != 0) { tracked.FirstVTable = head; }
+
+                _byAddress[address] = tracked;
+                _tracked.Add(tracked);
+                _newTracked++;
+                sample.NewObjects.Add(address);
+
+                Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
+                    "发现新建造的对象 0x{0:X8}（类型表 0x{1:X8}），已开始跟踪它的字段变化",
+                    address, tracked.FirstVTable));
+            }
+        }
+
+        private void ReadSelection(MemoryIO memory, uint moduleBase, HarvestSample sample)        {
             // **与引擎 / 高级功能页共用同一套"金钱锚定 + 自动更正"的读法**（2026-10-08 起）。
             //
             // 之前这里用的是结构探测（SelectionProbe）：它只验证"看起来像对象数组"，
@@ -468,25 +680,41 @@ namespace MoTrainer.Calibration
 
         // ============================================================ 报告
 
-        private string WriteReport()
+        /// <summary>
+        /// 把报告写到磁盘。**同一个采集会话只对应一个文件**（第二次调用覆盖第一次）——
+        /// 收尾时先写一版不含巡检的，巡检完再覆盖成完整的，两次必须落在同一个文件名上。
+        ///
+        /// 写法是"先写临时文件再改名"：直接覆盖的话，万一写到一半进程被关掉，
+        /// 原地留下的就是一个**被截断的报告**——比少两节更糟，因为它看起来是完整的。
+        /// </summary>
+        private string WriteReport(bool dumpToLog)
         {
             string text = BuildReport();
             try
             {
-                string folder = _store != null ? _store.ReportsFolder : "reports";
-                Directory.CreateDirectory(folder);
-                string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
-                string path = Path.Combine(folder, "harvest-" + stamp + ".txt");
-                File.WriteAllText(path, text, new UTF8Encoding(true));
-                _reportPath = path;
-
-                // 同时也逐行写进日志：「导出日志」能一并带出来，方便用户只发一个文件
-                string[] lines = text.Split('\n');
-                for (int i = 0; i < lines.Length; i++)
+                if (_reportPath.Length == 0)
                 {
-                    Logger.Info("Harvest", lines[i].TrimEnd('\r'));
+                    string folder = _store != null ? _store.ReportsFolder : "reports";
+                    Directory.CreateDirectory(folder);
+                    string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+                    _reportPath = Path.Combine(folder, "harvest-" + stamp + ".txt");
                 }
-                return path;
+
+                string temp = _reportPath + ".tmp";
+                File.WriteAllText(temp, text, new UTF8Encoding(true));
+                if (File.Exists(_reportPath)) { File.Delete(_reportPath); }
+                File.Move(temp, _reportPath);
+
+                if (dumpToLog)
+                {
+                    // 同时也逐行写进日志：「导出日志」能一并带出来，方便用户只发一个文件
+                    string[] lines = text.Split('\n');
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        Logger.Info("Harvest", lines[i].TrimEnd('\r'));
+                    }
+                }
+                return _reportPath;
             }
             catch (Exception ex)
             {
@@ -579,18 +807,22 @@ namespace MoTrainer.Calibration
 
             // ---- 二、被跟踪对象 ----
             text.AppendLine();
-            text.AppendLine("=== 二、被跟踪对象（曾经被选中过的，之后即使取消选中也继续跟踪）===");
+            text.AppendLine("=== 二、被跟踪对象 ===");
+            text.AppendLine("（来源有两种：**你选中过的**，以及**本次采集期间新造出来的**（后者自动收进来，不必先选中）。");
+            text.AppendLine("  两种都会一直跟到采集结束，取消选中也不丢。）");
             if (tracked.Count == 0)
             {
-                text.AppendLine("本次没有跟踪到任何对象 —— 采集期间你一次都没有选中过单位。");
-                text.AppendLine("如果要观察某个单位的字段变化，请在采集过程中用鼠标选中它（哪怕只选一下）。");
+                text.AppendLine("本次没有跟踪到任何对象 —— 采集期间你既没有选中过单位，也没有造过东西。");
+                text.AppendLine("想观察某个单位的字段变化：采集过程中用鼠标选中它（哪怕只选一下），或者直接造一个。");
             }
             for (int i = 0; i < tracked.Count; i++)
             {
                 HarvestTracked t = tracked[i];
                 text.AppendLine();
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "对象 #{0}  地址 0x{1:X8}  类型表 0x{2:X8}", i + 1, t.Address, t.FirstVTable));
+                    "对象 #{0}  地址 0x{1:X8}  类型表 0x{2:X8}{3}",
+                    i + 1, t.Address, t.FirstVTable,
+                    t.NewlyAppeared ? "  ← **采集期间新造出来的**" : ""));
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                     "  首次出现：采样 #{0}｜共成功读到 {1} 次｜其中被选中 {2} 次",
                     t.FirstSeen, t.SeenCount, t.SelectedAt.Count));
@@ -660,6 +892,15 @@ namespace MoTrainer.Calibration
                         "  0x{0:X8}  0x{1:X8}  0x{2:X8}  {3}",
                         row.Address, row.VTable, row.Owner, row.Health));
                 }
+            }
+
+            // ---- 四、五、自动巡检（找类型对象 / 主链反查）----
+            // 这两段是"本来要用户再开一局、再点几次"的活，改由程序自己算（见 AutoInspection）。
+            // 内容在采样线程里就算好了（全内存反查太慢，不能在写报告时才算）。
+            if (_inspectionText.Length > 0)
+            {
+                text.AppendLine();
+                text.Append(_inspectionText);
             }
 
             text.AppendLine();

@@ -10,9 +10,14 @@ namespace MoTrainer.Ui.Controls
     /// <summary>
     /// 单个功能的卡片：开关 + 说明 + 目标值 + 实时状态。
     ///
-    /// 设计要点：**未校准的功能必须看起来就不能用**。
+    /// 设计要点：**用不了的功能必须看起来就不能用**。
     /// 修改器最让人恼火的失败模式是"开关能打开、但什么也没发生" ——
-    /// 玩家会以为是游戏问题。所以未校准时开关置灰，并直接写明该去哪一步。
+    /// 玩家会以为是游戏问题。所以两种情况都置灰，并直接写明为什么、下一步怎么办：
+    ///   · **未校准** —— 字段位置还不知道，去「校准向导 / 单位校准」点一次；
+    ///   · **刻意停用**（<see cref="CheatFeature.UnavailableReason"/>）——
+    ///     已经知道现在这条路走不通（真机推翻过），点也没用，只能等换条路重做。
+    /// 后者是 2026-10-09 补的：电力那次"校准数据看着是好的、实际没用"，
+    /// 只判 `IsCalibrated` 会一路放行到"看起来完全正常"的分支里去。
     /// </summary>
     public sealed class FeatureCard : CardPanel
     {
@@ -95,6 +100,10 @@ namespace MoTrainer.Ui.Controls
 
         /// <summary>卡片上的开关。暴露出来是为了让自检能驱动它（界面逻辑也要有回归覆盖）。</summary>
         public ToggleSwitch Toggle { get { return _toggle; } }
+
+        /// <summary>状态行的当前文字（自检用）。
+        /// "用不了必须说得出原因"这条规矩只能靠这句话来断言 —— 开关置灰证明不了它。</summary>
+        public string StatusText { get { return _status.Text; } }
 
         private static Label MakeLabel(Font font, Color color)
         {
@@ -236,11 +245,40 @@ namespace MoTrainer.Ui.Controls
             CheatFeature feature = _feature;
             if (feature == null) { return; }
 
+            // 风险标签的颜色必须跟着"能不能用"走。
+            // 它平时按风险等级着色（低风险是绿的），一个绿油油的「风险 低」
+            // 挂在一个根本打不开的功能上，读起来就是"这个可以放心开" —— 与事实相反。
+            _risk.ForeColor = feature.IsAvailable ? RiskColorOf(feature.Risk) : Theme.Text2;
+
+            // 刻意停用：**排在"未校准"前面**判。
+            //
+            // 顺序为什么有讲究（改坏验证的收获，2026-10-09）：
+            // 两个条件并非互斥 —— 一个功能可以"又被停用、又没校准"。
+            // 那时**先说哪一句，玩家就会去做什么**：
+            //   先说"暂不可用" → 玩家知道这条路现在走不通，不必白费劲；
+            //   先说"尚未校准" → 玩家跑到校准页反复折腾一个根本修不好的东西。
+            // 两个分支都把开关置灰，所以顺序不影响"点不点得动"，只影响**给出的指引对不对** ——
+            // 而指引错了的代价，是用户白花一局的时间。见 CheckUnavailableFeature 的第六项断言。
+            if (!feature.IsAvailable)
+            {
+                _toggle.ReadOnly = true;
+                _toggle.SetCheckedSilently(false);
+                _desired = false;
+                _valueInput.Enabled = false;
+                _valueInput.BackColor = Theme.Bg1;
+                _description.ForeColor = Theme.Text2;
+                _status.ForeColor = Theme.Warning;
+                _status.Text = "暂不可用 —— " + feature.UnavailableReason;
+                return;
+            }
+
             if (!feature.IsCalibrated)
             {
                 _toggle.ReadOnly = true;
                 _toggle.SetCheckedSilently(false);
+                _desired = false;
                 _valueInput.Enabled = false;
+                _valueInput.BackColor = Theme.Bg1;
                 _status.ForeColor = Theme.Warning;
                 _status.Text = "尚未校准 —— 请到「校准向导」或「单位校准」完成该字段的定位";
                 return;
@@ -305,8 +343,9 @@ namespace MoTrainer.Ui.Controls
             // 判定"状态没变"，开关自己弹回原位 —— 表现就是"点了没反应"。
             _desired = _toggle.Checked;
 
-            // 未校准的开关是画灰的，这里再兜一层，防止任何路径把它打开
-            if (!_feature.IsCalibrated)
+            // 刻意停用 / 未校准的开关都不接受点击，这里再兜一层，
+            // 防止任何路径把它打开（界面置灰只是视觉，真正的闸门在引擎与主窗口）
+            if (!_feature.IsUsable)
             {
                 _toggle.SetCheckedSilently(false);
                 _desired = false;

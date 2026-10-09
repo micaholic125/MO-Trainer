@@ -101,6 +101,25 @@ namespace MoTrainer.Cheats
         /// <summary>鼠标悬停时显示的详细说明（风险原因、注意事项）。空串表示不显示。</summary>
         public string Detail = "";
 
+        /// <summary>
+        /// **刻意停用**这项功能的简短原因；非空 = 该功能目前一律不可用。
+        ///
+        /// 为什么要在"未校准"之外单独建一个状态（2026-10-09）：
+        ///   未校准 = "字段位置还不知道"，去校准一次就能用；
+        ///   刻意停用 = "**已经知道现在这条路是错的**"（原做法被真机实测推翻、
+        ///              校准数据看着却是好的），再点也没有用，必须换技术路线重做。
+        /// 电力正是后者：`profile.json` 里 `powerOutput` 是"已校准"（读数核对通过），
+        /// 可真机实测证明那个位置只是**界面显示值** —— 用 `IsCalibrated` 根本挡不住它，
+        /// 于是开关能点、玩家以为开了、实际毫无作用。这正是 `CLAUDE.md` §4.2 禁止的失败模式。
+        ///
+        /// 这句话会**直接显示在卡片的状态行**上，所以必须短（一句话）；
+        /// 完整原因放在 <see cref="Detail"/> 里（鼠标悬停可见）。
+        ///
+        /// 解除停用的唯一方式：先在真机上验证新做法确实有效，再删掉
+        /// `FeatureAvailability` 里对应的那一条 —— 两件事必须一起做。
+        /// </summary>
+        public string UnavailableReason = "";
+
         // ---------------- 运行时状态（不落盘） ----------------
 
         /// <summary>当前解析到的字段地址；0 表示尚未解析或解析失败。</summary>
@@ -129,8 +148,22 @@ namespace MoTrainer.Cheats
 
         public bool IsCalibrated { get { return Locator != null && Locator.IsCalibrated; } }
 
-        /// <summary>是否真的在起作用（已开启 + 已校准 + 解析到地址）。</summary>
-        public bool IsActive { get { return Enabled && IsCalibrated && Address != 0; } }
+        /// <summary>是否没有被刻意停用。</summary>
+        public bool IsAvailable
+        {
+            get { return UnavailableReason == null || UnavailableReason.Length == 0; }
+        }
+
+        /// <summary>
+        /// 是否**真的能用**：既没被刻意停用、也已完成字段定位。
+        ///
+        /// 界面置灰 / 开关裁决 / 引擎执行**一律判这一个**，不要再单独判 <see cref="IsCalibrated"/> ——
+        /// 三处各判各的，迟早会出现"某一处放行"的缝（`CLAUDE.md` 7.1 同类教训）。
+        /// </summary>
+        public bool IsUsable { get { return IsAvailable && IsCalibrated; } }
+
+        /// <summary>是否真的在起作用（已开启 + 真的能用 + 解析到地址）。</summary>
+        public bool IsActive { get { return Enabled && IsUsable && Address != 0; } }
 
         /// <summary>卡片上显示的风险标签。刻意做短：完整解释放在鼠标悬停提示里，
         /// 卡片上只要一眼能看出颜色等级即可。</summary>
@@ -163,6 +196,7 @@ namespace MoTrainer.Cheats
         public string DescribeTarget()
         {
             if (!NeedsValue) { return "—"; }
+            if (!IsAvailable) { return "暂不可用"; }
             if (!IsCalibrated) { return "待校准"; }
             return TargetValue.ToString(CultureInfo.InvariantCulture);
         }

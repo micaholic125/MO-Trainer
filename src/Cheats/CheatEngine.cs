@@ -129,10 +129,12 @@ namespace MoTrainer.Cheats
                 feature.Address = 0;
                 feature.TicksSinceResolve = RelocateEveryTicks;
 
-                if (!feature.IsCalibrated && feature.Enabled)
+                if (!feature.IsUsable && feature.Enabled)
                 {
                     feature.Enabled = false;
-                    Logger.Warn("Engine", feature.Name + " 尚未校准，已自动关闭");
+                    Logger.Warn("Engine", feature.IsAvailable
+                        ? feature.Name + " 尚未校准，已自动关闭"
+                        : feature.Name + " 目前被刻意停用，已自动关闭：" + feature.UnavailableReason);
                 }
             }
         }
@@ -235,7 +237,11 @@ namespace MoTrainer.Cheats
             {
                 CheatFeature feature = _features[i];
 
-                if (!feature.IsCalibrated)
+                // 判 IsUsable 而不是 IsCalibrated：被刻意停用的功能（例如电力，
+                // 校准数据看着是好的、真机实测却证明那个位置没用）**必须一个字节都不写**。
+                // 这是引擎层的最后一道闸门 —— 界面置灰与主窗口的裁决都可能被绕过，
+                // 只有这里对"要不要碰内存"说了算。
+                if (!feature.IsUsable)
                 {
                     feature.Address = 0;
                     continue;

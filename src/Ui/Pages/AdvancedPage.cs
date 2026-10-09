@@ -364,8 +364,21 @@ namespace MoTrainer.Ui.Pages
             if (_harvest != null && _harvest.IsRunning)
             {
                 string path = _harvest.Stop();
-                _harvestTimer.Stop();
-                SetOutput(BuildHarvestDoneText(path));
+                if (path.Length > 0)
+                {
+                    _harvestTimer.Stop();
+                    SetOutput(BuildHarvestDoneText(path));
+                }
+                else
+                {
+                    // 停止后还要"收尾"：自动巡检里有一次全内存反查，要十几秒。
+                    // 报告由采样线程收尾完自己落盘，界面继续轮询（计时器不能停）——
+                    // 停了就再也没人去取报告路径了（改坏过一次：用户点了停止，报告却找不着）。
+                    SetOutput("正在收尾：跑自动巡检 + 写报告…\n\n"
+                        + "这一步里要做一次全内存反查（指针链），可能要十几秒。\n"
+                        + "界面不会卡 —— 你可以继续玩，跑完会自动把报告路径显示在这里。\n"
+                        + "在此之前请不要关闭修改器（关掉这段就白跑了）。");
+                }
                 UpdateHarvestUi();
                 return;
             }
@@ -388,7 +401,9 @@ namespace MoTrainer.Ui.Pages
                 + "  2. 造点东西，让金钱发生变化\n"
                 + "  3. 让某个单位挨点打\n"
                 + "  4. 想取消选中就取消，程序会继续跟踪它\n\n"
-                + "3 分钟到会自动结束；想提前结束就再点一次这个按钮。");
+                + "**新造出来的东西会自动被跟踪**，不必先选中它。\n"
+                + "3 分钟到会自动结束；想提前结束就再点一次这个按钮。\n"
+                + "结束后程序还会自己做一次「自动巡检」（找类型对象 + 主链反查），多花十几秒。");
             UpdateHarvestUi();
         }
 
@@ -398,9 +413,15 @@ namespace MoTrainer.Ui.Pages
 
             if (!_harvest.IsRunning)
             {
-                // 到时间自动结束（或采样线程意外退出）：把报告落盘，一次都不落下
-                _harvestTimer.Stop();
+                // 到时间自动结束（或采样线程意外退出）：报告已由采样线程落盘，这里只取路径
                 string path = _harvest.Stop();
+                if (path.Length == 0)
+                {
+                    // 报告还没写出来 —— 绝不能就此停表，否则没人再去取了
+                    UpdateHarvestUi();
+                    return;
+                }
+                _harvestTimer.Stop();
                 SetOutput(BuildHarvestDoneText(path));
             }
             UpdateHarvestUi();
@@ -411,12 +432,18 @@ namespace MoTrainer.Ui.Pages
             bool running = _harvest != null && _harvest.IsRunning;
             _harvestButton.Text = running ? "停止并保存报告" : "开始采集（3 分钟）";
 
-            if (running)
+            if (running && _harvest.IsFinalizing)
+            {
+                // 采样早就停了但线程还活着 = 在收尾。必须说出来，
+                // 否则"停止"之后十几秒没反应，用户会以为程序卡死或报告丢了。
+                _harvestStatus.Text = "正在收尾（自动巡检 + 写报告）… 这一步要全内存反查，十几秒，界面不卡。";
+            }
+            else if (running)
             {
                 _harvestStatus.Text = string.Format(CultureInfo.InvariantCulture,
-                    "采集中… {0:0} / {1} 秒｜已采 {2} 次｜跟踪 {3} 个对象（现在可以切回游戏了）",
+                    "采集中… {0:0} / {1} 秒｜已采 {2} 次｜跟踪 {3} 个对象（其中新出现 {4} 个）（现在可以切回游戏了）",
                     _harvest.ElapsedSeconds, _harvest.PlannedSeconds,
-                    _harvest.SampleCount, _harvest.TrackedCount);
+                    _harvest.SampleCount, _harvest.TrackedCount, _harvest.NewTrackedCount);
             }
             else if (_harvest != null && _harvest.ReportPath.Length > 0)
             {

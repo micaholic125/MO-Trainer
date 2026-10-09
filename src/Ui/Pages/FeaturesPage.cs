@@ -111,10 +111,10 @@ namespace MoTrainer.Ui.Pages
 
             string[] lines = new string[]
             {
-                "Ctrl + Alt + 1        金钱开关",
-                "Ctrl + Alt + 2        电力开关",
-                "Ctrl + Alt + 3        选中单位无敌开关",
-                "Ctrl + Alt + 4        秒杀敌人开关",
+                HotkeyLine(CheatId.Money, "Ctrl + Alt + 1        金钱开关"),
+                HotkeyLine(CheatId.PowerOutput, "Ctrl + Alt + 2        电力开关"),
+                HotkeyLine(CheatId.SelectedInvincible, "Ctrl + Alt + 3        选中单位无敌开关"),
+                HotkeyLine(CheatId.KillEnemies, "Ctrl + Alt + 4        秒杀敌人开关"),
                 "",
                 "提示：游戏若是独占全屏，Windows 可能把热键让给游戏窗口而收不到。",
                 "本工具不修改任何游戏文件，只读写游戏进程的内存。"
@@ -134,6 +134,18 @@ namespace MoTrainer.Ui.Pages
                 y += i >= 4 ? 18 : 20;
             }
             return card;
+        }
+
+        /// <summary>
+        /// 热键说明里的一行。功能被**刻意停用**时补一句 ——
+        /// 程序那边是"根本不注册这个热键"，说明里若还写着"Ctrl+Alt+2 电力开关"，
+        /// 玩家就会照着按、然后以为热键坏了。
+        /// </summary>
+        private string HotkeyLine(CheatId id, string text)
+        {
+            CheatFeature feature = _engine.Find(id);
+            if (feature == null || feature.IsAvailable) { return text; }
+            return text + "（暂不可用，见上方卡片）";
         }
 
         private void OnCardToggled(object sender, EventArgs e)
@@ -186,31 +198,49 @@ namespace MoTrainer.Ui.Pages
         private void RefreshSummary()
         {
             int total = 0;
-            int calibrated = 0;
+            int usable = 0;
+            int unavailable = 0;
             for (int i = 0; i < _engine.Features.Count; i++)
             {
+                CheatFeature feature = _engine.Features[i];
                 total++;
-                if (_engine.Features[i].IsCalibrated) { calibrated++; }
+                if (!feature.IsAvailable) { unavailable++; }
+                else if (feature.IsCalibrated) { usable++; }
             }
+
+            // 分母刻意**排除"刻意停用"的功能**：那些不是"还差一步校准"，
+            // 而是"现在这条路走不通"。把它们算进分母，玩家会一直看到"5/6 项"，
+            // 然后跑到校准页反复折腾一个根本修不好的东西。
+            int expected = total - unavailable;
 
             _subtitle.Text = _engine.IsRunning
                 ? string.Format(CultureInfo.InvariantCulture,
-                    "v0.2 开发版 · 锁定线程运行中（30Hz）· 已校准 {0}/{1} 项", calibrated, total)
+                    "v0.2 开发版 · 锁定线程运行中（30Hz）· 可用功能 {0}/{1} 项", usable, expected)
                 : "v0.2 开发版 · 锁定线程未运行";
 
-            if (calibrated == 0)
+            if (usable == 0)
             {
                 _summary.ForeColor = Theme.Warning;
                 _summary.Text = "还没有任何字段完成校准 —— 请先到「校准向导」完成一次性定位。";
                 return;
             }
 
-            if (calibrated < total)
+            if (usable < expected)
             {
                 _summary.ForeColor = Theme.Warning;
                 _summary.Text = string.Format(CultureInfo.InvariantCulture,
                     "已校准 {0}/{1} 项。未校准的功能开关是灰的，无法开启 —— 请到「校准向导」补齐。",
-                    calibrated, total);
+                    usable, expected);
+                return;
+            }
+
+            if (unavailable > 0)
+            {
+                // 用警告色而不是成功色：这一页上确实有一项用不了，
+                // 报"全部正常"会让玩家以为是自己没找到开关。
+                _summary.ForeColor = Theme.Warning;
+                _summary.Text = string.Format(CultureInfo.InvariantCulture,
+                    "已校准的功能全部可用；另有 {0} 项正在重做、暂不可用（卡片上写了原因）。", unavailable);
                 return;
             }
 
