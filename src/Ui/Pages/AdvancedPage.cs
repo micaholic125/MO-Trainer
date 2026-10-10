@@ -77,6 +77,7 @@ namespace MoTrainer.Ui.Pages
         private readonly Button _markAllyButton;
         private readonly Button _shroudButton;
         private readonly Button _powerProbeButton;
+        private readonly Button _houseProbeButton;
         private readonly Button _powerScoutButton;
         private readonly Button _harvestButton;
         private readonly Label _harvestStatus;
@@ -148,8 +149,10 @@ namespace MoTrainer.Ui.Pages
             Controls.Add(_markAllyButton);
 
             _hintTop = MakeHintLabel();
-            _hintTop.Text = "用法：先在游戏里选中一个自己的单位，再点「自动查找总名单」；然后点「预演」看它准备杀谁、放过谁。\n"
-                + "有队友的局：点选队友的一个单位（或建筑）→ 点「标记友军」，该阵营就永远不会被秒杀。";
+            // 2026-10-10：为了给"房子试探"按钮腾出高度，这条提示压成一行（原来是两行）。
+            // 界面被切/被挤这类问题，本项目吃过 6 轮往返的亏 —— 见 `CLAUDE.md` 7.2：
+            // 一律"用数字量"（自检里那条"输出框还有没有可用高度"的断言就是量尺）。
+            _hintTop.Text = "用法：选中自己的一个单位 → 点「自动查找总名单」→ 点「预演」看它准备杀谁、放过谁。";
             Controls.Add(_hintTop);
 
             // 第二组：全图视野 + 一键采集。
@@ -185,6 +188,15 @@ namespace MoTrainer.Ui.Pages
             _powerScoutButton.Click += OnPowerScoutClick;
             Controls.Add(_powerScoutButton);
 
+            // 「房子字段试探」（2026-10-10 新增，`[S6-2]` 用）：全项目**第二个**会往游戏里写试探值的按钮。
+            // 为什么需要：追了两轮采集，"进度字段"的形状判据全用遍也没找到 —— 数据反而指出
+            // 这类引擎的建造是"**按拍付钱、付满就造好**"（真机证据：房子 +0x2DC 与金钱的减少逐拍完全相同）。
+            // 若果真如此，往账上加大数就能让当前建造立刻造好 —— 这种事只能写一下看行为。
+            // 目标写在一行配置里（`config\house-probe.txt`），并且**点两次**才真写（与电力试探同一套路）。
+            _houseProbeButton = UiFactory.MakeButton("房子试探（点两次）", 168);
+            _houseProbeButton.Click += OnHouseProbeClick;
+            Controls.Add(_houseProbeButton);
+
             _harvestStatus = MakeHintLabel();
             _harvestStatus.Text = "采集期间你只需要在游戏里正常玩：选几个单位、造点东西、让单位挨点打。程序自己记录。";
             Controls.Add(_harvestStatus);
@@ -198,6 +210,11 @@ namespace MoTrainer.Ui.Pages
             _powerProbeTimer = new Timer();
             _powerProbeTimer.Interval = 400;
             _powerProbeTimer.Tick += OnPowerProbeTick;
+
+            // 房子试探的收尾轮询（后台线程里写值、盯 3 秒、还原，一共约 3 秒）。
+            _houseProbeTimer = new Timer();
+            _houseProbeTimer.Interval = 400;
+            _houseProbeTimer.Tick += OnHouseProbeTick;
 
             _output = new TextBox();
             _output.Multiline = true;
@@ -282,7 +299,7 @@ namespace MoTrainer.Ui.Pages
             y = LayoutHint(_hintTop, y, rightLimit - left) + 14;
 
             y = LayoutButtonRow(y,
-                new Control[] { _shroudButton, _harvestButton, _powerProbeButton, _powerScoutButton },
+                new Control[] { _shroudButton, _harvestButton, _powerProbeButton, _powerScoutButton, _houseProbeButton },
                 left, rightLimit) + 6;
             y = LayoutHint(_harvestStatus, y, rightLimit - left) + 14;
 
@@ -1548,6 +1565,12 @@ namespace MoTrainer.Ui.Pages
         private PowerProbe.Result _powerProbeResult;
         private readonly Timer _powerProbeTimer;
 
+        // ---- 房子字段试探（[S6-2]，2026-10-10）----
+        private System.Threading.Thread _houseProbeThread;
+        private HouseProbeResult _houseProbeResult;
+        private readonly Timer _houseProbeTimer;
+        private HouseProbeSpec _houseProbePending;      // 第 1 次点击解析出的目标，等第 2 次确认才真写
+
         /// <summary>
         /// 「电力试探」（`[S4-3]` B 方案）：判定建筑对象上的候选字段是不是**电力产出的来源**。
         ///
@@ -1681,6 +1704,144 @@ namespace MoTrainer.Ui.Pages
                     r.OutputBefore, r.OutputPeak, r.OutputAfter,
                     r.LooksLikeSource ? "是产出来源" : "不是产出来源") : ""));
             SetOutput(text.ToString());
+        }
+
+        // ============================================================ 房子字段试探（[S6-2]）
+
+        /// <summary>
+        /// 房子试探的目标配置（一行，例如 `0x2DC +100000`）。
+        /// 放文件而不是写死在代码里：**换目标不用重新编译**（这个项目里"重编译=关掉正在跑的修改器"）。
+        /// </summary>
+        private string HouseProbeConfigPath()
+        {
+            string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            return System.IO.Path.Combine(System.IO.Path.Combine(baseDirectory, "config"), "house-probe.txt");
+        }
+
+        /// <summary>
+        /// 「房子字段试探」：往**我方房子**的某个偏移写一个值、盯 3 秒、**无条件还原**。
+        ///
+        /// 为什么需要：`[S6-2]` 追了两轮采集，"进度字段"的形态判据全用遍也没找到；
+        /// 数据反而指出这类引擎的建造是「**按拍付钱、付满就造好**」
+        /// （真机证据：房子的 `+0x2DC` 与金钱的减少逐拍完全相同、总数也等于花掉的钱）。
+        /// 若果真如此，往账上加大数就能让当前建造立刻造好 —— 这种事**只能写一下看行为**。
+        ///
+        /// 安全设计（与「电力试探」同源）：① 点两次才真写；② 只写我方房子（金钱链解析出来的那个对象）；
+        /// ③ 拒绝写金钱偏移；④ 写前查目标页可写；⑤ 写完回读；⑥ **finally 里无条件还原**并回读确认。
+        /// </summary>
+        private void OnHouseProbeClick(object sender, EventArgs e)
+        {
+            StringBuilder text = new StringBuilder();
+            text.AppendLine("=== 房子字段试探（会往你自己的房子那个对象里写一个值，约 3 秒后自动还原）===");
+            text.AppendLine();
+
+            if (_houseProbeThread != null && _houseProbeThread.IsAlive)
+            {
+                text.AppendLine("上一次试探还在进行（约 3 秒），请稍候。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            if (_houseProbePending == null)
+            {
+                string path = HouseProbeConfigPath();
+                if (!System.IO.File.Exists(path))
+                {
+                    text.AppendLine("没找到目标配置文件：");
+                    text.AppendLine("  " + path);
+                    text.AppendLine();
+                    text.AppendLine("请新建这个文件、写一行，例如：");
+                    text.AppendLine("  0x2DC +100000");
+                    text.AppendLine("（`+100000` = 在当前值上加十万；也可写 `=0` 表示直接写 0）");
+                    SetOutput(text.ToString());
+                    return;
+                }
+
+                HouseProbeSpec spec;
+                string error;
+                if (!HouseProbeSpec.TryParse(System.IO.File.ReadAllText(path), out spec, out error))
+                {
+                    text.AppendLine("配置读不懂：" + error);
+                    SetOutput(text.ToString());
+                    return;
+                }
+
+                _houseProbePending = spec;
+                text.AppendLine("**第一次点击只做说明，不会写任何东西。** 确认下面这些之后，再点一次才真写：");
+                text.AppendLine();
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "  写哪儿：我方房子 + 0x{0:X}（房子地址由金钱链推出）", spec.Offset));
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "  写什么：{0}", spec.IsDelta
+                        ? string.Format(CultureInfo.InvariantCulture, "在当前值上 +{0}", spec.Value)
+                        : string.Format(CultureInfo.InvariantCulture, "直接写 {0}", spec.Value)));
+                text.AppendLine();
+                text.AppendLine("  怎么用：**先在游戏里造一样东西**（比如一座电厂），等它开始建造时再点第二次；");
+                text.AppendLine("  写完之后**盯 3 秒**，看那样东西是不是「一下子就造好了」。3 秒后程序自动写回原值。");
+                text.AppendLine("  风险：这是往你自己的房子写**数据**（不是代码），写错顶多界面上某个数字跳一下，");
+                text.AppendLine("  而且 3 秒后一定还原；**试探期间请不要关闭程序**。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            HouseProbeSpec pending = _houseProbePending;
+            _houseProbePending = null;
+
+            if (_target == null || !_target.IsReady)
+            {
+                text.AppendLine("游戏未连接 —— 先启动游戏、确认状态条显示「已连接」。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            uint moduleBase = _target.ModuleBase;
+            MemoryIO memory = _target.Memory;
+            CalibrationProfile profile = _profile;
+
+            text.AppendLine("正在写…（约 3 秒后自动还原）**现在看游戏里：那样东西有没有立刻造好？**");
+            SetOutput(text.ToString());
+
+            _houseProbeResult = null;
+            _houseProbeButton.Enabled = false;
+            _houseProbeThread = new System.Threading.Thread(delegate()
+            {
+                HouseProbeResult probe;
+                try { probe = HouseProbe.Run(memory, profile, moduleBase, pending); }
+                catch (Exception ex)
+                {
+                    probe = new HouseProbeResult();
+                    probe.Note = ex.GetType().Name + ": " + ex.Message;
+                }
+                _houseProbeResult = probe;      // 引用赋值，界面线程读到的要么是 null 要么是完整结果
+            });
+            _houseProbeThread.IsBackground = true;
+            _houseProbeThread.Start();
+            _houseProbeTimer.Start();
+        }
+
+        /// <summary>试探线程的收尾（界面线程）：把三个读数写出来，并在日志里留一份完整记录。</summary>
+        private void OnHouseProbeTick(object sender, EventArgs e)
+        {
+            if (_houseProbeResult == null) { return; }
+            _houseProbeTimer.Stop();
+            _houseProbeButton.Enabled = true;
+
+            HouseProbeResult probe = _houseProbeResult;
+            _houseProbeResult = null;
+
+            StringBuilder text = new StringBuilder();
+            text.AppendLine("=== 房子字段试探结果 ===");
+            text.AppendLine();
+            text.Append(probe.Explain());
+            text.AppendLine();
+            text.AppendLine("请告诉我：**刚才那 3 秒里，那样东西是不是「一下子就造好了」？**");
+            SetOutput(text.ToString());
+
+            string[] lines = text.ToString().Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                Logger.Info("Advanced", "房子试探：" + lines[i].TrimEnd('\r'));
+            }
         }
 
         /// <summary>

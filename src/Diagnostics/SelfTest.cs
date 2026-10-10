@@ -150,6 +150,7 @@ namespace MoTrainer.Diagnostics
             // 用户的时间最稀缺，所以要保证"下一次开局就该拿到答案"，而不是"多开几局试试"。
             Section("17. 施工进度猎手（[S6-2] 瞬间建造）");
             CheckProgressHunter();
+            CheckHouseProbe();
             CheckTypeIdScan();
             CheckHarvestHouseTracking();
 
@@ -5501,6 +5502,117 @@ namespace MoTrainer.Diagnostics
                 {
                     try { File.Delete(reportPath); } catch (Exception) { }
                 }
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// 「房子字段试探」的自检（`[S6-2]` 用）。这是全项目**第二个会往游戏里写实验值**的地方
+        /// （第一个是电力试探），所以重点完全一样：**该拒绝的一定拒绝、写了一定还原**。
+        /// </summary>
+        private static void CheckHouseProbe()
+        {
+            HouseProbeSpec spec;
+            string error;
+
+            Check("房子试探：解析 `0x2DC +100000`（在现值上加）",
+                HouseProbeSpec.TryParse("0x2DC +100000", out spec, out error)
+                    && spec.Offset == 0x2DC && spec.IsDelta && spec.Value == 100000,
+                error.Length > 0 ? error : "0x2DC +100000");
+            Check("房子试探：解析 `0x57A4 =0`（直接写 0）",
+                HouseProbeSpec.TryParse("0x57A4 =0", out spec, out error)
+                    && spec.Offset == 0x57A4 && !spec.IsDelta && spec.Value == 0,
+                error.Length > 0 ? error : "0x57A4 =0");
+            Check("房子试探：配置空着或格式不对时说得出为什么（不静默）",
+                !HouseProbeSpec.TryParse("", out spec, out error) && error.Length > 0
+                    && !HouseProbeSpec.TryParse("0x2DC", out spec, out error) && error.Length > 0
+                    && !HouseProbeSpec.TryParse("0xZZ +1", out spec, out error) && error.Length > 0,
+                "三条坏配置都被拒绝并给出原因");
+
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("房子试探", false, "OpenProcess 失败"); return; }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("房子试探（测试内存块）", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("房子试探", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = TestBlockSize;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                const uint MoneyOffset = 0x30C;
+                const uint FieldOffset = 0x2DC;
+                const uint FieldValue = 1760;
+
+                uint house = heap + 0x1000;
+                io.WriteUInt32(house, moduleBase + 0x2000);            // 房子头部：模块区间内的类型表
+                io.WriteUInt32(house + MoneyOffset, 48240);            // 金钱
+                io.WriteUInt32(house + FieldOffset, FieldValue);       // 待试探的字段（真机里这格是"已付多少"）
+                io.WriteUInt32(moduleBase + 0x100, house);             // 金钱链的静态根
+
+                CalibrationProfile profile = new CalibrationProfile();
+                profile.ModuleBase = moduleBase;
+                profile.ModuleSize = moduleSize;
+                profile.Money.SetOffsets(new uint[] { 0x100, MoneyOffset });
+
+                // ---- 拒绝路径 ----
+                HouseProbeSpec moneySpec;
+                HouseProbeSpec.TryParse("0x30C +1", out moneySpec, out error);
+                HouseProbeResult refusedMoney = HouseProbe.Run(io, profile, moduleBase, moneySpec);
+                Check("房子试探：**拒绝写金钱**（+0x30C）", !refusedMoney.Ok && !refusedMoney.Wrote,
+                    refusedMoney.Note);
+
+                HouseProbeSpec farSpec;
+                HouseProbeSpec.TryParse("0x8000 +1", out farSpec, out error);
+                HouseProbeResult refusedFar = HouseProbe.Run(io, profile, moduleBase, farSpec);
+                Check("房子试探：偏移越界时拒绝", !refusedFar.Ok && !refusedFar.Wrote, refusedFar.Note);
+
+                HouseProbeResult refusedNoMoney =
+                    HouseProbe.Run(io, new CalibrationProfile(), moduleBase, moneySpec);
+                Check("房子试探：金钱未校准时拒绝并说明缺什么",
+                    !refusedNoMoney.Ok && refusedNoMoney.Note.IndexOf("金钱", StringComparison.Ordinal) >= 0,
+                    refusedNoMoney.Note);
+
+                // ---- 正常路径：写进去、盯 3 秒、还原回来 ----
+                HouseProbeSpec good;
+                HouseProbeSpec.TryParse("0x2DC +100000", out good, out error);
+                HouseProbeResult probe = HouseProbe.Run(io, profile, moduleBase, good);
+
+                Check("房子试探：确实写进去了（写后回读到新值）",
+                    probe.Ok && probe.Wrote && probe.ReadAfterWrite
+                        && probe.AfterWrite == FieldValue + 100000,
+                    "写前 " + probe.Before + " → 写后 " + probe.AfterWrite);
+                Check("房子试探：**无条件还原**（还原后就是原值）",
+                    probe.Restored && probe.ReadAfterRestore && probe.AfterRestore == FieldValue,
+                    "还原后读到 " + probe.AfterRestore + "（原值 " + FieldValue + "）");
+
+                uint now;
+                io.ReadUInt32(house + FieldOffset, out now);
+                Check("房子试探：内存里再确认一次已还原（不是只印了个数）",
+                    now == FieldValue, "内存现值 " + now);
+            }
+            catch (Exception ex)
+            {
+                Check("房子试探", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
                 if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
                 if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
                 self.Dispose();
