@@ -5815,6 +5815,36 @@ namespace MoTrainer.Diagnostics
                 io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, producing);   // 清理
                 io.WriteUInt32(remainingField, 1926);          // 清理
 
+                // ---- 正常路径 B3：这一轮把建造**推着造完了** ⇒ 不还原（写回旧值会把建好的东西退回去）----
+                HouseProbeSpec elapsedSpec;
+                HouseProbeSpec.TryParse("handle 0x24 =53", out elapsedSpec, out error);
+                io.WriteUInt32(producing + 0x24, 14);          // 已经造了 14 拍
+                io.WriteUInt32(remainingField, 1482);          // 还差 1482 没付完
+
+                System.Threading.Thread payThread = new System.Threading.Thread(delegate()
+                {
+                    System.Threading.Thread.Sleep(80);
+                    io.WriteUInt32(remainingField, 0);         // 冒充"游戏把剩下的钱一次付清了"
+                });
+                payThread.IsBackground = true;
+                payThread.Start();
+
+                HouseProbeResult paidOff = HouseProbe.Run(io, profile, moduleBase, elapsedSpec, 700, producingClass);
+                payThread.Join();
+
+                Check("字段试探：把建造**推着造完了** ⇒ 认得出（判据：还差的钱变成了 0）",
+                    paidOff.Ok && paidOff.Completed && paidOff.ReadRemainingBefore
+                        && paidOff.RemainingBefore == 1482,
+                    "还差 " + paidOff.RemainingBefore + " → 0");
+                Check("字段试探：造完之后**不还原**（写回旧值会把建好的东西退回未完成 —— 真机踩过）",
+                    paidOff.SkippedRestore && !paidOff.Restored && paidOff.SkipReason.Length > 0,
+                    paidOff.SkipReason);
+
+                uint keptTick;
+                io.ReadUInt32(producing + 0x24, out keptTick);
+                Check("字段试探：不还原时保留的是**我们推它的那个值**（没有往回拨）",
+                    keptTick == 53, "内存现值 " + keptTick);
+
                 // ---- 正常路径 C：旧写法（写房子本体）仍然好用 ----
                 HouseProbeSpec good;
                 HouseProbeSpec.TryParse("0x2DC +100000", out good, out error);

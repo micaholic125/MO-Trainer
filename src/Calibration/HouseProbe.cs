@@ -153,6 +153,10 @@ namespace MoTrainer.Calibration
         public bool MoneyOk;
         public uint Handle;
         public bool HandleOk;
+
+        /// <summary>同一个对象上"还差多少钱没付完"那一格（`+0x60`）。</summary>
+        public uint Remaining;
+        public bool RemainingOk;
     }
 
     public sealed class HouseProbeResult
@@ -201,6 +205,13 @@ namespace MoTrainer.Calibration
         /// <summary>盯的过程中读不到那一格了（不敢盲写回去）。</summary>
         public bool LostField;
 
+        /// <summary>
+        /// **建造在这一轮里完成了**（判据：同一个对象上"还差多少钱没付完"那一格，写之前还不是 0、写之后变成 0
+        /// ⇒ 游戏把剩下的钱一次付清了）。真机实测（2026-10-10 18:53）：写 `+0x24 = 53` 后 0.3 秒内
+        /// 游戏把剩下的 1482 一次付清，用户看到侧边栏显示"建造就绪"。
+        /// </summary>
+        public bool Completed;
+
         /// <summary>因为上面某条而**故意没有还原**（写回去会出问题）。</summary>
         public bool SkippedRestore;
 
@@ -209,6 +220,10 @@ namespace MoTrainer.Calibration
         public uint MoneyBefore;
         public uint MoneyAfter;
         public bool ReadMoney;
+
+        /// <summary>写之前"还差多少钱没付完"是多少（用来判断这一轮有没有把它付清）。</summary>
+        public uint RemainingBefore;
+        public bool ReadRemainingBefore;
 
         public int HoldMsHeld;
 
@@ -245,7 +260,7 @@ namespace MoTrainer.Calibration
 
             if (Samples.Count > 0)
             {
-                text.AppendLine("读数（这一格的值 / 你的钱 / 那颗东西还在不在）：");
+                text.AppendLine("读数（写的那一格 / 还差多少钱没付完 / 你的钱 / 那颗东西还在不在）：");
                 for (int i = 0; i < Samples.Count; i++)
                 {
                     if (Samples.Count > 12 && i == 5) { text.AppendLine("  ……"); }
@@ -253,12 +268,20 @@ namespace MoTrainer.Calibration
 
                     HoldSample s = Samples[i];
                     text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                        "  +{0:0.0}s｜{1}｜{2}｜{3}",
+                        "  +{0:0.0}s｜{1}｜还差 {2}｜钱 {3}｜{4}",
                         s.Ms / 1000.0,
                         s.ValueOk ? s.Value.ToString(CultureInfo.InvariantCulture) : "读不到",
+                        s.RemainingOk ? s.Remaining.ToString(CultureInfo.InvariantCulture) : "—",
                         s.MoneyOk ? s.Money.ToString(CultureInfo.InvariantCulture) : "读不到",
                         s.HandleOk ? (s.Handle == TargetObject ? "在" : "**不在了**") : "读不到"));
                 }
+            }
+
+            if (Completed)
+            {
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "★ **建造完成了**：还差的钱从 {0} 变成了 0 —— 游戏把剩下的钱一次付清了（侧边栏应该显示「就绪」）。",
+                    RemainingBefore));
             }
 
             if (SkippedRestore)
@@ -333,6 +356,13 @@ namespace MoTrainer.Calibration
         /// 别的类别一律拒绝写：**宁可少写一次、回头补验，也不往没验过的对象上写**。
         /// </summary>
         public const uint VerifiedProducingTypeTable = 0x007E88D0;
+
+        /// <summary>
+        /// 「正在生产的东西」身上"**还差多少钱没付完**"那一格（2026-10-10 用账目逐拍核对出来的：
+        /// 每拍减少量 = 这一拍扣掉的钱、总数 = 造价、造好时正好落到 0）。
+        /// 这里**只用来读**（当作"造好了没有"的判据），不当写入目标。
+        /// </summary>
+        public const uint ProducingRemainingOffset = 0x60;
 
         /// <summary>写完之后盯这么久再收尾（够用户看清"是不是立刻造好"）。</summary>
         public const int HoldMs = 3000;
@@ -688,6 +718,13 @@ namespace MoTrainer.Calibration
             bool moneyOk = profile.Money.TryResolve(memory, moduleBase, out moneyAddress, out moneyError);
             if (moneyOk) { result.ReadMoney = memory.ReadUInt32(moneyAddress, out result.MoneyBefore); }
 
+            // 「造好了没有」的判据：同一个对象上"还差多少钱没付完"那一格，写之前不是 0、写之后变成 0
+            // ⇒ 游戏把剩下的钱一次付清了 ⇒ 建造完成。（写 +0x60 本身时不做这条判断，那是循环论证。）
+            bool watchRemaining = target.FollowedHandle && spec.Offset != ProducingRemainingOffset;
+            bool haveRemainingBefore = watchRemaining
+                && memory.ReadUInt32(target.Object + ProducingRemainingOffset, out result.RemainingBefore);
+            if (haveRemainingBefore) { result.ReadRemainingBefore = true; }
+
             uint write = spec.IsDelta ? unchecked(target.Value + spec.Value) : spec.Value;
             result.Written = write;
 
@@ -729,6 +766,11 @@ namespace MoTrainer.Calibration
                             sample.HandleOk = memory.ReadUInt32(
                                 target.House + HarvestSession.ProducingPointerOffset, out sample.Handle);
                         }
+                        if (watchRemaining)
+                        {
+                            sample.RemainingOk = memory.ReadUInt32(
+                                target.Object + ProducingRemainingOffset, out sample.Remaining);
+                        }
                         result.Samples.Add(sample);
 
                         // 那颗东西从把手上消失了 —— 造好时游戏就会把它收走。这时**立刻停手**。
@@ -750,6 +792,18 @@ namespace MoTrainer.Calibration
 
                 result.Wrote = result.Writes > 0;
 
+                // 收尾前判定："还差的钱"从非 0 变成了 0 ⇒ 游戏被我们推着把剩下的钱一次付清了 ⇒ 建造完成。
+                if (haveRemainingBefore && result.RemainingBefore > 0)
+                {
+                    for (int i = result.Samples.Count - 1; i >= 0; i--)
+                    {
+                        HoldSample s = result.Samples[i];
+                        if (!s.RemainingOk) { continue; }
+                        if (s.Remaining == 0) { result.Completed = true; }
+                        break;
+                    }
+                }
+
                 // 第一条读数正好是"刚写完就读"的那一次，用它当"写入后读到"。
                 if (result.Samples.Count > 0)
                 {
@@ -770,7 +824,14 @@ namespace MoTrainer.Calibration
             }
             finally
             {
-                if (result.TargetGone)
+                if (result.Completed)
+                {
+                    // 真机实测（2026-10-10 18:53）：造好之后写回旧值，游戏会把建好的东西**退回未完成**。
+                    result.SkippedRestore = true;
+                    result.SkipReason = "**建造已经完成**（游戏把剩下的钱一次付清了）—— 那一格现在归游戏管，"
+                                      + "写回旧值会把建好的东西退回未完成状态（2026-10-10 真机实测过）";
+                }
+                else if (result.TargetGone)
                 {
                     result.SkippedRestore = true;
                     result.SkipReason = "那颗东西已经从把手上消失了（造好时游戏就会把它收走）—— "
