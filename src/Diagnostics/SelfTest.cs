@@ -150,6 +150,7 @@ namespace MoTrainer.Diagnostics
             // 用户的时间最稀缺，所以要保证"下一次开局就该拿到答案"，而不是"多开几局试试"。
             Section("17. 施工进度猎手（[S6-2] 瞬间建造）");
             CheckProgressHunter();
+            CheckTypeIdScan();
             CheckHarvestHouseTracking();
 
             Write("");
@@ -5161,9 +5162,130 @@ namespace MoTrainer.Diagnostics
                 cappedText.IndexOf("未逐条记录", StringComparison.Ordinal) >= 0,
                 capped.Changes + " 次变化 / " + capped.Values.Count + " 个点");
 
-            string longText = ProgressHunter.FormatSeries(capped, 20);
-            Check("施工进度猎手：超长序列保留头尾并标明省略了多少个",
-                longText.IndexOf("个省略", StringComparison.Ordinal) >= 0, longText);
+            // ---- 房子：已知字段与"账本"都必须排到进度后面（2026-10-10 真机教训）----
+            HarvestTracked house = new HarvestTracked();
+            house.Address = 0x267E28E8;
+            house.FirstVTable = 0x007EA8A0;
+            house.IsPlayerHouse = true;
+
+            // 金钱（已知字段）：它比谁都像"进度" —— 每拍都在降、造完停下、还正好对齐。
+            // 正因如此才必须**按已知偏移硬排掉**，否则它永远霸占第一名。
+            OffsetSeries money = new OffsetSeries(0x30C, 0, 50000);
+            for (int i = 1; i <= 11; i++) { money.Record(i, (uint)(50000 - i * 100)); }
+            house.Series[0x30C] = money;
+
+            // 累计花费（账本类）：只涨不停、还从头涨到尾 —— 形态很像进度，其实不是
+            OffsetSeries spent = new OffsetSeries(0x2DC, 0, 0);
+            for (int i = 1; i <= 11; i++) { spent.Record(i, (uint)(i * 36)); }
+            house.Series[0x2DC] = spent;
+
+            tracked.Add(house);
+
+            candidates = ProgressHunter.Rank(tracked, samples, 0x400000, 0x793000, 15, new List<string>());
+
+            bool sawMoney = false;
+            int spentScore = -1000;
+            int progressScore = -1000;
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                if (candidates[i].Series.Offset == 0x30C) { sawMoney = true; }
+                if (candidates[i].Series.Offset == 0x2DC) { spentScore = candidates[i].Score; }
+                if (candidates[i].Series.Offset == 0x534) { progressScore = candidates[i].Score; }
+            }
+
+            Check("施工进度猎手：金钱（已知字段 +0x30C）被排掉，不进候选", !sawMoney,
+                sawMoney ? "混进候选了" : "已排掉");
+            // 除了「排在后面」，还要钉住它的**得分上限**：
+            // 这条扣分只有在「账本比真进度更活跃」时才决定名次，单看排序抓不住它
+            // （2026-10-10 改坏验证实测：取消扣分后名次不变、断言照样绿 —— 于是补上这条）。
+            // 实测：有扣分时它 15 分，取消扣分立刻涨到 19，所以断言它必须 ≤16。
+            Check("施工进度猎手：账本类计数器（只涨不停）既排在真进度后面、得分也被压住",
+                spentScore < progressScore && spentScore <= 16
+                    && candidates.Count > 0 && candidates[0].Series.Offset == 0x534,
+                "账本得分 " + spentScore + "（应 ≤16）｜真进度得分 " + progressScore);
+        }
+
+        /// <summary>
+        /// 「型号线索」扫描（[S6-2] 顺手加的识别手段）：
+        /// 顺着对象内部的指针，找出像「建造 ID」的字符串（GAPOWR / HARV / E1 这种）。
+        ///
+        /// 为什么值得单测：2026-10-10 卡住的地方就是"这两个对象到底是什么东西"。
+        /// 这条判据一旦太松（把方位词、随机字符串都算进来）就等于没有信息，
+        /// 太紧（漏掉真 ID）就白扫一遍 —— 两头都要钉住。
+        /// </summary>
+        private static void CheckTypeIdScan()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("型号线索扫描", false, "OpenProcess 失败"); return; }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("型号线索扫描（测试内存块）", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("型号线索扫描", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                uint obj = heap + 0x2000;
+                uint idString = heap + 0x3000;
+                uint noiseString = heap + 0x3100;
+                uint shotString = heap + 0x3200;
+
+                byte[] gapowr = Encoding.ASCII.GetBytes("GAPOWR\0");
+                io.Write(idString, gapowr, 0, gapowr.Length);
+                byte[] north = Encoding.ASCII.GetBytes("North\0");
+                io.Write(noiseString, north, 0, north.Length);
+                byte[] harv = Encoding.ASCII.GetBytes("HARV\0");
+                io.Write(shotString, harv, 0, harv.Length);
+
+                io.WriteUInt32(obj + 0x10, idString);      // 真 ID
+                io.WriteUInt32(obj + 0x20, noiseString);   // 方位词（噪声）
+                io.WriteUInt32(obj + 0x30, shotString);    // 短 ID（合法）
+                io.WriteUInt32(obj + 0x40, 0x00000001);    // 不是指针
+
+                List<string> ids = ProgressHunter.ScanTypeIds(io, obj, 0x800);
+                bool hasGapowr = false;
+                bool hasHarv = false;
+                bool hasNorth = false;
+                for (int i = 0; i < ids.Count; i++)
+                {
+                    if (ids[i] == "GAPOWR") { hasGapowr = true; }
+                    if (ids[i] == "HARV") { hasHarv = true; }
+                    if (ids[i] == "North") { hasNorth = true; }
+                }
+
+                Check("型号线索：找得到指向建造 ID 的指针（GAPOWR）", hasGapowr,
+                    hasGapowr ? "找到" : "没找到：" + string.Join(", ", ids.ToArray()));
+                Check("型号线索：短 ID（HARV）也算", hasHarv, hasHarv ? "找到" : "没找到");
+                Check("型号线索：方位词（North）当噪声排掉", !hasNorth,
+                    hasNorth ? "混进来了" : "已排掉");
+                Check("型号线索：读不到时返回空表（不抛异常、不编造）",
+                    ProgressHunter.ScanTypeIds(io, 0x00000020, 0x800).Count == 0, "已返回空表");
+                Check("型号线索：对象地址无效时返回空表",
+                    ProgressHunter.ScanTypeIds(io, 0, 0x800).Count == 0, "已返回空表");
+            }
+            catch (Exception ex)
+            {
+                Check("型号线索扫描", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
+            }
         }
 
         /// <summary>
@@ -5214,6 +5336,13 @@ namespace MoTrainer.Diagnostics
                 io.WriteUInt32(house + MoneyOffset, 12345);      // 金钱
                 io.WriteUInt32(house + 0x200, followed);
                 io.WriteUInt32(house + 0x204, bogus);
+
+                // 「模块内的假对象」：头 4 字节也是模块区间内的指针（看着像对象），
+                // 但它在**程序自己的数据段**里 —— 2026-10-10 起这类目标一律不跟。
+                // 真机教训：上一版把 8 个名额全给了这种静态结构，真正的堆对象一个都没跟上。
+                uint staticDecoy = moduleBase + 0x3000;
+                io.WriteUInt32(staticDecoy, moduleBase + 0x2010);
+                io.WriteUInt32(house + 0x208, staticDecoy);
                 io.WriteUInt32(followed, moduleBase + 0x2010);   // 目标确实是个 C++ 对象
                 io.WriteUInt32(bogus, 0xDEADBEEF);               // 目标头 4 字节不是模块区间指针
 
@@ -5271,6 +5400,12 @@ namespace MoTrainer.Diagnostics
                 Check("采集器：指向「头不是类型表」的指针没有被跟随（宁可漏，不许跟错）",
                     text.IndexOf("跟随 +0x204", StringComparison.Ordinal) < 0,
                     text.IndexOf("跟随 +0x204", StringComparison.Ordinal) < 0 ? "已拒绝" : "跟错了");
+
+                Check("采集器：指向模块内静态结构的指针不被跟随（只剩堆对象才跟）",
+                    text.IndexOf("跟随 +0x208", StringComparison.Ordinal) < 0
+                        && text.IndexOf("指向静态结构", StringComparison.Ordinal) >= 0,
+                    text.IndexOf("跟随 +0x208", StringComparison.Ordinal) < 0
+                        ? "已跳过（并在报告里说明）" : "跟错了：静态结构也跟了");
 
                 // ---- 负面用例：认不出房子时，必须**说得出卡在哪一步** ----
                 // 这是本项目最忌讳的失败模式的正面防线：用户开一局、点一次采集，

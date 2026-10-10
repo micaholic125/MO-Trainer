@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
+using MoTrainer.Core;
 
 namespace MoTrainer.Calibration
 {
@@ -256,6 +257,11 @@ namespace MoTrainer.Calibration
                     if (series.Offset == 0) { continue; }
                     if (series.Changes < MinChanges) { continue; }
 
+                    // 我方房子上**已知**的字段：金钱（+0x30C）与电力显示值（+0x53A4 / +0x53A8）。
+                    // 它们同样"一边生产一边变"，但绝不可能是进度 ——
+                    // 2026-10-10 那次它们把前四名全占了，纯属干扰。
+                    if (obj.IsPlayerHouse && IsKnownHouseOffset(series.Offset)) { continue; }
+
                     List<uint> seq = series.ToSequence();
                     int steps = seq.Count - 1;
                     if (steps <= 0) { continue; }
@@ -322,6 +328,7 @@ namespace MoTrainer.Calibration
 
                     int score = 0;
                     List<string> reasons = new List<string>();
+                    bool decreasing = !dominantUp;
 
                     if (quietAfter >= PlateauSamples)
                     {
@@ -339,6 +346,18 @@ namespace MoTrainer.Calibration
                     {
                         score -= 6;
                         reasons.Add("一直在变、从不停（更像计数器/动画）");
+                    }
+
+                    // 方向：进度要么"往下倒数"（剩余时间），要么"往上走满就复位"（已完成量）。
+                    if (decreasing) { score += 3; reasons.Add("一路往下（像「剩余时间」）"); }
+                    if (resets >= 1) { score += 3; reasons.Add("有复位（一件接一件地造）"); }
+
+                    // **只涨不停、且从头涨到尾** = 累计值/账本的特征（花费总额、帧计数这类）。
+                    // 2026-10-10 真机数据里它们排在候选第 2~4 名，全是干扰。
+                    if (!decreasing && resets == 0 && quietAfter >= PlateauSamples)
+                    {
+                        score -= 4;
+                        reasons.Add("只涨不停、还从头涨到尾（更像累计值/账本）");
                     }
 
                     if (monotonic >= 0.9f) { score += 4; reasons.Add("单调"); }
@@ -389,6 +408,18 @@ namespace MoTrainer.Calibration
         }
 
         /// <summary>
+        /// 我方房子上**已知**的字段偏移 —— 它们也会"一边生产一边变"，但绝不可能是进度：
+        ///   +0x30C  金钱（三条金钱链的落点，真机反复确认过）
+        ///   +0x53A4 电力产出（界面显示值）
+        ///   +0x53A8 电力消耗（界面显示值）
+        /// 2026-10-10 那次采集里，金钱排在候选第一名 —— 排掉它，报告才好看。
+        /// </summary>
+        private static bool IsKnownHouseOffset(int offset)
+        {
+            return offset == 0x30C || offset == 0x53A4 || offset == 0x53A8;
+        }
+
+        /// <summary>
         /// 取值像不像一个内存地址（而不是"进度"这种计数）。
         ///
         /// 刻意看**整条序列**而不是只看某一个值：真机里字段的初始值偶尔是垃圾
@@ -410,6 +441,94 @@ namespace MoTrainer.Calibration
                 if (moduleBase != 0 && value >= moduleBase && value < moduleBase + moduleSize) { hits++; }
             }
             return hits * 2 >= seq.Count;
+        }
+
+        /// <summary>
+        /// 给一个对象扫「型号线索」：它内部的指针若指向一个像"建造 ID"的字符串
+        /// （GAPOWR / HARV / E1 这种），那串字符就是它的型号名。
+        ///
+        /// 为什么需要：报告的读者看得见偏移和取值，却看不出"这是什么东西"。
+        /// 2026-10-10 就是卡在这里 —— 两个"倒数到 0"的字段，谁都说不清它们属于兵、车还是别的。
+        ///
+        /// 判据刻意卡得很死（宁可漏、不要错）：只认 4~24 字符、只含字母数字与 `_ . -`、
+        /// 且至少有一个大写字母的串；另外把已知的**方位词**（North/South/…）当噪声排掉 ——
+        /// 真机报告里它们反复冒充"建造 ID"（那其实是地图方向的名字）。
+        /// </summary>
+        public static List<string> ScanTypeIds(MemoryIO memory, uint address, int scanBytes)
+        {
+            List<string> ids = new List<string>();
+            if (memory == null || address < 0x10000) { return ids; }
+
+            byte[] block = memory.ReadBytesQuiet(address, scanBytes);
+            if (block == null) { return ids; }
+
+            for (int offset = 0; offset + 4 <= block.Length; offset += 4)
+            {
+                uint pointer = ReadUInt32(block, offset);
+                if (pointer < 0x10000 || pointer > 0x7FFFFFFF) { continue; }
+
+                string id = ReadIdentifier(memory, pointer);
+                if (id.Length == 0) { continue; }
+
+                bool dup = false;
+                for (int d = 0; d < ids.Count; d++) { if (ids[d] == id) { dup = true; break; } }
+                if (dup) { continue; }
+
+                ids.Add(id);
+                if (ids.Count >= 8) { break; }
+            }
+            return ids;
+        }
+
+        /// <summary>读一个"建造 ID 风格"的字符串（与 `AutoInspection` 里那份同一口径）。</summary>
+        private static string ReadIdentifier(MemoryIO memory, uint address)
+        {
+            if (address < 0x10000) { return ""; }
+
+            byte[] raw = memory.ReadBytesQuiet(address, 24);
+            if (raw == null || raw.Length < 4) { return ""; }
+
+            int length = 0;
+            bool sawUpper = false;
+            while (length < raw.Length)
+            {
+                byte b = raw[length];
+                if (b == 0) { break; }
+                bool ok = (b >= (byte)'0' && b <= (byte)'9')
+                    || (b >= (byte)'A' && b <= (byte)'Z')
+                    || (b >= (byte)'a' && b <= (byte)'z')
+                    || b == (byte)'_' || b == (byte)'.' || b == (byte)'-';
+                if (!ok) { return ""; }
+                if (b >= (byte)'A' && b <= (byte)'Z') { sawUpper = true; }
+                length++;
+            }
+
+            if (length < 4 || !sawUpper) { return ""; }
+
+            string text = Encoding.ASCII.GetString(raw, 0, length);
+            if (IsKnownNoise(text)) { return ""; }
+            return text;
+        }
+
+        /// <summary>
+        /// 已知噪声：真机报告里反复冒充"建造 ID"的东西。
+        /// 方位词是地图方向的名字（每个对象附近都能找到），不是型号。
+        /// </summary>
+        private static bool IsKnownNoise(string text)
+        {
+            string upper = text.ToUpperInvariant();
+            if (upper == "NORTH" || upper == "SOUTH" || upper == "EAST" || upper == "WEST") { return true; }
+            if (upper == "NORTHEAST" || upper == "NORTHWEST" || upper == "SOUTHEAST" || upper == "SOUTHWEST") { return true; }
+            if (upper == "NONE" || upper == "TRUE" || upper == "FALSE" || upper == "NULL") { return true; }
+            return false;
+        }
+
+        private static uint ReadUInt32(byte[] buffer, int offset)
+        {
+            return (uint)(buffer[offset]
+                | (buffer[offset + 1] << 8)
+                | (buffer[offset + 2] << 16)
+                | (buffer[offset + 3] << 24));
         }
 
         /// <summary>
@@ -535,6 +654,12 @@ namespace MoTrainer.Calibration
                     "  {0,2}. 对象 {1} 类型表 0x{2:X8} {3}",
                     i + 1, c.ObjectLabel, c.VTable,
                     c.Source.Length > 0 ? "｜" + c.Source : (tracked[c.ObjectNumber - 1].NewlyAppeared ? "｜新造出来的" : "")));
+
+                List<string> hints = tracked[c.ObjectNumber - 1].TypeIdHints;
+                if (hints.Count > 0)
+                {
+                    text.AppendLine("      型号线索：" + string.Join(", ", hints.ToArray()));
+                }
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                     "      偏移 +0x{0:X3}｜变了 {1} 次｜单调 {2:0.00}｜推进率 {3:0.00}｜停下后 {4} 拍没动｜得分 {5}",
                     c.Series.Offset, c.Series.Changes, c.Monotonic, c.Rate, c.QuietAfter, c.Score));

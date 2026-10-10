@@ -81,6 +81,16 @@ namespace MoTrainer.Calibration
         /// <summary>来源说明（"我方房子" / "我方房子 → 跟随 +0xNNN"），报告里直接印出来。</summary>
         public string Source = "";
 
+        /// <summary>
+        /// 「型号线索」：这个对象里能找到的、像"建造 ID"的字符串（如 GAPOWR / HARV / E1）。
+        ///
+        /// 为什么需要：报告的读者（人）看得见偏移和取值，却**看不出这个对象是什么东西**。
+        /// 2026-10-10 就卡在这里：两个"倒数到 0"的字段，谁都说不清它们属于兵、车还是别的。
+        /// 现在每个对象都带一串线索，对不上型号也能一眼看出"这是哪一类东西"。
+        /// 采集收尾时统一扫一次（`ScanTypeIdHints`），扫不到就空着 —— 宁可空，不要瞎猜。
+        /// </summary>
+        public readonly List<string> TypeIdHints = new List<string>();
+
         /// <summary>本对象每拍 dump 多少字节（房子比普通对象大：金钱 0x30C、电力 0x53A4 都在它身上）。</summary>
         public int DumpBytes = HarvestSession.DumpBytes;
 
@@ -150,8 +160,13 @@ namespace MoTrainer.Calibration
         /// 为什么要有这个设计：生产进度**未必**记在房子对象内部 —— 按引擎惯例，
         /// 它更可能记在房子里某个指针指向的"生产队列/工厂"对象里。只盯房子本体的话，
         /// 一旦它在外面，这一局用户就白玩了。跟随一层是最划算的兜底。
+        ///
+        /// 2026-10-10 真机教训：上一版把 8 个名额全给了**模块内的静态结构**
+        /// （房子 +0x4/+0x8/+0xC… 指过去的都是程序自己的静态数据，整局一个字节都没动），
+        /// 真正该跟的**堆对象**一个都没轮到 —— 于是"跟随"这一层等于白做。
+        /// 现在只跟**不在模块区间内**的目标（真对象都在堆上），名额也放宽到 12。
         /// </summary>
-        public const int MaxFollowedFromHouse = 8;
+        public const int MaxFollowedFromHouse = 12;
 
         /// <summary>指针要在同一个位置上连续出现这么多拍，才认为它是"稳定的成员指针"并跟随过去。</summary>
         public const int FollowStableSamples = 3;
@@ -197,6 +212,7 @@ namespace MoTrainer.Calibration
         // 所以除了盯新建造的对象，还要盯**我方房子**，并从房子里跟随一层指针。
         private uint _houseAddress;
         private int _followedFromHouse;
+        private int _followSkippedStatic;
         private readonly Dictionary<int, FollowSlot> _followSlots = new Dictionary<int, FollowSlot>();
 
         /// <summary>
@@ -315,6 +331,7 @@ namespace MoTrainer.Calibration
                 _rosterEverRead = false;
                 _houseAddress = 0;
                 _followedFromHouse = 0;
+                _followSkippedStatic = 0;
                 _followSlots.Clear();
                 _houseNote = "";
                 _inspectionText = "";
@@ -397,6 +414,7 @@ namespace MoTrainer.Calibration
             // 为什么值得写两遍：收尾里那次全内存反查要十几秒，用户完全可能在这期间
             // 把修改器关掉 —— 只写一次的话，这一局的采集数据就整个没了。
             // 先落一版，最坏情况也只是少最后两节。
+            ScanTypeIdHints();
             WriteReport(false);
 
             try
@@ -819,6 +837,16 @@ namespace MoTrainer.Calibration
                 if (_followedFromHouse >= MaxFollowedFromHouse) { continue; }
                 if (_byAddress.ContainsKey(value) || value == _houseAddress) { continue; }
 
+                // **只跟堆对象**（2026-10-10 真机教训）：房子低偏移处的指针指向的是
+                // 程序自己的静态结构（在模块区间内，整局一动不动）—— 上一版把名额全给了它们，
+                // 真正的"生产队列/工厂"（堆对象）一个都没跟上。真对象一律在堆上。
+                bool insideModule = value >= moduleBase && value < moduleBase + moduleSize;
+                if (insideModule)
+                {
+                    _followSkippedStatic++;
+                    continue;
+                }
+
                 uint targetVtable;
                 if (!memory.ReadUInt32(value, out targetVtable)) { continue; }
                 if (targetVtable < moduleBase || targetVtable >= moduleBase + moduleSize) { continue; }
@@ -836,6 +864,34 @@ namespace MoTrainer.Calibration
                     "从「我方房子」跟随到对象 0x{0:X8}（房子 +0x{1:X} 指向它，类型表 0x{2:X8}）",
                     value, offset, targetVtable));
             }
+        }
+
+        /// <summary>
+        /// 给每个被跟踪对象扫一遍「型号线索」（像 GAPOWR / HARV / E1 这样的建造 ID 字符串）。
+        ///
+        /// 放在收尾里做，不在采样循环里做：它是几十次字符串读取，采样循环每拍都跑，
+        /// 不该为它增加每一拍的负担。**只读**，且读不到就空着（不猜）。
+        /// </summary>
+        private void ScanTypeIdHints()
+        {
+            MemoryIO memory = _target != null ? _target.Memory : null;
+            if (memory == null) { return; }
+
+            List<HarvestTracked> tracked;
+            lock (_lock) { tracked = new List<HarvestTracked>(_tracked); }
+
+            DateTime started = DateTime.UtcNow;
+            int found = 0;
+            for (int i = 0; i < tracked.Count; i++)
+            {
+                tracked[i].TypeIdHints.Clear();
+                List<string> ids = ProgressHunter.ScanTypeIds(memory, tracked[i].Address, 0x800);
+                for (int k = 0; k < ids.Count; k++) { tracked[i].TypeIdHints.Add(ids[k]); }
+                if (ids.Count > 0) { found++; }
+            }
+            Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
+                "型号线索扫描完毕：{0}/{1} 个对象扫到线索，耗时 {2:0.0} 秒",
+                found, tracked.Count, (DateTime.UtcNow - started).TotalSeconds));
         }
 
         private void ReadSelection(MemoryIO memory, uint moduleBase, HarvestSample sample)        {
@@ -1052,11 +1108,12 @@ namespace MoTrainer.Calibration
             // 「我方房子」认出来了没有 —— 必须写出来。
             // 认不出来时若什么都不写，用户那一局就白玩了、而且事后查不出原因。
             text.AppendLine("我方房子：" + (_houseNote.Length > 0 ? _houseNote : "（采集期间还没轮到认房子）"));
-            if (_followedFromHouse > 0)
+            if (_followedFromHouse > 0 || _followSkippedStatic > 0)
             {
                 text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "  从房子里跟随到 {0} 个对象（上限 {1}）—— 生产队列很可能是其中之一，见「二」里的「来源：我方房子 → 跟随」",
-                    _followedFromHouse, MaxFollowedFromHouse));
+                    "  从房子里跟随到 {0} 个**堆对象**（上限 {1}）—— 生产队列很可能是其中之一，见「二」里的「来源：我方房子 → 跟随」"
+                    + "；另有 {2} 个指向静态结构（在程序自己的数据段里、整局不动）的指针被跳过（2026-10-10 起：只跟堆对象）",
+                    _followedFromHouse, MaxFollowedFromHouse, _followSkippedStatic));
             }
 
             // ---- 一、时间线 ----
@@ -1114,6 +1171,13 @@ namespace MoTrainer.Calibration
                 {
                     text.AppendLine(string.Format(CultureInfo.InvariantCulture,
                         "  ⚠ 从采样 #{0} 起读不到了（对象已被摧毁，或该地址被其它对象复用）", t.DiedAt));
+                }
+                if (t.TypeIdHints.Count > 0)
+                {
+                    // 「型号线索」= 这个对象内部的指针指向的、像建造 ID 的字符串。
+                    // 有了它，报告里每个对象是什么东西就不再只能靠猜（2026-10-10 加的）。
+                    text.AppendLine("  型号线索：" + string.Join(", ", t.TypeIdHints.ToArray())
+                        + "（它内部指针指向的、像「建造 ID」的字符串）");
                 }
 
                 // 变化**按偏移分组**列（每个偏移一行 + 它的取值序列）。
