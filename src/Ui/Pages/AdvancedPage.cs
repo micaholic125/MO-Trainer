@@ -1775,6 +1775,14 @@ namespace MoTrainer.Ui.Pages
                 if (_target != null && _target.IsReady)
                 {
                     text.Append(HouseProbe.Preview(_target.Memory, _profile, _target.ModuleBase, spec));
+
+                    // 顺手把现场整段存一份（只读）：采集器只记"变过"的字段，常数它是瞎的。
+                    string dumpError;
+                    string dumpPath = HouseProbe.DumpObject(_target.Memory, _profile, _target.ModuleBase, spec,
+                        HouseProbe.VerifiedProducingTypeTable, "看现场", out dumpError);
+                    text.AppendLine(dumpPath.Length > 0
+                        ? "  （顺手把现场数据整段存了一份：" + dumpPath + "）"
+                        : "  （现场数据没存成：" + dumpError + "）");
                 }
                 else
                 {
@@ -1804,6 +1812,15 @@ namespace MoTrainer.Ui.Pages
             uint moduleBase = _target.ModuleBase;
             MemoryIO memory = _target.Memory;
             CalibrationProfile profile = _profile;
+
+            // 真写之前的最后一眼：把现场再存一份（**只读**）。
+            // 造好之后那颗东西就被游戏收走了，那时想存也存不到 —— 所以这一份必须在写之前拿。
+            string preWriteDumpError;
+            string preWriteDumpPath = HouseProbe.DumpObject(memory, profile, moduleBase, pending,
+                HouseProbe.VerifiedProducingTypeTable, "写之前", out preWriteDumpError);
+            Logger.Info("Advanced", preWriteDumpPath.Length > 0
+                ? "现场数据已整段存下来：" + preWriteDumpPath
+                : "现场数据没存成（不影响试探）：" + preWriteDumpError);
 
             text.AppendLine("正在写…（约 3 秒后收尾）**现在看游戏里：那样东西有没有立刻造好？**");
             SetOutput(text.ToString());

@@ -5691,6 +5691,61 @@ namespace MoTrainer.Diagnostics
                         && previewText.IndexOf("一个字节都没写", StringComparison.Ordinal) >= 0,
                     previewText.Replace('\r', ' ').Replace('\n', '|'));
 
+                // ---- 现场整段存文件（只读；采集器只记"变过"的字段，常数它是瞎的）----
+                // 放一个**只可能出现在目标对象身上**的哨兵值，免得"某个 4 字节碰巧在别处也有"
+                // 让断言变成假绿（2026-10-10 真的踩到过：1926 在房子那 24 KB 里恰好也有一份）。
+                io.WriteUInt32(producing + 0x900, 0x1234ABCD);
+
+                string dumpFolder = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "_selftest_dump");
+                string dumpError;
+                string dumpPath = HouseProbe.DumpObject(io, profile, moduleBase, byHandle,
+                    producingClass, "测试", dumpFolder, out dumpError);
+
+                bool dumpOk = false;
+                bool dumpHasTargetSection = false;
+                bool dumpHasSentinel = false;
+                bool dumpHasHouseSection = false;
+                string dumpFirstLine = "(没生成)";
+                try
+                {
+                    if (dumpPath.Length > 0 && System.IO.File.Exists(dumpPath))
+                    {
+                        string content = System.IO.File.ReadAllText(dumpPath);
+                        dumpFirstLine = "共 " + content.Length + " 字节";
+                        int targetAt = content.IndexOf("--- 正在生产的东西", StringComparison.Ordinal);
+                        int houseAt = content.IndexOf("--- 我方房子", StringComparison.Ordinal);
+                        dumpOk = targetAt >= 0 && houseAt > targetAt;
+                        if (dumpOk)
+                        {
+                            string targetSection = content.Substring(targetAt, houseAt - targetAt);
+                            dumpHasTargetSection = targetSection.IndexOf(
+                                "0x" + producing.ToString("X8"), StringComparison.Ordinal) >= 0;
+                            dumpHasSentinel = targetSection.IndexOf("CD AB 34 12", StringComparison.Ordinal) >= 0;
+                            dumpHasHouseSection = houseAt >= 0;
+                        }
+                    }
+                }
+                catch { }
+
+                Check("字段试探：能把现场整段存成文件（离线可翻「从没变过」的字段，如总拍数）",
+                    dumpOk && dumpHasTargetSection && dumpHasSentinel && dumpHasHouseSection,
+                    dumpPath + "｜找到了=" + dumpOk + " 目标段=" + dumpHasTargetSection
+                    + " 哨兵=" + dumpHasSentinel + " 房子段=" + dumpHasHouseSection
+                    + "｜首行=" + dumpFirstLine);
+
+                uint afterDump;
+                io.ReadUInt32(remainingField, out afterDump);
+                Check("字段试探：存文件是**只读**的（存完内存里一个字节都没动）",
+                    afterDump == 1926, "内存现值 " + afterDump);
+
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, 0);
+                string noDumpError;
+                string noDumpPath = HouseProbe.DumpObject(io, profile, moduleBase, byHandle,
+                    producingClass, "测试", dumpFolder, out noDumpError);
+                Check("字段试探：存不下来时说得出为什么（不静默）",
+                    noDumpPath.Length == 0 && noDumpError.Length > 0, noDumpError);
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, producing);
+
                 // ---- 正常路径 A：跟着把手写（真机第二轮试探就是这条）----
                 HouseProbeResult byHandleOk = HouseProbe.Run(io, profile, moduleBase, byHandle, ShortHold, producingClass);
                 Check("字段试探：跟着把手**确实写到了那个对象**上（不是房子）",
@@ -5787,6 +5842,14 @@ namespace MoTrainer.Diagnostics
                 if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
                 if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
                 self.Dispose();
+
+                // 体检自己产生的转储文件不要留在磁盘上（真报告目录里更不许留）。
+                try
+                {
+                    string dumpFolder = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "_selftest_dump");
+                    if (System.IO.Directory.Exists(dumpFolder)) { System.IO.Directory.Delete(dumpFolder, true); }
+                }
+                catch { }
             }
         }
 

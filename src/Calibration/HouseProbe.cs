@@ -546,7 +546,7 @@ namespace MoTrainer.Calibration
                 {
                     target.Note = string.Format(CultureInfo.InvariantCulture,
                         "「正在生产的东西」的 +0x{0:X} 现在是 {1}，**大得像地址** —— "
-                        + "这一格不像「还差多少钱」，拒绝执行。", spec.Offset, target.Value);
+                        + "这一格不像个数，拒绝执行。", spec.Offset, target.Value);
                     return target;
                 }
                 target.ExtraNote = string.Format(CultureInfo.InvariantCulture,
@@ -555,6 +555,102 @@ namespace MoTrainer.Calibration
 
             target.Ok = true;
             return target;
+        }
+
+        /// <summary>
+        /// 把目标对象的**原始数据整段**存成文件（**只读**，一个字节都不写）。
+        ///
+        /// 为什么需要：采集器只记**变过**的字段 —— 像"这个型号一共要造多少拍"这种**从头到尾不变的值**
+        /// 它根本看不见，2026-10-10 那几轮试探就是因此一直在猜。存成文件后可以离线把每一格都翻一遍。
+        /// 落盘位置与其它报告一致（工具自己的 `reports` 目录），不写别处。
+        /// </summary>
+        public static string DumpObject(
+            MemoryIO memory, CalibrationProfile profile, uint moduleBase, HouseProbeSpec spec,
+            uint expectedProducingType, string tag, out string error)
+        {
+            return DumpObject(memory, profile, moduleBase, spec, expectedProducingType, tag, null, out error);
+        }
+
+        /// <summary>同上，`folderOverride` 是给自动体检用的（不许往真报告目录里丢测试文件）。</summary>
+        public static string DumpObject(
+            MemoryIO memory, CalibrationProfile profile, uint moduleBase, HouseProbeSpec spec,
+            uint expectedProducingType, string tag, string folderOverride, out string error)
+        {
+            error = "";
+            try
+            {
+                Target target = Resolve(memory, profile, moduleBase, spec, expectedProducingType);
+                if (!target.Ok) { error = target.Note; return ""; }
+
+                DateTime now = DateTime.Now;
+                string folder = string.IsNullOrEmpty(folderOverride)
+                    ? System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ProfileStore.ReportsFolderName)
+                    : folderOverride;
+                if (!System.IO.Directory.Exists(folder)) { System.IO.Directory.CreateDirectory(folder); }
+                string path = System.IO.Path.Combine(folder, string.Format(CultureInfo.InvariantCulture,
+                    "objdump-{0:yyyyMMdd-HHmmss}-{1}.txt", now, tag));
+
+                StringBuilder text = new StringBuilder();
+                text.AppendLine("=== 对象原始数据（" + tag + "）===");
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "时间：{0:yyyy-MM-dd HH:mm:ss}｜准备写：{1}", now, spec.Describe()));
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "我方房子：0x{0:X8}", target.House));
+                if (target.FollowedHandle)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "「正在生产的东西」：0x{0:X8}（类型表 0x{1:X8}）—— 房子 + 0x{2:X} 指向它",
+                        target.Object, target.TypeTable, HarvestSession.ProducingPointerOffset));
+                }
+                text.AppendLine();
+
+                AppendHex(text, memory, target.Object, (int)ProducingMaxOffset, "正在生产的东西");
+                AppendHex(text, memory, target.House, (int)MaxOffset, "我方房子");
+
+                System.IO.File.WriteAllText(path, text.ToString(), new UTF8Encoding(false));
+                return path;
+            }
+            catch (Exception ex)
+            {
+                error = ex.GetType().Name + ": " + ex.Message;
+                return "";
+            }
+        }
+
+        /// <summary>把一段内存按 16 字节一行写成"十六进制 + 可见字符"（读不到的行如实标出来）。</summary>
+        private static void AppendHex(
+            StringBuilder text, MemoryIO memory, uint baseAddress, int length, string label)
+        {
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "--- {0}：0x{1:X8} 起，共 {2} 字节 ---", label, baseAddress, length));
+            for (int offset = 0; offset < length; offset += 16)
+            {
+                byte[] line = memory.ReadBytesQuiet(baseAddress + (uint)offset, 16);
+                if (line == null)
+                {
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture, "+{0:X4}: （读不到）", offset));
+                    continue;
+                }
+
+                StringBuilder hex = new StringBuilder();
+                StringBuilder ascii = new StringBuilder();
+                for (int i = 0; i < 16; i++)
+                {
+                    if (i < line.Length)
+                    {
+                        hex.Append(line[i].ToString("X2", CultureInfo.InvariantCulture)).Append(' ');
+                        ascii.Append(line[i] >= 32 && line[i] < 127 ? (char)line[i] : '.');
+                    }
+                    else
+                    {
+                        hex.Append("?? ");
+                        ascii.Append('?');
+                    }
+                }
+                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "+{0:X4}: {1} |{2}|", offset, hex.ToString(), ascii.ToString()));
+            }
+            text.AppendLine();
         }
 
         public static HouseProbeResult Run(
