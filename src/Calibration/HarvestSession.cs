@@ -213,6 +213,26 @@ namespace MoTrainer.Calibration
         /// <summary>从房子里跟随的堆对象之外，再盯这么多"指向我方房子"的对象。</summary>
         public const int MaxMyObjects = 12;
 
+        /// <summary>「正在生产的东西」最多同时盯几个（换一样就多一个，别把跟踪名额吃光）。</summary>
+        public const int MaxProducingTracked = 8;
+
+        /// <summary>
+        /// 「我方房子 +0x53BC 指向的对象」—— 2026-10-10 从真机数据里认出来的**生产状态持有者**。
+        ///
+        /// 判据（两次真机采集一致，见 `开发日志/2026-10-10.md` 第七节）：
+        /// 这个指针**每件东西只变一次**：`0 → 某个对象 → 0`；而且变动次数**恰好等于用户这一局造了几样东西**
+        /// （第三次采集他造了 4 样 —— 兵营、电厂1、电厂2、动员兵 —— 该字段正好变 4 次）。
+        /// 换句话说：游戏在"开始造一样东西"时把它挂在这里、造完就摘掉。这就是生产队列的把手。
+        ///
+        /// **注意**：这是**从数据里认出来的线索，不是"已确认的字段语义"**（本项目规矩：字段语义必须运行时自证）。
+        /// 所以这里只用它**只读地盯住那个对象**（读、不写），真相靠"它旁边哪些字段随生产推进"来说话。
+        /// </summary>
+        public const uint ProducingPointerOffset = 0x53BC;
+
+        /// <summary>房子 +0x53BC 上一次指向谁（用来发现"换了一个新对象"）。</summary>
+        private uint _lastProducingTarget;
+        private int _producingTracked;
+
         /// <summary>"指向我方房子"的扫描只做一次（它要读几百个对象的头部，不能每拍都做）。</summary>
         private bool _myObjectsScanned;
         private int _myObjectsTracked;
@@ -343,6 +363,8 @@ namespace MoTrainer.Calibration
                 _houseNote = "";
                 _myObjectsScanned = false;
                 _myObjectsTracked = 0;
+                _lastProducingTarget = 0;
+                _producingTracked = 0;
                 _inspectionText = "";
                 _finalizing = false;
                 _rosterSlot = 0;
@@ -515,6 +537,9 @@ namespace MoTrainer.Calibration
 
             // 「谁指向我方房子」→ 盯上那些房子名下的对象（生产队列大概率在这一类里，见方法注释）
             TrackMyObjects(memory, moduleBase, moduleSize, sample);
+
+            // 房子 +0x53BC 指向的对象 = **正在生产的东西**（2026-10-10 从真机数据认出来的把手）
+            TrackProducingObject(memory, sample);
 
             // 阵营分组（用来判断阵营偏移是否有效：有效的表现是"少数几个阵营、各自聚集大量单位"）
             if (_profile.OffsetTechnoOwner != 0 && roster.Count > 0)
@@ -1006,6 +1031,43 @@ namespace MoTrainer.Calibration
                 if (roster[i].Address == address) { return roster[i].VTable; }
             }
             return 0;
+        }
+
+        /// <summary>
+        /// 盯上「房子 +0x53BC 指向的那个对象」—— 游戏挂"当前正在造的东西"的把手（判据见常量注释）。
+        /// **只读**：读指针、盯住目标；不写、也不据此下结论（真相靠它旁边的字段随时间的表现）。
+        /// </summary>
+        private void TrackProducingObject(MemoryIO memory, HarvestSample sample)
+        {
+            if (_houseAddress == 0) { return; }
+
+            uint target;
+            if (!memory.ReadUInt32(_houseAddress + ProducingPointerOffset, out target)) { return; }
+            if (target == _lastProducingTarget) { return; }
+
+            _lastProducingTarget = target;
+            if (target == 0)
+            {
+                Logger.Info("Harvest", "房子 +0x53BC 归零（这一件造完了）");
+                return;
+            }
+            if (target < 0x10000 || _byAddress.ContainsKey(target)) { return; }
+            if (_producingTracked >= MaxProducingTracked || _tracked.Count >= MaxTracked) { return; }
+
+            HarvestTracked tracked = new HarvestTracked();
+            tracked.Address = target;
+            tracked.FirstSeen = sample.Index;
+            tracked.Source = "我方房子 +0x53BC 指向的（**正在生产的东西**）";
+            tracked.DumpBytes = 0x1000;
+            uint head;
+            if (memory.ReadUInt32(target, out head)) { tracked.FirstVTable = head; }
+            _byAddress[target] = tracked;
+            _tracked.Add(tracked);
+            _producingTracked++;
+
+            Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
+                "房子 +0x53BC 指向新对象 0x{0:X8}（类型表 0x{1:X8}）—— 这就是**正在生产的东西**，盯住它",
+                target, tracked.FirstVTable));
         }
 
         private void ReadSelection(MemoryIO memory, uint moduleBase, HarvestSample sample)        {

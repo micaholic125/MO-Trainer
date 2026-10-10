@@ -5395,6 +5395,12 @@ namespace MoTrainer.Diagnostics
                 uint staticDecoy = moduleBase + 0x3000;
                 io.WriteUInt32(staticDecoy, moduleBase + 0x2010);
                 io.WriteUInt32(house + 0x208, staticDecoy);
+
+                // 「正在生产的东西」：房子 +0x53BC 上挂一个对象（真机里这就是"生产槽位"）。
+                uint producing = heap + 0xA000;
+                io.WriteUInt32(producing, houseVtable);
+                io.WriteUInt32(producing + 0x100, 4242);        // 一个会变的字段，随便什么值
+                io.WriteUInt32(house + 0x53BC, producing);
                 io.WriteUInt32(followed, moduleBase + 0x2010);   // 目标确实是个 C++ 对象
                 io.WriteUInt32(bogus, 0xDEADBEEF);               // 目标头 4 字节不是模块区间指针
 
@@ -5468,6 +5474,12 @@ namespace MoTrainer.Diagnostics
                 Check("采集器：盯上了「指向我方房子」的对象（按稀有类别挑）",
                     text.IndexOf("指向我方房子", StringComparison.Ordinal) >= 0,
                     text.IndexOf("指向我方房子", StringComparison.Ordinal) >= 0 ? "已在跟踪" : "没找到这类对象");
+
+                // 「房子 +0x53BC 指向的对象」= **正在生产的东西**（2026-10-10 从真机数据认出来的把手：
+                // 每造一样东西就 0 → 对象 → 0 一次，三份报告都对得上）。
+                Check("采集器：盯上了「房子 +0x53BC 指向的、正在生产的东西」",
+                    text.IndexOf("正在生产的东西", StringComparison.Ordinal) >= 0,
+                    text.IndexOf("正在生产的东西", StringComparison.Ordinal) >= 0 ? "已在跟踪" : "没跟上");
 
                 // ---- 负面用例：认不出房子时，必须**说得出卡在哪一步** ----
                 // 这是本项目最忌讳的失败模式的正面防线：用户开一局、点一次采集，
