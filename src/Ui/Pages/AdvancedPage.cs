@@ -1719,20 +1719,22 @@ namespace MoTrainer.Ui.Pages
         }
 
         /// <summary>
-        /// 「房子字段试探」：往**我方房子**的某个偏移写一个值、盯 3 秒、**无条件还原**。
+        /// 「字段试探」：往**我方房子**（或它名下的「正在生产的东西」）的某个偏移写一个值、盯 3 秒、再收尾。
         ///
-        /// 为什么需要：`[S6-2]` 追了两轮采集，"进度字段"的形态判据全用遍也没找到；
-        /// 数据反而指出这类引擎的建造是「**按拍付钱、付满就造好**」
-        /// （真机证据：房子的 `+0x2DC` 与金钱的减少逐拍完全相同、总数也等于花掉的钱）。
-        /// 若果真如此，往账上加大数就能让当前建造立刻造好 —— 这种事**只能写一下看行为**。
+        /// 为什么需要：`[S6-2]` 的"进度字段"形态判据全用遍也没找到，只能**写一下看行为**。
+        /// 第一轮写房子的 `+0x2DC`（2026-10-10 17:40：**写进去了、建造毫无反应** → 干净否掉）；
+        /// 本版跟着**房子 +0x53BC 指向的「正在生产的东西」**走 —— 真机数据指出它的 `+0x60`
+        /// 每拍正好减少"这一拍扣掉的钱"、造好时正好落到 0（一座 2000 块的矿场：首拍付 74、剩 1926，最后归 0）。
         ///
-        /// 安全设计（与「电力试探」同源）：① 点两次才真写；② 只写我方房子（金钱链解析出来的那个对象）；
-        /// ③ 拒绝写金钱偏移；④ 写前查目标页可写；⑤ 写完回读；⑥ **finally 里无条件还原**并回读确认。
+        /// 安全设计（与「电力试探」同源）：① 点两次才真写（**第一次只做只读侦查**，并把要写哪儿念给用户听）；
+        /// ② 只写我方房子（金钱链解析出来的那个对象），或**它自己的把手**指向的那个对象；
+        /// ③ 拒绝写金钱偏移；④ 写前查目标页可写；⑤ 写完回读；
+        /// ⑥ 收尾：游戏没动过就无条件还原并回读确认，**游戏自己动过就不还原**（那一格已归游戏管）。
         /// </summary>
         private void OnHouseProbeClick(object sender, EventArgs e)
         {
             StringBuilder text = new StringBuilder();
-            text.AppendLine("=== 房子字段试探（会往你自己的房子那个对象里写一个值，约 3 秒后自动还原）===");
+            text.AppendLine("=== 字段试探（往「我方房子」或它名下的「正在生产的东西」里写一个值，约 3 秒后收尾）===");
             text.AppendLine();
 
             if (_houseProbeThread != null && _houseProbeThread.IsAlive)
@@ -1750,9 +1752,9 @@ namespace MoTrainer.Ui.Pages
                     text.AppendLine("没找到目标配置文件：");
                     text.AppendLine("  " + path);
                     text.AppendLine();
-                    text.AppendLine("请新建这个文件、写一行，例如：");
-                    text.AppendLine("  0x2DC +100000");
-                    text.AppendLine("（`+100000` = 在当前值上加十万；也可写 `=0` 表示直接写 0）");
+                    text.AppendLine("请新建这个文件、写一行，两种写法：");
+                    text.AppendLine("  0x2DC +100000   ← 写「我方房子」的这一格，在当前值上加十万");
+                    text.AppendLine("  handle 0x60 =1  ← 跟着房子的把手走，写「正在生产的东西」的这一格，直接写 1");
                     SetOutput(text.ToString());
                     return;
                 }
@@ -1769,17 +1771,21 @@ namespace MoTrainer.Ui.Pages
                 _houseProbePending = spec;
                 text.AppendLine("**第一次点击只做说明，不会写任何东西。** 确认下面这些之后，再点一次才真写：");
                 text.AppendLine();
-                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "  写哪儿：我方房子 + 0x{0:X}（房子地址由金钱链推出）", spec.Offset));
-                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "  写什么：{0}", spec.IsDelta
-                        ? string.Format(CultureInfo.InvariantCulture, "在当前值上 +{0}", spec.Value)
-                        : string.Format(CultureInfo.InvariantCulture, "直接写 {0}", spec.Value)));
+                text.AppendLine("  准备写：" + spec.Describe());
+                if (_target != null && _target.IsReady)
+                {
+                    text.Append(HouseProbe.Preview(_target.Memory, _profile, _target.ModuleBase, spec));
+                }
+                else
+                {
+                    text.AppendLine("  （游戏没连上，读不到现场情况 —— 先启动游戏、确认状态条显示「已连接」）");
+                }
                 text.AppendLine();
-                text.AppendLine("  怎么用：**先在游戏里造一样东西**（比如一座电厂），等它开始建造时再点第二次；");
-                text.AppendLine("  写完之后**盯 3 秒**，看那样东西是不是「一下子就造好了」。3 秒后程序自动写回原值。");
-                text.AppendLine("  风险：这是往你自己的房子写**数据**（不是代码），写错顶多界面上某个数字跳一下，");
-                text.AppendLine("  而且 3 秒后一定还原；**试探期间请不要关闭程序**。");
+                text.AppendLine("  怎么用：**先在游戏里造一样东西**（比如一座矿场），等它开始建造时再点第二次；");
+                text.AppendLine("  写完之后**盯 3 秒**，看那样东西是不是「一下子就造好了」。");
+                text.AppendLine("  收尾：游戏没动过那一格 → 3 秒后写回原值；游戏自己动过了 → 不写回（那一格已经归游戏管）。");
+                text.AppendLine("  写的是**数据**（不是代码）：不注入、不改游戏文件；地址不对时程序会拒绝写并说明原因。");
+                text.AppendLine("  **试探期间请不要关闭程序。**");
                 SetOutput(text.ToString());
                 return;
             }
@@ -1798,7 +1804,7 @@ namespace MoTrainer.Ui.Pages
             MemoryIO memory = _target.Memory;
             CalibrationProfile profile = _profile;
 
-            text.AppendLine("正在写…（约 3 秒后自动还原）**现在看游戏里：那样东西有没有立刻造好？**");
+            text.AppendLine("正在写…（约 3 秒后收尾）**现在看游戏里：那样东西有没有立刻造好？**");
             SetOutput(text.ToString());
 
             _houseProbeResult = null;
@@ -1830,7 +1836,7 @@ namespace MoTrainer.Ui.Pages
             _houseProbeResult = null;
 
             StringBuilder text = new StringBuilder();
-            text.AppendLine("=== 房子字段试探结果 ===");
+            text.AppendLine("=== 字段试探结果 ===");
             text.AppendLine();
             text.Append(probe.Explain());
             text.AppendLine();

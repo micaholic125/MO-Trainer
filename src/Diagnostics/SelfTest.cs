@@ -5529,22 +5529,25 @@ namespace MoTrainer.Diagnostics
             HouseProbeSpec spec;
             string error;
 
-            Check("房子试探：解析 `0x2DC +100000`（在现值上加）",
+            Check("字段试探：解析 `0x2DC +100000`（旧写法 = 写我方房子）",
                 HouseProbeSpec.TryParse("0x2DC +100000", out spec, out error)
-                    && spec.Offset == 0x2DC && spec.IsDelta && spec.Value == 100000,
+                    && !spec.FollowProducingHandle && spec.Offset == 0x2DC && spec.IsDelta && spec.Value == 100000,
                 error.Length > 0 ? error : "0x2DC +100000");
-            Check("房子试探：解析 `0x57A4 =0`（直接写 0）",
-                HouseProbeSpec.TryParse("0x57A4 =0", out spec, out error)
-                    && spec.Offset == 0x57A4 && !spec.IsDelta && spec.Value == 0,
-                error.Length > 0 ? error : "0x57A4 =0");
-            Check("房子试探：配置空着或格式不对时说得出为什么（不静默）",
-                !HouseProbeSpec.TryParse("", out spec, out error) && error.Length > 0
-                    && !HouseProbeSpec.TryParse("0x2DC", out spec, out error) && error.Length > 0
-                    && !HouseProbeSpec.TryParse("0xZZ +1", out spec, out error) && error.Length > 0,
-                "三条坏配置都被拒绝并给出原因");
+            Check("字段试探：解析 `handle 0x60 =1`（跟着把手写「正在生产的东西」）",
+                HouseProbeSpec.TryParse("handle 0x60 =1", out spec, out error)
+                    && spec.FollowProducingHandle && spec.Offset == 0x60 && !spec.IsDelta && spec.Value == 1,
+                error.Length > 0 ? error : "handle 0x60 =1");
+            Check("字段试探：`house 0x2DC +5` 与旧写法等价（明写 house 也是写房子本体）",
+                HouseProbeSpec.TryParse("house 0x2DC +5", out spec, out error)
+                    && !spec.FollowProducingHandle && spec.Offset == 0x2DC && spec.Value == 5,
+                error.Length > 0 ? error : "house 0x2DC +5");
+            Check("字段试探：配置空着 / 少一段 / 偏移不是十六进制 / 第一段写错时，都说得出为什么（不静默）",
+                RejectedWithReason("") && RejectedWithReason("0x2DC") && RejectedWithReason("0xZZ +1")
+                    && RejectedWithReason("handle 0x60") && RejectedWithReason("hous 0x2DC +1"),
+                "五条坏配置都被拒绝并给出原因");
 
             SelfHandle self = SelfHandle.Create();
-            if (self == null || !self.IsReady) { Check("房子试探", false, "OpenProcess 失败"); return; }
+            if (self == null || !self.IsReady) { Check("字段试探", false, "OpenProcess 失败"); return; }
 
             IntPtr moduleBlock = IntPtr.Zero;
             IntPtr heapBlock = IntPtr.Zero;
@@ -5554,12 +5557,12 @@ namespace MoTrainer.Diagnostics
                 heapBlock = AllocLowBlock(self.Handle);
                 if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
                 {
-                    Check("房子试探（测试内存块）", false, Win32Api.LastErrorMessage());
+                    Check("字段试探（测试内存块）", false, Win32Api.LastErrorMessage());
                     return;
                 }
                 if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
                 {
-                    WarnItem("房子试探", "测试块不在 4GB 以下，跳过");
+                    WarnItem("字段试探", "测试块不在 4GB 以下，跳过");
                     return;
                 }
 
@@ -5571,11 +5574,23 @@ namespace MoTrainer.Diagnostics
                 const uint MoneyOffset = 0x30C;
                 const uint FieldOffset = 0x2DC;
                 const uint FieldValue = 1760;
+                const int ShortHold = 150;                             // 合成场景里不用真等 3 秒
 
+                // 合成世界：房子 + 它名下的「正在生产的东西」（真机里由 房子+0x53BC 指过去）
+                uint producingClass = moduleBase + 0x3000;             // 真机上是 0x007E88D0（造矿场那一局）
+                uint otherClass = moduleBase + 0x4000;
                 uint house = heap + 0x1000;
+                uint producing = heap + 0x2000;
+                uint remainingField = producing + 0x60;
+
                 io.WriteUInt32(house, moduleBase + 0x2000);            // 房子头部：模块区间内的类型表
                 io.WriteUInt32(house + MoneyOffset, 48240);            // 金钱
                 io.WriteUInt32(house + FieldOffset, FieldValue);       // 待试探的字段（真机里这格是"已付多少"）
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, producing);
+                io.WriteUInt32(producing, producingClass);             // 「正在生产的东西」的头部
+                io.WriteUInt32(remainingField, 1926);                  // 真机值：还差 1926 没付完（矿场 2000 − 已付 74）
+                io.WriteUInt32(house + 0x60, 999);                     // **诱饵**：房子身上的同一个偏移也放个数，
+                                                                       // 这样"写错对象"会真写下去，而不是被别的门挡掉
                 io.WriteUInt32(moduleBase + 0x100, house);             // 金钱链的静态根
 
                 CalibrationProfile profile = new CalibrationProfile();
@@ -5583,45 +5598,163 @@ namespace MoTrainer.Diagnostics
                 profile.ModuleSize = moduleSize;
                 profile.Money.SetOffsets(new uint[] { 0x100, MoneyOffset });
 
-                // ---- 拒绝路径 ----
+                // ---- 拒绝路径（写哪儿不对就不写）----
                 HouseProbeSpec moneySpec;
                 HouseProbeSpec.TryParse("0x30C +1", out moneySpec, out error);
-                HouseProbeResult refusedMoney = HouseProbe.Run(io, profile, moduleBase, moneySpec);
-                Check("房子试探：**拒绝写金钱**（+0x30C）", !refusedMoney.Ok && !refusedMoney.Wrote,
+                HouseProbeResult refusedMoney = HouseProbe.Run(io, profile, moduleBase, moneySpec, ShortHold, producingClass);
+                Check("字段试探：**拒绝写金钱**（+0x30C）", !refusedMoney.Ok && !refusedMoney.Wrote,
                     refusedMoney.Note);
 
                 HouseProbeSpec farSpec;
                 HouseProbeSpec.TryParse("0x8000 +1", out farSpec, out error);
-                HouseProbeResult refusedFar = HouseProbe.Run(io, profile, moduleBase, farSpec);
-                Check("房子试探：偏移越界时拒绝", !refusedFar.Ok && !refusedFar.Wrote, refusedFar.Note);
+                HouseProbeResult refusedFar = HouseProbe.Run(io, profile, moduleBase, farSpec, ShortHold, producingClass);
+                Check("字段试探：偏移越界时拒绝（房子按 0x6000 算）",
+                    !refusedFar.Ok && !refusedFar.Wrote, refusedFar.Note);
+
+                HouseProbeSpec farHandle;
+                HouseProbeSpec.TryParse("handle 0x2000 =1", out farHandle, out error);
+                HouseProbeResult refusedFarHandle =
+                    HouseProbe.Run(io, profile, moduleBase, farHandle, ShortHold, producingClass);
+                Check("字段试探：跟着把手时按「生产对象 0x1000」算，超出也拒绝",
+                    !refusedFarHandle.Ok && !refusedFarHandle.Wrote, refusedFarHandle.Note);
 
                 HouseProbeResult refusedNoMoney =
-                    HouseProbe.Run(io, new CalibrationProfile(), moduleBase, moneySpec);
-                Check("房子试探：金钱未校准时拒绝并说明缺什么",
+                    HouseProbe.Run(io, new CalibrationProfile(), moduleBase, moneySpec, ShortHold, producingClass);
+                Check("字段试探：金钱未校准时拒绝并说明缺什么",
                     !refusedNoMoney.Ok && refusedNoMoney.Note.IndexOf("金钱", StringComparison.Ordinal) >= 0,
                     refusedNoMoney.Note);
 
-                // ---- 正常路径：写进去、盯 3 秒、还原回来 ----
+                // ---- 跟着把手走：四道门，每一道都要拒绝 ----
+                HouseProbeSpec byHandle;
+                HouseProbeSpec.TryParse("handle 0x60 =1", out byHandle, out error);
+
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, 0);
+                HouseProbeResult emptyHandle = HouseProbe.Run(io, profile, moduleBase, byHandle, ShortHold, producingClass);
+                Check("字段试探：把手是空的时候**拒绝**（没东西在造，写了也不知道是谁的反应）",
+                    !emptyHandle.Ok && !emptyHandle.Wrote
+                        && emptyHandle.Note.IndexOf("没有任何东西在造", StringComparison.Ordinal) >= 0,
+                    emptyHandle.Note);
+                Check("字段试探：只读侦查也把「现在没东西在造」念出来（用户点第一次就知道）",
+                    HouseProbe.Preview(io, profile, moduleBase, byHandle, producingClass)
+                        .IndexOf("没有任何东西在造", StringComparison.Ordinal) >= 0,
+                    "Preview");
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, producing);
+
+                io.WriteUInt32(producing, 0x12345678);
+                HouseProbeResult notObject = HouseProbe.Run(io, profile, moduleBase, byHandle, ShortHold, producingClass);
+                Check("字段试探：把手指向的东西**不像游戏对象**时拒绝，而且是**因为这个原因**拒的",
+                    !notObject.Ok && !notObject.Wrote
+                        && notObject.Note.IndexOf("不像游戏里的对象", StringComparison.Ordinal) >= 0,
+                    notObject.Note);
+
+                CalibrationProfile noSize = new CalibrationProfile();
+                noSize.ModuleBase = moduleBase;
+                noSize.Money.SetOffsets(new uint[] { 0x100, MoneyOffset });
+                HouseProbeResult refusedNoSize =
+                    HouseProbe.Run(io, noSize, moduleBase, byHandle, ShortHold, producingClass);
+                Check("字段试探：配置里没记模块大小时，拒绝并说清缺什么（不去猜）",
+                    !refusedNoSize.Ok && !refusedNoSize.Wrote
+                        && refusedNoSize.Note.IndexOf("模块大小", StringComparison.Ordinal) >= 0,
+                    refusedNoSize.Note);
+                io.WriteUInt32(producing, producingClass);
+
+                io.WriteUInt32(producing, otherClass);
+                HouseProbeResult wrongClass = HouseProbe.Run(io, profile, moduleBase, byHandle, ShortHold, producingClass);
+                Check("字段试探：**没验过的类别一律不写**（宁可少写一次、回头补验）",
+                    !wrongClass.Ok && !wrongClass.Wrote
+                        && wrongClass.Note.IndexOf("不是我真机验过的那一类", StringComparison.Ordinal) >= 0,
+                    wrongClass.Note);
+                Check("字段试探：只读侦查与真写**用同一个门槛**（侦查说不能写，真写也一定被拒）",
+                    HouseProbe.Preview(io, profile, moduleBase, byHandle, producingClass)
+                        .IndexOf("不是我真机验过的那一类", StringComparison.Ordinal) >= 0
+                        && !wrongClass.Ok && !wrongClass.Wrote,
+                    "两边都拒绝");
+                io.WriteUInt32(producing, producingClass);
+
+                io.WriteUInt32(remainingField, 0);
+                HouseProbeResult zeroField = HouseProbe.Run(io, profile, moduleBase, byHandle, ShortHold, producingClass);
+                Check("字段试探：那一格是 0 时拒绝（多半是没东西在造 / 找错格子了）",
+                    !zeroField.Ok && !zeroField.Wrote, zeroField.Note);
+
+                io.WriteUInt32(remainingField, 0x20000000);
+                HouseProbeResult hugeField = HouseProbe.Run(io, profile, moduleBase, byHandle, ShortHold, producingClass);
+                Check("字段试探：那一格**大得像地址**时拒绝（与猎手的「取值像地址」同口径）",
+                    !hugeField.Ok && !hugeField.Wrote
+                        && hugeField.Note.IndexOf("大得像地址", StringComparison.Ordinal) >= 0,
+                    hugeField.Note);
+                io.WriteUInt32(remainingField, 1926);
+
+                string previewText = HouseProbe.Preview(io, profile, moduleBase, byHandle, producingClass);
+                Check("字段试探：只读侦查把那颗对象、那一格的现值都念出来（用户点第一次就看到）",
+                    previewText.IndexOf(producing.ToString("X8"), StringComparison.Ordinal) >= 0
+                        && previewText.IndexOf("1926", StringComparison.Ordinal) >= 0
+                        && previewText.IndexOf("一个字节都没写", StringComparison.Ordinal) >= 0,
+                    previewText.Replace('\r', ' ').Replace('\n', '|'));
+
+                // ---- 正常路径 A：跟着把手写（真机第二轮试探就是这条）----
+                HouseProbeResult byHandleOk = HouseProbe.Run(io, profile, moduleBase, byHandle, ShortHold, producingClass);
+                Check("字段试探：跟着把手**确实写到了那个对象**上（不是房子）",
+                    byHandleOk.Ok && byHandleOk.Wrote && byHandleOk.FollowedHandle
+                        && byHandleOk.TargetObject == producing && byHandleOk.FieldAddress == remainingField
+                        && byHandleOk.AfterWrite == 1,
+                    "写前 " + byHandleOk.Before + " → 写后 " + byHandleOk.AfterWrite);
+                Check("字段试探：这一格游戏没动过 → **无条件还原**（还原后就是原值）",
+                    byHandleOk.Restored && byHandleOk.ReadAfterRestore && byHandleOk.AfterRestore == 1926
+                        && !byHandleOk.GameChangedIt && !byHandleOk.SkippedRestore,
+                    "还原后读到 " + byHandleOk.AfterRestore);
+                Check("字段试探：顺手记下金钱读数（写前 / 盯完后各一次）",
+                    byHandleOk.ReadMoney && byHandleOk.MoneyBefore == 48240 && byHandleOk.MoneyAfter == 48240,
+                    "金钱 " + byHandleOk.MoneyBefore + " → " + byHandleOk.MoneyAfter);
+
+                uint afterHandleOk;
+                io.ReadUInt32(remainingField, out afterHandleOk);
+                Check("字段试探：内存里再确认一次已还原（不是只印了个数）",
+                    afterHandleOk == 1926, "内存现值 " + afterHandleOk);
+
+                // ---- 正常路径 B：游戏自己动过那一格 → **不还原**（不跟游戏抢）----
+                System.Threading.Thread gameThread = new System.Threading.Thread(delegate()
+                {
+                    System.Threading.Thread.Sleep(80);
+                    io.WriteUInt32(remainingField, 777);       // 冒充"游戏自己把这一格改掉了"
+                });
+                gameThread.IsBackground = true;
+                gameThread.Start();
+
+                HouseProbeResult gameWrote = HouseProbe.Run(io, profile, moduleBase, byHandle, 400, producingClass);
+                gameThread.Join();
+
+                Check("字段试探：游戏自己动过那一格时**不还原**（把旧值塞回去会跟游戏打架）",
+                    gameWrote.Ok && gameWrote.Wrote && gameWrote.GameChangedIt
+                        && gameWrote.SkippedRestore && !gameWrote.Restored,
+                    "写入 1 → 盯完读到 " + gameWrote.AfterHold);
+
+                uint keptValue;
+                io.ReadUInt32(remainingField, out keptValue);
+                Check("字段试探：不还原时**保留的是游戏写的值**（我们没有把它盖掉）",
+                    keptValue == 777, "内存现值 " + keptValue);
+                io.WriteUInt32(remainingField, 1926);          // 清理
+
+                // ---- 正常路径 C：旧写法（写房子本体）仍然好用 ----
                 HouseProbeSpec good;
                 HouseProbeSpec.TryParse("0x2DC +100000", out good, out error);
-                HouseProbeResult probe = HouseProbe.Run(io, profile, moduleBase, good);
+                HouseProbeResult probe = HouseProbe.Run(io, profile, moduleBase, good, ShortHold, producingClass);
 
-                Check("房子试探：确实写进去了（写后回读到新值）",
-                    probe.Ok && probe.Wrote && probe.ReadAfterWrite
+                Check("字段试探：写房子本体（旧写法）确实写进去了",
+                    probe.Ok && probe.Wrote && probe.ReadAfterWrite && !probe.FollowedHandle
                         && probe.AfterWrite == FieldValue + 100000,
                     "写前 " + probe.Before + " → 写后 " + probe.AfterWrite);
-                Check("房子试探：**无条件还原**（还原后就是原值）",
+                Check("字段试探：写房子本体也照旧还原",
                     probe.Restored && probe.ReadAfterRestore && probe.AfterRestore == FieldValue,
                     "还原后读到 " + probe.AfterRestore + "（原值 " + FieldValue + "）");
 
                 uint now;
                 io.ReadUInt32(house + FieldOffset, out now);
-                Check("房子试探：内存里再确认一次已还原（不是只印了个数）",
+                Check("字段试探：内存里再确认一次已还原（不是只印了个数）",
                     now == FieldValue, "内存现值 " + now);
             }
             catch (Exception ex)
             {
-                Check("房子试探", false, ex.GetType().Name + ": " + ex.Message);
+                Check("字段试探", false, ex.GetType().Name + ": " + ex.Message);
             }
             finally
             {
@@ -5629,6 +5762,17 @@ namespace MoTrainer.Diagnostics
                 if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
                 self.Dispose();
             }
+        }
+
+        /// <summary>
+        /// 配置解析的坏例子：既要被拒、又要有话说。
+        /// 「空原因 = 静默失败」在本项目是不允许的（用户点了按钮却什么都没发生，是最招骂的失败模式）。
+        /// </summary>
+        private static bool RejectedWithReason(string text)
+        {
+            HouseProbeSpec s;
+            string err;
+            return !HouseProbeSpec.TryParse(text, out s, out err) && err != null && err.Trim().Length > 0;
         }
 
         // ============================================================ 辅助
