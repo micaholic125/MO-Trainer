@@ -185,6 +185,27 @@ namespace MoTrainer.Calibration
             return moments;
         }
 
+        /// <summary>
+        /// 「生产窗口」掩码：金钱正在下降的那些拍（前后各放宽一拍，容忍采样与扣款错开）。
+        ///
+        /// 为什么用金钱当尺子：它是本项目里唯一**可观测**的"正在生产"信号 ——
+        /// 生产时按拍扣钱，生产一停立刻就停。真进度必须只在这个窗口里推进。
+        /// </summary>
+        public static HashSet<int> BuildDrainMask(IList<HarvestSample> samples)
+        {
+            HashSet<int> mask = new HashSet<int>();
+            if (samples == null || samples.Count < 2) { return mask; }
+
+            for (int i = 1; i < samples.Count; i++)
+            {
+                if (samples[i].Money >= samples[i - 1].Money) { continue; }
+                mask.Add(samples[i - 1].Index);
+                mask.Add(samples[i].Index);
+                if (i + 1 < samples.Count) { mask.Add(samples[i + 1].Index); }
+            }
+            return mask;
+        }
+
         /// <summary>把"造好了"时刻写成报告里可读的几行。</summary>
         public static List<string> DescribeCompletionMoments(IList<HarvestSample> samples)
         {
@@ -240,6 +261,13 @@ namespace MoTrainer.Calibration
             List<int> moments = FindCompletionMoments(samples);
             int lastSample = 0;
             if (samples != null && samples.Count > 0) { lastSample = samples[samples.Count - 1].Index; }
+
+            // 「生产窗口」= 金钱正在下降的那些拍（前后各放宽一拍，容忍采样与扣款错开）。
+            // 这是本项目里唯一**可观测**的"正在生产"信号：金钱是按拍扣的，生产一停它就停。
+            // 真进度必须"只在这个窗口里推进" —— 2026-10-10 第三次真机才把这条判据用上：
+            // 那一局用户造三样、中间各等一会，生产窗口一眼可数（14 拍），
+            // 而界面/动画类对象的计数器在整个采集期间都在动，靠这条一眼就能剔掉。
+            HashSet<int> drain = BuildDrainMask(samples);
 
             for (int t = 0; t < tracked.Count; t++)
             {
@@ -366,6 +394,31 @@ namespace MoTrainer.Calibration
                     if (rate >= 0.6f) { score += 3; reasons.Add("每拍都在推进"); }
                     if (series.Changes >= 8) { score += 2; }
                     if (nearMoment) { score += 4; reasons.Add("停下时刻与「造好了」对齐"); }
+
+                    // 与「生产窗口」对齐：真进度只在生产时动，生产一停它就不动。
+                    int insideChanges = 0;
+                    int outsideChanges = 0;
+                    for (int k2 = 0; k2 < series.Samples.Count; k2++)
+                    {
+                        if (drain.Contains(series.Samples[k2])) { insideChanges++; }
+                        else { outsideChanges++; }
+                    }
+                    // 掩码为空 = 这次采集根本没看到"金钱在掉"（没校准金钱、或全程没生产）——
+                    // 那就**不做这条判断**，绝不能拿"没有窗口"当成"处处都在生产之外"。
+                    if (drain.Count > 0 && insideChanges + outsideChanges >= 3)
+                    {
+                        float insideRatio = (float)insideChanges / (insideChanges + outsideChanges);
+                        if (insideRatio >= 0.8f)
+                        {
+                            score += 6;
+                            reasons.Add("只在生产时推进（与金钱下降同步）");
+                        }
+                        else if (insideRatio <= 0.4f)
+                        {
+                            score -= 4;
+                            reasons.Add("生产之外也在变（不是生产进度）");
+                        }
+                    }
 
                     if (obj.NewlyAppeared || obj.IsPlayerHouse)
                     {

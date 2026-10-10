@@ -210,6 +210,13 @@ namespace MoTrainer.Calibration
         // ---- 我方房子 + "跟随一层"（[S6-2] 瞬间建造用）----
         // 生产进度未必记在建筑对象身上 —— 按引擎惯例，它更可能记在房子的生产队列/工厂里。
         // 所以除了盯新建造的对象，还要盯**我方房子**，并从房子里跟随一层指针。
+        /// <summary>从房子里跟随的堆对象之外，再盯这么多"指向我方房子"的对象。</summary>
+        public const int MaxMyObjects = 12;
+
+        /// <summary>"指向我方房子"的扫描只做一次（它要读几百个对象的头部，不能每拍都做）。</summary>
+        private bool _myObjectsScanned;
+        private int _myObjectsTracked;
+
         private uint _houseAddress;
         private int _followedFromHouse;
         private int _followSkippedStatic;
@@ -334,6 +341,8 @@ namespace MoTrainer.Calibration
                 _followSkippedStatic = 0;
                 _followSlots.Clear();
                 _houseNote = "";
+                _myObjectsScanned = false;
+                _myObjectsTracked = 0;
                 _inspectionText = "";
                 _finalizing = false;
                 _rosterSlot = 0;
@@ -503,6 +512,9 @@ namespace MoTrainer.Calibration
 
             // 从房子里跟随一层指针（生产队列也可能是房子里的指针指向的另一个对象）
             FollowHousePointers(memory, moduleBase, moduleSize, sample);
+
+            // 「谁指向我方房子」→ 盯上那些房子名下的对象（生产队列大概率在这一类里，见方法注释）
+            TrackMyObjects(memory, moduleBase, moduleSize, sample);
 
             // 阵营分组（用来判断阵营偏移是否有效：有效的表现是"少数几个阵营、各自聚集大量单位"）
             if (_profile.OffsetTechnoOwner != 0 && roster.Count > 0)
@@ -892,6 +904,108 @@ namespace MoTrainer.Calibration
             Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
                 "型号线索扫描完毕：{0}/{1} 个对象扫到线索，耗时 {2:0.0} 秒",
                 found, tracked.Count, (DateTime.UtcNow - started).TotalSeconds));
+        }
+
+        /// <summary>
+        /// 「属于我的对象」自动跟踪：找出那些**指向我方房子**的对象，按"**类别越稀有越可疑**"
+        /// 排序后盯上前若干个。
+        ///
+        /// 为什么需要（2026-10-10 跑完第三次采集才想通）：建造/生产进度
+        /// **不在建筑身上、不在单位身上、也不在房子身上** ——
+        /// 房子的 80 个变化字段逐个核过，只有"金钱"和"累计花费"跟生产同步，其余都不是。
+        /// 那它只可能在**房子名下的另一个对象**里，而那种对象**开局就存在**：
+        /// 既不是"采集期间新出现的"（采集器只跟新对象），也未必被房子直接指着
+        /// （"跟随一层"在真机上找到的是界面对象，整局一字未动）。
+        ///
+        /// 所以换成"从**谁指向我方房子**入手"，并且优先挑**稀有的类别**：
+        /// 生产队列/工厂这类东西一个房子只有几份，而建筑、单位、界面对象动辄几十份。
+        ///
+        /// 只做一次（要读几百个对象的头部，不能每拍都跑），失败也不影响采集继续进行。
+        /// </summary>
+        private void TrackMyObjects(MemoryIO memory, uint moduleBase, uint moduleSize, HarvestSample sample)
+        {
+            if (_houseAddress == 0 || _myObjectsScanned) { return; }
+
+            List<HarvestObjectRow> roster;
+            lock (_lock) { roster = new List<HarvestObjectRow>(_lastRoster); }
+            if (roster.Count < 4) { return; }        // 名单还没读到，下一拍再试
+            _myObjectsScanned = true;
+
+            // 各"类别"在名单里出现了几次（用来判断稀不稀有）
+            Dictionary<uint, int> classCount = new Dictionary<uint, int>();
+            for (int i = 0; i < roster.Count; i++)
+            {
+                uint vtable = roster[i].VTable;
+                int existing;
+                classCount[vtable] = classCount.TryGetValue(vtable, out existing) ? existing + 1 : 1;
+            }
+
+            List<uint> mine = new List<uint>();
+            for (int i = 0; i < roster.Count && mine.Count < 256; i++)
+            {
+                uint address = roster[i].Address;
+                if (address < 0x10000) { continue; }
+
+                byte[] block = memory.ReadBytesQuiet(address, 0x800);
+                if (block == null) { continue; }
+
+                for (int offset = 0; offset + 4 <= block.Length; offset += 4)
+                {
+                    if (ReadUInt32(block, offset) != _houseAddress) { continue; }
+                    mine.Add(address);
+                    break;
+                }
+            }
+
+            if (mine.Count == 0)
+            {
+                Logger.Info("Harvest", "「指向我方房子」的对象：一个都没找到（这条线索这次用不上）");
+                return;
+            }
+
+            // 稀有的类别排前面（同类别内按地址顺序，保证可复现）
+            mine.Sort(delegate(uint a, uint b)
+            {
+                int ca, cb;
+                classCount.TryGetValue(ClassOf(roster, a), out ca);
+                classCount.TryGetValue(ClassOf(roster, b), out cb);
+                if (ca != cb) { return ca.CompareTo(cb); }
+                return a.CompareTo(b);
+            });
+
+            for (int i = 0; i < mine.Count && _myObjectsTracked < MaxMyObjects; i++)
+            {
+                uint address = mine[i];
+                if (_byAddress.ContainsKey(address)) { continue; }
+                if (_tracked.Count >= MaxTracked) { break; }
+
+                uint vtable = ClassOf(roster, address);
+                int count;
+                classCount.TryGetValue(vtable, out count);
+
+                HarvestTracked tracked = new HarvestTracked();
+                tracked.Address = address;
+                tracked.FirstSeen = sample.Index;
+                tracked.FirstVTable = vtable;
+                tracked.Source = string.Format(CultureInfo.InvariantCulture,
+                    "指向我方房子（类别 0x{0:X8}，全场 {1} 个）", vtable, count);
+                _byAddress[address] = tracked;
+                _tracked.Add(tracked);
+                _myObjectsTracked++;
+            }
+
+            Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
+                "「指向我方房子」的对象：共有 {0} 个，按稀有类别挑了 {1} 个盯起来",
+                mine.Count, _myObjectsTracked));
+        }
+
+        private static uint ClassOf(List<HarvestObjectRow> roster, uint address)
+        {
+            for (int i = 0; i < roster.Count; i++)
+            {
+                if (roster[i].Address == address) { return roster[i].VTable; }
+            }
+            return 0;
         }
 
         private void ReadSelection(MemoryIO memory, uint moduleBase, HarvestSample sample)        {

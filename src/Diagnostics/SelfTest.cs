@@ -5203,6 +5203,57 @@ namespace MoTrainer.Diagnostics
                 spentScore < progressScore && spentScore <= 16
                     && candidates.Count > 0 && candidates[0].Series.Offset == 0x534,
                 "账本得分 " + spentScore + "（应 ≤16）｜真进度得分 " + progressScore);
+
+            // ---- 「只在生产时推进」这条判据（2026-10-10 第三次真机才用上）----
+            // 12 拍采样，金钱只在第 4~7 拍下降（= 生产窗口），其余时候不动。
+            // 甲字段只在这个窗口里动（真进度该有的样子）；乙字段只在窗口之外动。
+            List<HarvestSample> drainSamples = new List<HarvestSample>();
+            for (int i = 0; i < 12; i++)
+            {
+                HarvestSample s = new HarvestSample();
+                s.Index = i;
+                s.Seconds = i;
+                s.PowerOutput = 60;
+                s.Money = (uint)(5000 - (i >= 4 && i <= 7 ? (i - 3) * 50 : 200));
+                drainSamples.Add(s);
+            }
+
+            HarvestTracked worker = new HarvestTracked();
+            worker.Address = 0x1EC29520;
+            worker.FirstVTable = 0x007E3354;
+            worker.NewlyAppeared = true;
+
+            OffsetSeries insideField = new OffsetSeries(0x10, 0, 0);
+            for (int i = 4; i <= 7; i++) { insideField.Record(i, (uint)(i - 3)); }
+            worker.Series[0x10] = insideField;
+
+            // 窗口外那个**故意做成「合格的倒数」**（往下走、也会停）——
+            // 这样"谁排前面"就只由「在不在生产窗口里」这一条判据决定。
+            OffsetSeries outsideField = new OffsetSeries(0x20, 0, 3);
+            for (int i = 1; i <= 3; i++) { outsideField.Record(i, (uint)(3 - i)); }
+            worker.Series[0x20] = outsideField;
+
+            List<HarvestTracked> workerTracked = new List<HarvestTracked>();
+            workerTracked.Add(worker);
+            List<ProgressCandidate> drainCandidates =
+                ProgressHunter.Rank(workerTracked, drainSamples, 0x400000, 0x793000, 15, new List<string>());
+
+            int insideScore = -1000;
+            int outsideScore = -1000;
+            bool insideFirst = false;
+            for (int i = 0; i < drainCandidates.Count; i++)
+            {
+                if (drainCandidates[i].Series.Offset == 0x10) { insideScore = drainCandidates[i].Score; }
+                if (drainCandidates[i].Series.Offset == 0x20) { outsideScore = drainCandidates[i].Score; }
+            }
+            insideFirst = drainCandidates.Count > 0 && drainCandidates[0].Series.Offset == 0x10;
+
+            // 打开这条判据时：窗口内 16 分、窗口外 12 分（窗口外那条被扣了 4 分）；
+            // 把判据关掉：窗口内掉到 10、窗口外涨到 16 —— 第一名就换人了。
+            // 所以断言"第一名是窗口内那个" + "窗口外那个被压到 ≤14" 才钉得住它。
+            Check("施工进度猎手：「只在生产窗口里推进」的字段排在「窗口之外也在动」的前面、且后者被扣分",
+                insideFirst && outsideScore <= 14,
+                "窗口内得分 " + insideScore + "｜窗口外得分 " + outsideScore + "（应 ≤14 且排在后面）");
         }
 
         /// <summary>
@@ -5349,14 +5400,18 @@ namespace MoTrainer.Diagnostics
                 // 金钱链：静态根 → 房子 → +0x30C（与真机口径一致：金钱地址减 0x30C 就是房子）
                 io.WriteUInt32(moduleBase + 0x100, house);
 
-                // 全对象名单（采集靠它枚举对象；本用例只要它别报错）
+                // 名单里放 4 个**不同**的对象（遍历器会按地址去重，同一个地址写 4 遍只算 1 个），
+                // 每个都"指向我方房子" —— 这是「谁指向我方房子」那条线索要抓的东西。
                 uint rosterSlot = heap + 0x5000;
                 uint rosterArray = heap + 0x4000;
-                uint someObject = heap + 0x2000;
-                io.WriteUInt32(someObject, houseVtable);
+                for (int i = 0; i < 4; i++)
+                {
+                    uint obj = heap + 0x2000 + (uint)(i * 0x100);
+                    io.WriteUInt32(obj, houseVtable);          // 同一类别（否则会被"孤例剔除"扔掉）
+                    io.WriteUInt32(obj + 0x100, house);        // 指向我方房子
+                    io.WriteUInt32(rosterArray + (uint)(i * 4), obj);
+                }
                 io.WriteUInt32(rosterSlot, rosterArray);
-                io.WriteUInt32(rosterArray, someObject);
-                io.WriteUInt32(rosterArray + 4, someObject);
 
                 CalibrationProfile profile = new CalibrationProfile();
                 profile.ModuleBase = moduleBase;
@@ -5406,6 +5461,12 @@ namespace MoTrainer.Diagnostics
                         && text.IndexOf("指向静态结构", StringComparison.Ordinal) >= 0,
                     text.IndexOf("跟随 +0x208", StringComparison.Ordinal) < 0
                         ? "已跳过（并在报告里说明）" : "跟错了：静态结构也跟了");
+
+                // 「谁指向我方房子」——生产队列很可能就在这类对象里（它开局就存在，
+                // 既不是"新出现的"、也未必被房子直接指着，前两版采集器都漏掉了它们）。
+                Check("采集器：盯上了「指向我方房子」的对象（按稀有类别挑）",
+                    text.IndexOf("指向我方房子", StringComparison.Ordinal) >= 0,
+                    text.IndexOf("指向我方房子", StringComparison.Ordinal) >= 0 ? "已在跟踪" : "没找到这类对象");
 
                 // ---- 负面用例：认不出房子时，必须**说得出卡在哪一步** ----
                 // 这是本项目最忌讳的失败模式的正面防线：用户开一局、点一次采集，
