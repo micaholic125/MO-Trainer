@@ -5698,10 +5698,13 @@ namespace MoTrainer.Diagnostics
                         && byHandleOk.TargetObject == producing && byHandleOk.FieldAddress == remainingField
                         && byHandleOk.AfterWrite == 1,
                     "写前 " + byHandleOk.Before + " → 写后 " + byHandleOk.AfterWrite);
-                Check("字段试探：这一格游戏没动过 → **无条件还原**（还原后就是原值）",
+                Check("字段试探：这一格游戏没动过 → **还原**（还原后就是原值）",
                     byHandleOk.Restored && byHandleOk.ReadAfterRestore && byHandleOk.AfterRestore == 1926
-                        && !byHandleOk.GameChangedIt && !byHandleOk.SkippedRestore,
+                        && byHandleOk.GameWrites == 0 && !byHandleOk.SkippedRestore,
                     "还原后读到 " + byHandleOk.AfterRestore);
+                Check("字段试探：**锁定式反复写**（不是写一次就完），并留下了读数时间线",
+                    byHandleOk.Writes >= 2 && byHandleOk.Samples.Count >= 1,
+                    "写了 " + byHandleOk.Writes + " 次，读数 " + byHandleOk.Samples.Count + " 条");
                 Check("字段试探：顺手记下金钱读数（写前 / 盯完后各一次）",
                     byHandleOk.ReadMoney && byHandleOk.MoneyBefore == 48240 && byHandleOk.MoneyAfter == 48240,
                     "金钱 " + byHandleOk.MoneyBefore + " → " + byHandleOk.MoneyAfter);
@@ -5711,11 +5714,11 @@ namespace MoTrainer.Diagnostics
                 Check("字段试探：内存里再确认一次已还原（不是只印了个数）",
                     afterHandleOk == 1926, "内存现值 " + afterHandleOk);
 
-                // ---- 正常路径 B：游戏自己动过那一格 → **不还原**（不跟游戏抢）----
+                // ---- 正常路径 B：游戏跟我们抢这一格 → **数出来**，但收尾照样还原成原值 ----
                 System.Threading.Thread gameThread = new System.Threading.Thread(delegate()
                 {
                     System.Threading.Thread.Sleep(80);
-                    io.WriteUInt32(remainingField, 777);       // 冒充"游戏自己把这一格改掉了"
+                    io.WriteUInt32(remainingField, 777);       // 冒充"游戏自己把这一格写成了别的值"
                 });
                 gameThread.IsBackground = true;
                 gameThread.Start();
@@ -5723,15 +5726,38 @@ namespace MoTrainer.Diagnostics
                 HouseProbeResult gameWrote = HouseProbe.Run(io, profile, moduleBase, byHandle, 400, producingClass);
                 gameThread.Join();
 
-                Check("字段试探：游戏自己动过那一格时**不还原**（把旧值塞回去会跟游戏打架）",
-                    gameWrote.Ok && gameWrote.Wrote && gameWrote.GameChangedIt
-                        && gameWrote.SkippedRestore && !gameWrote.Restored,
-                    "写入 1 → 盯完读到 " + gameWrote.AfterHold);
+                Check("字段试探：游戏抢过这一格 → **数得出来**（报告里会写明它抢了几次）",
+                    gameWrote.Ok && gameWrote.Wrote && gameWrote.GameWrites >= 1,
+                    "游戏抢回去 " + gameWrote.GameWrites + " 次");
+                Check("字段试探：抢过之后收尾照样还原成原值（对象还在就该还原）",
+                    gameWrote.Restored && !gameWrote.SkippedRestore && gameWrote.AfterRestore == 1926,
+                    "还原后读到 " + gameWrote.AfterRestore);
+
+                // ---- 正常路径 B2：那颗东西从把手上消失 ⇒ **立刻停手 + 不还原** ----
+                System.Threading.Thread goneThread = new System.Threading.Thread(delegate()
+                {
+                    System.Threading.Thread.Sleep(80);
+                    io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, 0);   // 冒充"造好了、被游戏收走"
+                });
+                goneThread.IsBackground = true;
+                goneThread.Start();
+
+                HouseProbeResult gone = HouseProbe.Run(io, profile, moduleBase, byHandle, 700, producingClass);
+                goneThread.Join();
+
+                Check("字段试探：那颗东西从把手上消失时**立刻停手**（不白写）",
+                    gone.Ok && gone.TargetGone && gone.Wrote,
+                    "写了 " + gone.Writes + " 次后停手");
+                Check("字段试探：对象已经不在了 ⇒ **不还原**（不往别人的地盘上写）",
+                    gone.SkippedRestore && !gone.Restored && gone.SkipReason.Length > 0,
+                    gone.SkipReason);
 
                 uint keptValue;
                 io.ReadUInt32(remainingField, out keptValue);
-                Check("字段试探：不还原时**保留的是游戏写的值**（我们没有把它盖掉）",
-                    keptValue == 777, "内存现值 " + keptValue);
+                Check("字段试探：不还原时**保留的是最后写进去的值**（没有盲写回旧值）",
+                    keptValue == 1, "内存现值 " + keptValue);
+
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, producing);   // 清理
                 io.WriteUInt32(remainingField, 1926);          // 清理
 
                 // ---- 正常路径 C：旧写法（写房子本体）仍然好用 ----

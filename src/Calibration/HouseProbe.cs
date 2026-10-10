@@ -143,6 +143,18 @@ namespace MoTrainer.Calibration
     }
 
     /// <summary>一次「字段试探」的结果（含写前 / 写入后 / 盯完后 / 还原后四个读数）。</summary>
+    /// <summary>盯的那几秒里的一次读数（默认每 300 毫秒一次）—— 事后靠它看清"这几秒到底发生了什么"。</summary>
+    public sealed class HoldSample
+    {
+        public int Ms;
+        public uint Value;
+        public bool ValueOk;
+        public uint Money;
+        public bool MoneyOk;
+        public uint Handle;
+        public bool HandleOk;
+    }
+
     public sealed class HouseProbeResult
     {
         public string Note = "";
@@ -173,11 +185,26 @@ namespace MoTrainer.Calibration
         public bool ReadAfterRestore;
         public bool Restored;
 
-        /// <summary>盯着的那几秒里，**游戏自己把这一格改掉了**（说明我们的写入被游戏接手了）。</summary>
-        public bool GameChangedIt;
+        /// <summary>我们一共写成功多少次（**锁定式反复写**，不是写一次）。</summary>
+        public int Writes;
 
-        /// <summary>因为上面那条而**故意没有还原**（把旧值塞回去会跟游戏打架）。</summary>
+        /// <summary>这几十毫秒一次的空隙里，**游戏把这一格写回去过几次**（0 = 它没跟我们抢这一格）。</summary>
+        public int GameWrites;
+
+        /// <summary>盯的过程里的读数时间线。</summary>
+        public System.Collections.Generic.List<HoldSample> Samples =
+            new System.Collections.Generic.List<HoldSample>();
+
+        /// <summary>那颗东西从把手上消失了（造好时游戏就会把它收走）。</summary>
+        public bool TargetGone;
+
+        /// <summary>盯的过程中读不到那一格了（不敢盲写回去）。</summary>
+        public bool LostField;
+
+        /// <summary>因为上面某条而**故意没有还原**（写回去会出问题）。</summary>
         public bool SkippedRestore;
+
+        public string SkipReason = "";
 
         public uint MoneyBefore;
         public uint MoneyAfter;
@@ -210,34 +237,41 @@ namespace MoTrainer.Calibration
                 "写的那一格：0x{0:X8}（对象 0x{1:X8} + 0x{2:X}）",
                 FieldAddress, TargetObject, Offset));
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "写前 {0}｜写入 {1}（{2}）｜写入后读到 {3}｜{4} 秒后读到 {5}",
-                Before, Written, Wrote ? "已写" : "**没写成**",
-                ReadAfterWrite ? AfterWrite.ToString(CultureInfo.InvariantCulture) : "读不到",
-                (HoldMsHeld / 1000.0).ToString("0.0", CultureInfo.InvariantCulture),
-                ReadAfterHold ? AfterHold.ToString(CultureInfo.InvariantCulture) : "读不到"));
+                "写前 {0} → **反复写 {1}**（成功 {2} 次，每 {3} 毫秒一次）｜一共盯了 {4} 秒",
+                Before, Written, Writes, HouseProbe.RewriteEveryMs,
+                (HoldMsHeld / 1000.0).ToString("0.0", CultureInfo.InvariantCulture)));
+            text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "这几秒里**游戏把这一格写回去过 {0} 次**（0 = 它没跟我们抢这一格）", GameWrites));
 
-            if (ReadMoney)
+            if (Samples.Count > 0)
             {
-                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "你的金钱：写前 {0} → {1} 秒后 {2}{3}",
-                    MoneyBefore, (HoldMsHeld / 1000.0).ToString("0.0", CultureInfo.InvariantCulture),
-                    MoneyAfter,
-                    MoneyAfter == MoneyBefore ? "（这期间没有扣钱）" : "（这期间扣了钱）"));
+                text.AppendLine("读数（这一格的值 / 你的钱 / 那颗东西还在不在）：");
+                for (int i = 0; i < Samples.Count; i++)
+                {
+                    if (Samples.Count > 12 && i == 5) { text.AppendLine("  ……"); }
+                    if (Samples.Count > 12 && i >= 5 && i < Samples.Count - 5) { continue; }
+
+                    HoldSample s = Samples[i];
+                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "  +{0:0.0}s｜{1}｜{2}｜{3}",
+                        s.Ms / 1000.0,
+                        s.ValueOk ? s.Value.ToString(CultureInfo.InvariantCulture) : "读不到",
+                        s.MoneyOk ? s.Money.ToString(CultureInfo.InvariantCulture) : "读不到",
+                        s.HandleOk ? (s.Handle == TargetObject ? "在" : "**不在了**") : "读不到"));
+                }
             }
 
             if (SkippedRestore)
             {
-                text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "这一格在这几秒里**被游戏自己改过**（我们写的是 {0}，现在是 {1}）——",
-                    Written, AfterHold));
-                text.AppendLine("**故意不还原**：游戏已经接手这一格，把旧值硬塞回去反而会跟它打架。");
+                text.AppendLine("**故意不还原**：" + SkipReason);
             }
             else if (Restored)
             {
                 text.AppendLine(AfterRestore == Before
                     ? "已还原成原值 ✓"
                     : string.Format(CultureInfo.InvariantCulture,
-                        "**还原后与原值不一致** ⚠（原值 {0}，还原后读到 {1}）", Before, AfterRestore));
+                        "写回了原值 {0}，但马上读到的是 {1} —— **游戏又把它写成了自己的值**（这本身就说明它在管这一格）",
+                        Before, AfterRestore));
             }
             else
             {
@@ -253,9 +287,17 @@ namespace MoTrainer.Calibration
     ///
     /// 为什么需要它：`[S6-2]` 的"进度字段"只能**写一下看行为**（形态判据已经用遍）。
     /// 第一轮写的是房子的 `+0x2DC`（2026-10-10 17:40，写进去了、建造毫无反应 → 干净否掉）。
-    /// 第二轮（本版）跟着**房子 +0x53BC 指向的「正在生产的东西」**走 ——
-    /// 真机数据指出：那个对象的 `+0x60` **每拍正好减少"这一拍扣掉的钱"、造好时正好落到 0**
-    /// （一局只造一座矿场：1926 → 0，而矿场造价 2000 = 首拍已付 74 + 剩 1926）。
+    /// 第二轮跟着**房子 +0x53BC 指向的「正在生产的东西」**走 —— 写它的 `+0x60`（"还差多少没付完"）。
+    /// 真机结果（2026-10-10 18:16）：值**确实写进去了**、3 秒里**没被游戏改回去**，
+    /// **但那 3 秒里金钱一分没扣**（而同一时刻"永不停歇"的计数器照常走 ⇒ 不是游戏卡住），
+    /// 收尾写回原值后**扣钱立刻恢复** ⇒ **这一格确实是生产逻辑读的**，只是写 1 让它停住了。
+    ///
+    /// 第三轮（本版）两处改进：
+    ///   ① 由"写一次"改成**锁定式反复写**（每 60 毫秒一次）—— 依据是用户 2026-10-10 的补充：
+    ///      这游戏"钱"有一份**隐藏真值**、**单写一次几乎不改变游戏状态**，修改器的金钱功能靠的就是每拍重写；
+    ///   ② 盯的过程里每 300 毫秒记一次读数（值 / 金钱 / 那颗东西还在不在），
+    ///      并把"游戏在这几十毫秒里抢回去过几次"数出来 —— 事后能看清这几秒到底发生了什么。
+    ///   另外：**那颗东西从把手上消失就立刻停手且不还原**（造好时游戏就会把它收走）。
     ///
     /// 安全设计（与 `PowerProbe` 同源，跟着把手走时再加三道门）：
     ///   · 只写**我方房子**（由金钱链解析）或**它的 +0x53BC 指向的对象**，不碰任何别的东西；
@@ -264,8 +306,9 @@ namespace MoTrainer.Calibration
     ///     目标那一格必须是"像个数"的小正数（0 = 没东西在造；大得像地址 = 找错地方了）；
     ///   · **绝不写金钱偏移 `+0x30C`**（那是玩家的钱，没有任何试探理由写它）；
     ///   · 写前先查目标页可写（`VirtualQueryEx`），不可写就拒绝；
-    ///   · 写完回读校验；**盯完后：游戏没动过就无条件还原并回读确认；
-    ///     游戏自己动过就不还原**（那一格已经被游戏接手，塞回旧值会跟它打架）；
+    ///   · 锁定式反复写、每次写完回读；**盯完后还原成原值并回读确认**，
+    ///     除了两种情况：**那颗东西已从把手上消失**（造好了、被游戏收走）或**读不到那一格** ——
+    ///     那时绝不盲写；
     ///   · 缺前置（进程没连、金钱链解析不出来）一律**拒绝执行并说明缺什么**。
     /// </summary>
     public static class HouseProbe
@@ -293,6 +336,17 @@ namespace MoTrainer.Calibration
 
         /// <summary>写完之后盯这么久再收尾（够用户看清"是不是立刻造好"）。</summary>
         public const int HoldMs = 3000;
+
+        /// <summary>
+        /// 每这么多毫秒**重写一次**（锁定式，不是写一次就完）。
+        /// 依据：用户 2026-10-10 的补充 —— 这游戏里"钱"有一份**隐藏真值**，
+        /// **单写一次几乎不改变游戏状态**，修改器的金钱功能靠的就是每拍重写（锁定）。
+        /// 所以试探也必须这么写，否则"没反应"可能只是因为我们只写了一次。
+        /// </summary>
+        public const int RewriteEveryMs = 60;
+
+        /// <summary>每这么多毫秒记一次读数（值 / 金钱 / 那颗东西还在不在），写进报告供事后分析。</summary>
+        public const int SampleEveryMs = 300;
 
         /// <summary>一次试探要写的对象与偏移（只读部分）。</summary>
         private sealed class Target
@@ -533,12 +587,10 @@ namespace MoTrainer.Calibration
             result.Before = target.Value;
             result.HoldMsHeld = holdMs;
 
-            uint moneyAddress;
+            uint moneyAddress = 0;
             string moneyError;
-            if (profile.Money.TryResolve(memory, moduleBase, out moneyAddress, out moneyError))
-            {
-                result.ReadMoney = memory.ReadUInt32(moneyAddress, out result.MoneyBefore);
-            }
+            bool moneyOk = profile.Money.TryResolve(memory, moduleBase, out moneyAddress, out moneyError);
+            if (moneyOk) { result.ReadMoney = memory.ReadUInt32(moneyAddress, out result.MoneyBefore); }
 
             uint write = spec.IsDelta ? unchecked(target.Value + spec.Value) : spec.Value;
             result.Written = write;
@@ -546,54 +598,111 @@ namespace MoTrainer.Calibration
             try
             {
                 Logger.Info("HouseProbe", string.Format(CultureInfo.InvariantCulture,
-                    "字段试探：0x{0:X8}（对象 0x{1:X8} +0x{2:X}；跟着把手={3}）{4} → {5}",
+                    "字段试探：0x{0:X8}（对象 0x{1:X8} +0x{2:X}；跟着把手={3}）{4} → {5}，锁定式反复写（每 {6} 毫秒一次）",
                     result.FieldAddress, target.Object, spec.Offset, target.FollowedHandle,
-                    target.Value, write));
+                    target.Value, write, RewriteEveryMs));
 
-                result.Wrote = memory.WriteUInt32(result.FieldAddress, write);
-                uint afterWrite;
-                result.ReadAfterWrite = memory.ReadUInt32(result.FieldAddress, out afterWrite);
-                result.AfterWrite = afterWrite;
+                int elapsed = 0;
+                bool everWritten = false;
+                result.HoldMsHeld = holdMs;
 
-                System.Threading.Thread.Sleep(holdMs);
+                while (elapsed < holdMs)
+                {
+                    // ① 先读一眼：这一格还是我们上次写的值吗？
+                    //    不是 ⇒ **游戏在这几十毫秒里自己写过一次**（它在跟我们抢这一格）。
+                    uint nowValue;
+                    bool nowOk = memory.ReadUInt32(result.FieldAddress, out nowValue);
+                    if (everWritten && nowOk && nowValue != write) { result.GameWrites++; }
+
+                    // ② 重写 —— **锁定式**，与金钱锁定同一个套路（用户提示：这游戏单写一次几乎没用）。
+                    if (memory.WriteUInt32(result.FieldAddress, write))
+                    {
+                        result.Writes++;
+                        everWritten = true;
+                    }
+
+                    // ③ 定时记读数（事后靠这条时间线看清这几秒里发生了什么）。
+                    if (elapsed % SampleEveryMs == 0)
+                    {
+                        HoldSample sample = new HoldSample();
+                        sample.Ms = elapsed;
+                        sample.ValueOk = memory.ReadUInt32(result.FieldAddress, out sample.Value);
+                        if (moneyOk) { sample.MoneyOk = memory.ReadUInt32(moneyAddress, out sample.Money); }
+                        if (target.FollowedHandle)
+                        {
+                            sample.HandleOk = memory.ReadUInt32(
+                                target.House + HarvestSession.ProducingPointerOffset, out sample.Handle);
+                        }
+                        result.Samples.Add(sample);
+
+                        // 那颗东西从把手上消失了 —— 造好时游戏就会把它收走。这时**立刻停手**。
+                        if (sample.HandleOk && sample.Handle != target.Object)
+                        {
+                            result.TargetGone = true;
+                            break;
+                        }
+                        if (!sample.ValueOk)
+                        {
+                            result.LostField = true;
+                            break;
+                        }
+                    }
+
+                    System.Threading.Thread.Sleep(RewriteEveryMs);
+                    elapsed += RewriteEveryMs;
+                }
+
+                result.Wrote = result.Writes > 0;
+
+                // 第一条读数正好是"刚写完就读"的那一次，用它当"写入后读到"。
+                if (result.Samples.Count > 0)
+                {
+                    result.AfterWrite = result.Samples[0].Value;
+                    result.ReadAfterWrite = result.Samples[0].ValueOk;
+                }
 
                 uint afterHold;
                 result.ReadAfterHold = memory.ReadUInt32(result.FieldAddress, out afterHold);
                 result.AfterHold = afterHold;
-                if (result.Wrote && result.ReadAfterHold && afterHold != write)
-                {
-                    result.GameChangedIt = true;
-                }
 
-                if (result.ReadMoney)
+                if (moneyOk && result.ReadMoney)
                 {
                     uint moneyAfter;
-                    if (memory.ReadUInt32(moneyAddress, out moneyAfter)) { result.MoneyAfter = moneyAfter; }
-                    else { result.ReadMoney = false; }
+                    result.ReadMoney = memory.ReadUInt32(moneyAddress, out moneyAfter);
+                    if (result.ReadMoney) { result.MoneyAfter = moneyAfter; }
                 }
             }
             finally
             {
-                if (result.GameChangedIt)
+                if (result.TargetGone)
                 {
-                    // 游戏自己动过这一格 ⇒ 这一格现在归游戏管。硬塞回旧值会跟它打架（可能让它重新开始扣钱）。
                     result.SkippedRestore = true;
-                    Logger.Info("HouseProbe", string.Format(CultureInfo.InvariantCulture,
-                        "字段试探收尾：这一格被游戏自己改过（{0} → {1}），**故意不还原**",
-                        write, result.AfterHold));
+                    result.SkipReason = "那颗东西已经从把手上消失了（造好时游戏就会把它收走）—— "
+                                      + "那个对象多半已经不在了，硬写回去是往别人的地盘上写";
+                }
+                else if (result.LostField)
+                {
+                    result.SkippedRestore = true;
+                    result.SkipReason = "盯的过程中读不到那一格了 —— 不知道现在是什么状况，不敢盲写回去";
                 }
                 else
                 {
-                    // **无条件还原**：试探值最多只存在于上面那几秒里。
+                    // **还原**：试探值最多只存在于上面那几秒里。
                     uint restored;
                     result.Restored = memory.WriteUInt32(result.FieldAddress, target.Value);
                     result.ReadAfterRestore = memory.ReadUInt32(result.FieldAddress, out restored);
                     result.AfterRestore = restored;
 
                     Logger.Info("HouseProbe", string.Format(CultureInfo.InvariantCulture,
-                        "字段试探收尾：还原 {0}（写回 {1}，回读到 {2}）",
+                        "字段试探收尾：写 {0} 次、游戏抢回去 {1} 次；还原 {2}（写回 {3}，回读到 {4}）",
+                        result.Writes, result.GameWrites,
                         result.Restored && restored == target.Value ? "成功" : "**失败**",
                         target.Value, restored));
+                }
+
+                if (result.SkippedRestore)
+                {
+                    Logger.Info("HouseProbe", "字段试探收尾：**故意不还原** —— " + result.SkipReason);
                 }
             }
 

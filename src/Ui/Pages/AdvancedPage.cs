@@ -1783,7 +1783,8 @@ namespace MoTrainer.Ui.Pages
                 text.AppendLine();
                 text.AppendLine("  怎么用：**先在游戏里造一样东西**（比如一座矿场），等它开始建造时再点第二次；");
                 text.AppendLine("  写完之后**盯 3 秒**，看那样东西是不是「一下子就造好了」。");
-                text.AppendLine("  收尾：游戏没动过那一格 → 3 秒后写回原值；游戏自己动过了 → 不写回（那一格已经归游戏管）。");
+                text.AppendLine("  写的方式：**反复写**（每 60 毫秒一次，和金钱锁定同一套路），不是写一次就完；");
+                text.AppendLine("  收尾：3 秒后写回原值；但若**那样东西已经造好被游戏收走**，就不写回（对象都没了）。");
                 text.AppendLine("  写的是**数据**（不是代码）：不注入、不改游戏文件；地址不对时程序会拒绝写并说明原因。");
                 text.AppendLine("  **试探期间请不要关闭程序。**");
                 SetOutput(text.ToString());
