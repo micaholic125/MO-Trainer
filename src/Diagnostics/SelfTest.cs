@@ -151,6 +151,8 @@ namespace MoTrainer.Diagnostics
             Section("17. 施工进度猎手（[S6-2] 瞬间建造）");
             CheckProgressHunter();
             CheckHouseProbe();
+            CheckInstantBuild();
+            CheckInstantBuildWiring();
             CheckTypeIdScan();
             CheckHarvestHouseTracking();
 
@@ -5880,6 +5882,229 @@ namespace MoTrainer.Diagnostics
                     if (System.IO.Directory.Exists(dumpFolder)) { System.IO.Directory.Delete(dumpFolder, true); }
                 }
                 catch { }
+            }
+        }
+
+        // ============================================================ 瞬间建造（S6-2，2026-10-11 接线）
+
+        /// <summary>
+        /// 「瞬间建造」的守门自检（合成场景）。重点全在**该拒绝的时候一个字节都不写**：
+        /// 没东西在造 / 类别没验过 / 尾款已结清（造好之后动它会把成果退回去）/ 数值离谱 / 页不可写。
+        /// </summary>
+        private static void CheckInstantBuild()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("瞬间建造", false, "OpenProcess 失败"); return; }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("瞬间建造（测试内存块）", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("瞬间建造", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = TestBlockSize;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                uint producingClass = moduleBase + 0x3000;   // 合成世界里的"那一类"（真机上是 0x007E88D0）
+                uint otherClass = moduleBase + 0x4000;
+                uint house = heap + 0x1000;
+                uint producing = heap + 0x2000;
+                uint elapsedField = producing + InstantBuild.ElapsedOffset;
+                uint remainingField = producing + InstantBuild.RemainingOffset;
+
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, producing);
+                io.WriteUInt32(producing, producingClass);
+                io.WriteUInt32(elapsedField, 20);
+                io.WriteUInt32(remainingField, 1482);
+
+                // ---- 正常路径：往前推 ----
+                InstantBuildResult ok = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：把「已经造了多少拍」往前推（20 → 25）",
+                    ok.Ok && ok.Wrote && ok.ProducingAddress == producing
+                        && ok.ElapsedBefore == 20 && ok.ElapsedAfter == 25,
+                    "写前 " + ok.ElapsedBefore + " → 写后 " + ok.ElapsedAfter);
+
+                uint nowElapsed;
+                io.ReadUInt32(elapsedField, out nowElapsed);
+                Check("瞬间建造：内存里确认真的写进去了（不是只印了个数）",
+                    nowElapsed == 25, "内存现值 " + nowElapsed);
+
+                // ---- 拒绝路径：每一条都要"不写 + 说得出为什么" ----
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, 0);
+                InstantBuildResult idle = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：没东西在造时不写、并如实说明",
+                    !idle.Ok && !idle.Wrote && idle.Note.IndexOf("没有东西在造", StringComparison.Ordinal) >= 0,
+                    idle.Note);
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, producing);
+
+                io.WriteUInt32(producing, otherClass);
+                InstantBuildResult wrongClass = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：**类别没验过的一律不写**",
+                    !wrongClass.Ok && !wrongClass.Wrote
+                        && wrongClass.Note.IndexOf("不是真机验过的那一类", StringComparison.Ordinal) >= 0,
+                    wrongClass.Note);
+                io.WriteUInt32(producing, producingClass);
+
+                io.WriteUInt32(producing, 0x12345678);
+                InstantBuildResult notObject = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：把手指向的东西不像游戏对象时不写",
+                    !notObject.Ok && !notObject.Wrote, notObject.Note);
+                io.WriteUInt32(producing, producingClass);
+
+                io.WriteUInt32(remainingField, 0);
+                InstantBuildResult settled = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：**尾款已结清就不动它**（这时候动它正是把成果撤回去的那个动作）",
+                    !settled.Ok && !settled.Wrote
+                        && settled.Note.IndexOf("尾款已经结清", StringComparison.Ordinal) >= 0,
+                    settled.Note);
+
+                io.WriteUInt32(remainingField, 0x20000000);
+                InstantBuildResult huge = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：「还差多少钱」大得像地址时不写",
+                    !huge.Ok && !huge.Wrote, huge.Note);
+                io.WriteUInt32(remainingField, 1482);
+
+                io.WriteUInt32(elapsedField, InstantBuild.MaxElapsed);
+                InstantBuildResult tooBig = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：拍数大得不像正常建造时不写",
+                    !tooBig.Ok && !tooBig.Wrote, tooBig.Note);
+                io.WriteUInt32(elapsedField, 20);
+
+                InstantBuildResult noModule = InstantBuild.Tick(io, house, moduleBase, 0, producingClass);
+                Check("瞬间建造：配置里没记模块大小时拒绝并说明缺什么",
+                    !noModule.Ok && !noModule.Wrote
+                        && noModule.Note.IndexOf("模块大小", StringComparison.Ordinal) >= 0,
+                    noModule.Note);
+
+                // 上面每一条拒绝之后，那一格都必须还是"我自己放进去的 20"——
+                // 也就是**拒绝路径一个字节都没写**（第一段成功那下写成的 25，已被我改回 20 当作新基准）。
+                uint afterAll;
+                io.ReadUInt32(elapsedField, out afterAll);
+                Check("瞬间建造：上面每一条拒绝都**真的没写**（那一格还是 20）",
+                    afterAll == 20, "内存现值 " + afterAll);
+            }
+            catch (Exception ex)
+            {
+                Check("瞬间建造", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// 「瞬间建造」**从引擎到内存的端到端**回归（2026-10-11 接线时新增）。
+        ///
+        /// 为什么必须再测一遍：`InstantBuild.Tick` 单测只证明"给对参数就写对"，
+        /// 而接线的风险全在**这条功能有没有走专用分支** —— 若漏了分支，它会拿**金钱定位器**
+        /// 的地址去写值（那是"把你的钱写成 0"级别的错，而且 `IsCalibrated` 拦不住）。
+        /// 所以这里的判据是：**房子里的金钱一个字节都没变，而建造进度确实往前走了**。
+        /// </summary>
+        private static void CheckInstantBuildWiring()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("瞬间建造接线", false, "OpenProcess 失败"); return; }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            CheatEngine engine = null;
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("瞬间建造接线（测试内存块）", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("瞬间建造接线", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = TestBlockSize;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                uint house = heap + 0x1000;
+                uint moneyField = house + TechnoOwnership.HouseMoneyOffset;
+
+                const uint MyMoney = 48240;
+                io.WriteUInt32(house, moduleBase + 0x2000);                       // 房子头部：模块区间内的类型表
+                io.WriteUInt32(moneyField, MyMoney);
+                io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, 0);  // 此刻没有东西在造
+                io.WriteUInt32(moduleBase + 0x100, house);                        // 金钱链的静态根
+
+                List<MemoryRegion> regions = new List<MemoryRegion>();
+                regions.Add(MakeRegion(moduleBase, TestBlockSize));
+                regions.Add(MakeRegion(heap, TestBlockSize));
+                SyntheticTarget target = new SyntheticTarget(io, moduleBase, moduleSize, regions, regions);
+
+                CalibrationProfile profile = new CalibrationProfile();
+                profile.ModuleBase = moduleBase;
+                profile.ModuleSize = moduleSize;
+                profile.Money.SetOffsets(new uint[] { 0x100, TechnoOwnership.HouseMoneyOffset });
+
+                TrainerSettings settings = new TrainerSettings();
+                engine = new CheatEngine(target, settings);
+                CheatFeature instant = engine.Add(new CheatFeature(
+                    CheatId.InstantBuild, "瞬间建造", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+
+                Check("瞬间建造接线：金钱已校准时它被视为**已校准**（前置条件就是金钱链）",
+                    instant.IsCalibrated && instant.IsUsable,
+                    "IsCalibrated=" + instant.IsCalibrated + "｜" + instant.LastError);
+
+                instant.Enabled = true;
+                engine.Start();
+
+                // 判据：**只有专用分支**会说出"现在没有东西在造"这句话（通用单地址路径根本不认识这个概念）。
+                // 所以这句话出现 = 接线接对了；若分支漏了、走到通用路径，报到这里的会是别的东西
+                // （而且会拿金钱定位器的地址去写值 —— 下一句断言就是防那个的）。
+                bool routed = WaitUntil(delegate
+                {
+                    return instant.LastError != null
+                        && instant.LastError.IndexOf("没有东西在造", StringComparison.Ordinal) >= 0;
+                }, 2000);
+                engine.Stop();
+
+                Check("瞬间建造接线：引擎确实把它交给了**专用分支**（不是通用单地址路径）",
+                    routed, "LastError=" + instant.LastError
+                        + "｜Address=0x" + instant.Address.ToString("X") + "｜轮次=" + engine.Ticks);
+
+                uint moneyNow;
+                io.ReadUInt32(moneyField, out moneyNow);
+                Check("瞬间建造接线：**金钱一个字节都没被碰**（漏分支就会拿它当字段写）",
+                    moneyNow == MyMoney, "金钱现值 " + moneyNow + "（原值 " + MyMoney + "）");
+            }
+            catch (Exception ex)
+            {
+                Check("瞬间建造接线", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (engine != null) { try { engine.Stop(); } catch (Exception) { } try { engine.Dispose(); } catch (Exception) { } }
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
             }
         }
 

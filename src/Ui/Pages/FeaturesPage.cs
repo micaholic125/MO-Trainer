@@ -115,6 +115,7 @@ namespace MoTrainer.Ui.Pages
                 HotkeyLine(CheatId.PowerOutput, "Ctrl + Alt + 2        电力开关"),
                 HotkeyLine(CheatId.SelectedInvincible, "Ctrl + Alt + 3        选中单位无敌开关"),
                 HotkeyLine(CheatId.KillEnemies, "Ctrl + Alt + 4        秒杀敌人开关"),
+                HotkeyLine(CheatId.InstantBuild, "Ctrl + Alt + 5        瞬间建造开关"),
                 "",
                 "提示：游戏若是独占全屏，Windows 可能把热键让给游戏窗口而收不到。",
                 "本工具不修改任何游戏文件，只读写游戏进程的内存。"

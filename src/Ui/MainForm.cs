@@ -26,6 +26,7 @@ namespace MoTrainer.Ui
         private const int HotkeyPower = 0xA002;
         private const int HotkeyInvincible = 0xA003;
         private const int HotkeyKillEnemies = 0xA004;
+        private const int HotkeyInstantBuild = 0xA005;
 
         private readonly ProcessAttach _attach;
         private readonly MemoryIO _memory;
@@ -390,6 +391,27 @@ namespace MoTrainer.Ui
                 + "② 到「高级功能」页点一次「预演：秒杀敌人」，看清「将击杀 / 放过我方」两个数字再开启。\n\n"
                 + "程序每一拍都会核对敌我，任何一处对不上就拒绝执行、一个字节都不写。";
 
+            // 瞬间建造（S6-2，2026-10-11 接线）：**刻意不从设置里恢复开启状态** ——
+            // 与无敌 / 秒杀同一处理：它改的是"联网时会互相核对的状态"，属于高风险项，
+            // 每次启动都该由玩家重新确认后主动打开。
+            CheatFeature instant = _engine.Add(new CheatFeature(CheatId.InstantBuild, "瞬间建造",
+                "开启后，你正在造的东西会被立刻造好（尾款由游戏一次性结清）。", SynchRisk.High, false));
+            instant.Detail =
+                "做法：在游戏的建造流水线里，把「正在造的那个东西」的进度往前推几拍 ——\n"
+                + "推到只剩最后 1 拍时，游戏会自己把尾款一次结清、东西立刻造好。\n"
+                + "**钱照扣**（不是白送），你看到的只是它「嗖」地就造完了。\n"
+                + "\n"
+                + "⚠ **联机代价（与「选中单位无敌」「秒杀敌人」同一档）**：\n"
+                + "建造进度是联网时会互相核对的状态 —— 每个客户端各自模拟同一条流水线。\n"
+                + "你这边提前造好、别人那边还在造，对不上就会 out of sync 掉线。\n"
+                + "**只适合单人战役 / 遭遇战打 AI；局域网对局请勿开启。**\n"
+                + "\n"
+                + "什么时候需要先做点什么：程序靠「金钱」锚定出你的房子。\n"
+                + "若提示认不出我方房子，先确认「金钱」那一项处于已校准状态。\n"
+                + "\n"
+                + "关掉开关时：程序**立刻停手**，已经在造的东西保持当前进度继续造（不会退回）。\n"
+                + "卡片状态行会显示「现在在造什么、造到第几拍」；没东西在造时也如实写明，不会装作在工作。";
+
             _settings.SetValue(CheatId.Money, money.TargetValue);
             _settings.SetValue(CheatId.PowerOutput, power.TargetValue);
         }
@@ -420,6 +442,7 @@ namespace MoTrainer.Ui
             RegisterHotkey(HotkeyPower, CheatId.PowerOutput, Keys.D2, "2");
             RegisterHotkey(HotkeyInvincible, CheatId.SelectedInvincible, Keys.D3, "3");
             RegisterHotkey(HotkeyKillEnemies, CheatId.KillEnemies, Keys.D4, "4");
+            RegisterHotkey(HotkeyInstantBuild, CheatId.InstantBuild, Keys.D5, "5");
         }
 
         private void RegisterHotkey(int id, CheatId featureId, Keys key, string label)

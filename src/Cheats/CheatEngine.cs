@@ -155,7 +155,11 @@ namespace MoTrainer.Cheats
                 case CheatId.PowerOutput: return profile.PowerOutput;
                 case CheatId.SelectedInvincible: return profile.SelectedList;
                 case CheatId.KillEnemies: return profile.TechnoArray;
-                case CheatId.InstantBuild: return null;
+                // 瞬间建造**没有自己的地址**（它是"跟着房子 + 0x53BC 的把手走"，见 InstantBuild），
+                // 但它有一个**实打实的前置条件**：金钱链必须能解析出来 —— 我方房子就是从那儿锚定的。
+                // 所以这里挂金钱定位器：`IsUsable` 判的正是"前置条件够不够"，
+                // 而它的执行**永远走专用分支**（ApplyInstantBuild），绝不会拿这个定位器当地址去写。
+                case CheatId.InstantBuild: return profile.Money;
                 case CheatId.RevealMap: return profile.MapShroud;
                 default: return null;
             }
@@ -281,6 +285,7 @@ namespace MoTrainer.Cheats
                         if (feature.Id == CheatId.SelectedInvincible) { PeekSelection(feature); }
                         else if (feature.Id == CheatId.KillEnemies) { PeekTechnoArray(feature); }
                         else if (feature.Id == CheatId.PowerOutput) { PeekPower(feature); }
+                        else if (feature.Id == CheatId.InstantBuild) { PeekInstantBuild(feature); }
                         else { PeekValue(feature); }
                     }
 
@@ -323,8 +328,112 @@ namespace MoTrainer.Cheats
                 if (feature.Id == CheatId.SelectedInvincible) { ApplySelectedInvincible(feature); }
                 else if (feature.Id == CheatId.KillEnemies) { ApplyKillEnemies(feature); }
                 else if (feature.Id == CheatId.PowerOutput) { ApplyPower(feature); }
+                else if (feature.Id == CheatId.InstantBuild) { ApplyInstantBuild(feature); }
                 else { ApplyFeature(feature); }
             }
+        }
+
+        // ============================================================ 瞬间建造（S6-2，2026-10-11 定位成功）
+
+        /// <summary>
+        /// 关闭状态下的只读探测：把"你现在在造什么、造到第几拍"显示到卡片上。
+        /// 让玩家**开启之前**就能看到地址解析是否正常（与其它功能同一考虑：
+        /// 免得开了才发现没效果，还得猜是工具坏了还是地址错了）。
+        /// </summary>
+        private void PeekInstantBuild(CheatFeature feature)
+        {
+            feature.Address = 0;
+
+            uint house;
+            string reason;
+            if (!TryResolveMyHouse(out house, out reason))
+            {
+                feature.LastError = reason;
+                return;
+            }
+
+            uint target;
+            if (!_target.Memory.ReadUInt32(house + HarvestSession.ProducingPointerOffset, out target)
+                || target == 0)
+            {
+                feature.LastError = "现在没有东西在造";
+                return;
+            }
+
+            uint typeTable;
+            if (!_target.Memory.ReadUInt32(target, out typeTable)
+                || typeTable < _target.ModuleBase
+                || typeTable >= _target.ModuleBase + _target.ModuleSize)
+            {
+                feature.LastError = "「正在造的东西」那个指针不像游戏对象（可能这一拍正好在换）";
+                return;
+            }
+
+            uint elapsed;
+            if (!_target.Memory.ReadUInt32(target + InstantBuild.ElapsedOffset, out elapsed))
+            {
+                feature.LastError = "读不到「已经造了多少拍」";
+                return;
+            }
+
+            feature.Address = target;
+            feature.LastSeenValue = elapsed;
+            feature.LastError = "";
+        }
+
+        /// <summary>
+        /// 瞬间建造：把"现在在造的那个东西"的进度往前推（原理与安全设计见 `InstantBuild` 的类注释）。
+        ///
+        /// 与无敌 / 秒杀 / 电力一样**必须走专用路径**——它既不是"锁一个地址"，也不是"遍历名单"，
+        /// 而是"跟着房子自己的把手走"。若复用到单地址的读-比-写上，就会拿别人的地址当字段写，
+        /// 正是 `CLAUDE.md` 7.1 那个雷。
+        /// </summary>
+        private void ApplyInstantBuild(CheatFeature feature)
+        {
+            uint house;
+            string reason;
+            if (!TryResolveMyHouse(out house, out reason))
+            {
+                feature.Address = 0;
+                feature.LastError = reason;
+                return;
+            }
+
+            InstantBuildResult r = InstantBuild.Tick(
+                _target.Memory, house, _target.ModuleBase, _target.ModuleSize);
+
+            feature.Address = r.ProducingAddress;
+            feature.LastSeenValue = r.Wrote ? r.ElapsedAfter : r.ElapsedBefore;
+            // Note 里既有"写不了"的原因，也有"现在没有东西在造"这类状态 —— 一律如实显示，不静默。
+            feature.LastError = r.Note;
+            if (r.Wrote) { feature.WriteCount++; }
+        }
+
+        /// <summary>
+        /// 我方房子（`HouseClass`）：金钱地址减去金钱偏移。
+        /// 与校准页、采集器用的是同一套锚定（金钱链是"我方"的**唯一**可靠来源）。
+        /// </summary>
+        private bool TryResolveMyHouse(out uint house, out string reason)
+        {
+            house = 0;
+            reason = "";
+            if (_profile == null) { reason = "缺少校准配置"; return false; }
+
+            uint moneyAddress;
+            string error;
+            if (!_profile.Money.TryResolve(_target.Memory, _target.ModuleBase, out moneyAddress, out error))
+            {
+                reason = "认不出我方房子（金钱链没解析出来）：" + error;
+                return false;
+            }
+            if (moneyAddress < TechnoOwnership.HouseMoneyOffset + 0x10000)
+            {
+                reason = "金钱地址小得不合理，拒绝执行";
+                return false;
+            }
+
+            house = moneyAddress - TechnoOwnership.HouseMoneyOffset;
+            return true;
         }
 
         // ============================================================ 电力（S4-3，2026-10-09 定位成功）
@@ -1315,6 +1424,20 @@ namespace MoTrainer.Cheats
 
         private void ApplyFeature(CheatFeature feature)
         {
+            // 兜底闸门：这两条功能**必须**走各自的专用分支（见上面的 ApplyAll）。
+            //
+            // 为什么值得单独挡一下（`CLAUDE.md` 7.1 那个雷）：它们的 Locator 只是"前置条件的凭证"，
+            // **不是要写的地址**（瞬间建造挂的是金钱定位器 —— 金钱链能解析 = 认得出我方房子）。
+            // 万一将来有人加功能时漏了分支，这里会拿金钱地址去写值 —— 那是"把你的钱写成 0"级别的错，
+            // 而且 `IsCalibrated` 那道闸门**拦不住**（配置看着是好的）。宁可什么都不做并大声报错。
+            if (feature.Id == CheatId.InstantBuild)
+            {
+                feature.Address = 0;
+                feature.LastError = "内部错误：这项功能缺少专用执行分支（已拒绝执行，一个字节都没写）";
+                Logger.Error("Engine", "功能「" + feature.Name + "」走到了通用单地址路径 —— 分支漏了，已拒绝写入");
+                return;
+            }
+
             EnsureAddress(feature);
             if (feature.Address == 0) { return; }
 
