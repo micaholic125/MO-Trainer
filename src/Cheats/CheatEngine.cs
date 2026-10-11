@@ -333,6 +333,9 @@ namespace MoTrainer.Cheats
             }
         }
 
+        /// <summary>瞬间建造上一拍写进日志的状态（状态没变就不重复写，避免按拍刷屏）。</summary>
+        private string _instantBuildLastNote = "";
+
         // ============================================================ 瞬间建造（S6-2，2026-10-11 定位成功）
 
         /// <summary>
@@ -407,6 +410,20 @@ namespace MoTrainer.Cheats
             // Note 里既有"写不了"的原因，也有"现在没有东西在造"这类状态 —— 一律如实显示，不静默。
             feature.LastError = r.Note;
             if (r.Wrote) { feature.WriteCount++; }
+
+            // **状态一变就写一行日志**（不按拍刷屏）。理由：真机上"为什么没效果"以前只出现在卡片上，
+            // 事后查不到 —— 而本项目有明确规矩：能让程序自己写进日志的，就不要靠人去描述
+            //（2026-10-11 用户报"防御工事 / 步兵 / 载具不能瞬间建造"时，日志里就什么都没有）。
+            if (r.Note != _instantBuildLastNote)
+            {
+                _instantBuildLastNote = r.Note;
+                if (r.Note.Length > 0)
+                {
+                    Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                        "瞬间建造：{0}（对象 0x{1:X8}｜类别 0x{2:X8}｜已过拍数 {3}）",
+                        r.Note, r.ProducingAddress, r.TypeTable, r.ElapsedBefore));
+                }
+            }
         }
 
         /// <summary>
