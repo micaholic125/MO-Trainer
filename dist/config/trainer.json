@@ -16,10 +16,6 @@
     "killEnemies": {
       "enabled": true,
       "value": "0x0"
-    },
-    "instantBuild": {
-      "enabled": true,
-      "value": "0x0"
     }
   }
 }
