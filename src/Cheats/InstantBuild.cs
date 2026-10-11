@@ -82,16 +82,26 @@ namespace MoTrainer.Cheats
         public const uint VerifiedTypeTable = 0x007E88D0;
 
         /// <summary>
-        /// 每拍往前推几拍。锁定线程 33 毫秒一拍 ⇒ 约 150 拍/秒，
-        /// 一座 54 拍的矿场大约 0.4 秒造好（"瞬间"够用了，又不至于一步跳过头太多）。
+        /// 收尾前**留几拍不推**，交给游戏自己走完。
+        ///
+        /// 为什么必须留余量（2026-10-11 真机事故）：建造完成的**唯一**触发方式是
+        /// "某一拍把尾款一次结清"（还剩 1 拍时那一拍正好把余款付掉）。若把进度推**过了**那个点，
+        /// 游戏再也不会执行"结清"那一下 —— 表现就是**读条满了、不显示就绪、也放不下去**。
+        /// 留 3 拍：就算"总拍数"估算差了 ±2 拍，也绝不会推过头。
         /// </summary>
-        public const uint AdvanceTicks = 5;
+        public const uint ReserveTicks = 3;
 
         /// <summary>拍数上限：超过这个数说明这不是一条正常的建造流水线，拒绝动它。</summary>
         public const uint MaxElapsed = 5000;
 
         /// <summary>与 `ProgressHunter`「取值像地址」同口径：比这大的数不可能是"还差多少钱"。</summary>
         public const uint MaxSaneRemaining = 0x10000000;
+
+        // 观测状态：**只认同一件东西**（换东西就重新量）。静态是因为 `Tick` 是无状态的工具方法，
+        // 而这几格只服务于"量一拍"这一件事，不需要跟着功能开关走。
+        private static uint _watchedObject;
+        private static uint _watchedElapsed;
+        private static uint _watchedRemaining;
 
         /// <summary>
         /// 走一拍。**任何一步对不上就一个字节都不写**，原因写在返回值的 <see cref="InstantBuildResult.Note"/> 里。
@@ -187,8 +197,48 @@ namespace MoTrainer.Cheats
                 return result;
             }
 
-            uint next = result.ElapsedBefore + AdvanceTicks;
+            // ⑤ 先"看一拍"：等游戏自己走一拍（它自己会同时改 elapsed 和 remaining），
+            //    从这一拍扣掉的钱反推"还差几拍"，再决定推到哪儿停 —— **绝不闷头往前推**。
+            if (target != _watchedObject)
+            {
+                _watchedObject = target;
+                _watchedElapsed = result.ElapsedBefore;
+                _watchedRemaining = result.Remaining;
+                result.Note = "正在量这东西一共要造多少拍（等游戏自己走一拍，约 0.4 秒）";
+                return result;
+            }
+            if (result.ElapsedBefore == _watchedElapsed && result.Remaining == _watchedRemaining)
+            {
+                result.Note = "正在量…（游戏这一拍还没走完）";
+                return result;
+            }
+
+            uint paidThisTick = _watchedRemaining > result.Remaining
+                ? _watchedRemaining - result.Remaining : 0;
+            _watchedElapsed = result.ElapsedBefore;
+            _watchedRemaining = result.Remaining;
+
+            if (paidThisTick == 0)
+            {
+                result.Note = "这一拍没有扣钱（可能在等钱或正在收尾）—— 不推";
+                return result;
+            }
+
+            // 还差几拍 ≈ 还差的钱 ÷ 这一拍扣的钱；总拍数 ≈ 已经过的 + 还差的
+            uint ticksLeft = result.Remaining / paidThisTick;
+            if (ticksLeft <= ReserveTicks)
+            {
+                result.Note = "就剩最后几拍了，交给游戏自己走完";
+                return result;
+            }
+
+            uint next = result.ElapsedBefore + ticksLeft - ReserveTicks;
             result.ElapsedAfter = next;
+            if (next <= result.ElapsedBefore)
+            {
+                result.Note = "算出来的目标不比现在大，不推";
+                return result;
+            }
 
             if (!memory.IsWritable(target + ElapsedOffset))
             {

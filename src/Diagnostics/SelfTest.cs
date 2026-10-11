@@ -5930,17 +5930,28 @@ namespace MoTrainer.Diagnostics
                 io.WriteUInt32(elapsedField, 20);
                 io.WriteUInt32(remainingField, 1482);
 
-                // ---- 正常路径：往前推 ----
+                // ---- 正常路径：先"量一拍"，再推到"差 3 拍"，**绝不推过头** ----
+                InstantBuildResult first = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：第一次只观察、不下手（先量出这东西一共要造多少拍，才敢推）",
+                    !first.Wrote && first.Note.IndexOf("正在量", StringComparison.Ordinal) >= 0,
+                    first.Note);
+
+                // 冒充"游戏自己走了一拍"：又走了一拍（20 → 21）、并扣掉 37 块（1482 → 1445）
+                io.WriteUInt32(elapsedField, 21);
+                io.WriteUInt32(remainingField, 1445);
                 InstantBuildResult ok = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
-                Check("瞬间建造：把「已经造了多少拍」往前推（20 → 25）",
+                // 还差 1445 / 37 ≈ 39 拍；21 + 39 − 3 = 57 —— 这就是"推到这儿就停"
+                Check("瞬间建造：按量出来的拍数往前推，并**留 3 拍余量**（21 → 57）",
                     ok.Ok && ok.Wrote && ok.ProducingAddress == producing
-                        && ok.ElapsedBefore == 20 && ok.ElapsedAfter == 25,
-                    "写前 " + ok.ElapsedBefore + " → 写后 " + ok.ElapsedAfter);
+                        && ok.ElapsedAfter == 57,
+                    "写前 " + ok.ElapsedBefore + " → 写后 " + ok.ElapsedAfter
+                        + "（还差 " + ok.Remaining + "，这一拍扣了 37）");
 
                 uint nowElapsed;
                 io.ReadUInt32(elapsedField, out nowElapsed);
                 Check("瞬间建造：内存里确认真的写进去了（不是只印了个数）",
-                    nowElapsed == 25, "内存现值 " + nowElapsed);
+                    nowElapsed == 57, "内存现值 " + nowElapsed);
+                io.WriteUInt32(elapsedField, 20);          // 复位，后面几条用得到
 
                 // ---- 拒绝路径：每一条都要"不写 + 说得出为什么" ----
                 io.WriteUInt32(house + HarvestSession.ProducingPointerOffset, 0);
@@ -5995,6 +6006,20 @@ namespace MoTrainer.Diagnostics
                 io.ReadUInt32(elapsedField, out afterAll);
                 Check("瞬间建造：上面每一条拒绝都**真的没写**（那一格还是 20）",
                     afterAll == 20, "内存现值 " + afterAll);
+
+                // ---- 最关键的一条：**绝不推过头**（真机事故：推过了"最后 1 拍"→ 读条满但不就绪）----
+                io.WriteUInt32(elapsedField, 20);
+                io.WriteUInt32(remainingField, 1482);
+                InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);   // 重新开始量
+                io.WriteUInt32(elapsedField, 21);
+                io.WriteUInt32(remainingField, 1445);                                   // 游戏走了一拍、扣了 37
+                InstantBuildResult pushed = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+                uint afterPush;
+                io.ReadUInt32(elapsedField, out afterPush);
+                Check("瞬间建造：推到的位置**必须留下余量**（不许顶到甚至越过总拍数）",
+                    pushed.Wrote && afterPush + InstantBuild.ReserveTicks <= 21 + 1445 / 37,
+                    "推到 " + afterPush + "，估算总拍数 " + (21 + 1445 / 37)
+                        + "（余量" + InstantBuild.ReserveTicks + " 拍）");
             }
             catch (Exception ex)
             {
