@@ -162,6 +162,11 @@ namespace MoTrainer.Diagnostics
             Section("18. 无敌的保护名单（只保护开启那一刻选中的 · [S5-6] 反向用例）");
             CheckInvincibleSnapshot();
 
+            // [S6-3] 全图视野：写入那一半（分块清零 + 游标）早就有断言，卡点是"黑幕数据在哪"。
+            // 猎手负责把"哪块地方像黑幕"从一次普通采集里排出来 —— 用户不必为此多开一局。
+            Section("19. 黑幕数据猎手（[S6-3] 全图视野的前置）");
+            CheckShroudHunter();
+
             Write("");
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
@@ -4911,6 +4916,184 @@ namespace MoTrainer.Diagnostics
                 if (scene != null) { scene.Dispose(); }
                 self.Dispose();
             }
+        }
+
+        // ============================================================ 黑幕数据猎手（[S6-3]）
+
+        /// <summary>
+        /// 「黑幕数据」猎手（`[S6-3]` 全图视野的前置，**只读**）。
+        ///
+        /// 它的判据只有一条：**同一个地址范围里 0xFF 持续减少、0x00 等量增加** ——
+        /// 那正是"黑幕被揭开"在内存里的样子。这里在合成内存上把这个形态造出来，
+        /// 同时造两种"像但不是"的东西当反例，确保它不会乱指：
+        ///   · 一大片 0x00 从头到尾不变（空内存 / 已清零的缓冲区）；
+        ///   · 一块内容乱动、但 0x00/0xFF 的个数基本不动（计数器、指针表、对象数组）。
+        /// 另有一条钉死"全程只读"：**采样前后逐字节比对**（照 `PowerScout` 那条的老办法）。
+        /// </summary>
+        private static void CheckShroudHunter()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("黑幕猎手", false, "OpenProcess 失败"); return; }
+
+            IntPtr blockShroud = IntPtr.Zero;
+            IntPtr blockQuiet = IntPtr.Zero;
+            IntPtr blockChurn = IntPtr.Zero;
+            IntPtr blockGrow = IntPtr.Zero;
+            try
+            {
+                blockShroud = AllocLowBlock(self.Handle);
+                blockQuiet = AllocLowBlock(self.Handle);
+                blockChurn = AllocLowBlock(self.Handle);
+                blockGrow = AllocLowBlock(self.Handle);
+                if (blockShroud == IntPtr.Zero || blockQuiet == IntPtr.Zero
+                    || blockChurn == IntPtr.Zero || blockGrow == IntPtr.Zero)
+                {
+                    Check("黑幕猎手测试内存块", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+
+                MemoryIO io = new MemoryIO(self);
+                uint shroud = (uint)blockShroud.ToInt64();
+                uint quiet = (uint)blockQuiet.ToInt64();
+                uint churn = (uint)blockChurn.ToInt64();
+                uint grow = (uint)blockGrow.ToInt64();
+
+                const int Window = ShroudHunter.WindowSize;      // 0x10000，正好一块
+                const int Explored = 0x4000;                     // 这一局"探索掉"的 16 KB
+                const int Grew = 0x2000;                         // "数组增长"那种：只多出 0x00
+
+                // ① 造现场：一块 0xFF（未探索）、一块 0x00（空内存）、
+                //    一块 0x5A（像"别的数据"）、一块 0x5A 之后会长出 0x00（像数组增长）
+                byte[] ones = new byte[Window];
+                for (int i = 0; i < ones.Length; i++) { ones[i] = 0xFF; }
+                byte[] zeros = new byte[Window];
+                byte[] pattern = new byte[Window];
+                for (int i = 0; i < pattern.Length; i++) { pattern[i] = 0x5A; }
+
+                bool wrote = io.Write(shroud, ones, 0, Window)
+                    && io.Write(quiet, zeros, 0, Window)
+                    && io.Write(churn, pattern, 0, Window)
+                    && io.Write(grow, pattern, 0, Window);
+                Check("黑幕猎手：四块测试内存已就位（未探索 / 空内存 / 乱动 / 只增不减）", wrote,
+                    wrote ? "ok" : "写入测试内存失败");
+
+                List<MemoryRegion> regions = new List<MemoryRegion>();
+                regions.Add(MakeRegion(shroud, TestBlockSize));
+                regions.Add(MakeRegion(quiet, TestBlockSize));
+                regions.Add(MakeRegion(churn, TestBlockSize));
+                regions.Add(MakeRegion(grow, TestBlockSize));
+
+                // ② 第一张画像（还没探索）
+                string note;
+                List<ShroudWindow> before = ShroudHunter.SampleRegions(
+                    io, regions, Window, 16L * 1024 * 1024, out note);
+                Check("黑幕猎手：第一张画像采到四块", before.Count == 4,
+                    before.Count + " 块｜" + note);
+
+                // ③ "探索"：把黑幕那块的前 16 KB 揭开（0xFF 少、0x00 等量多）；
+                //    让第三块乱动 1000 个字节（0x00/0xFF 个数不变）；
+                //    让第四块只长出 8 KB 的 0x00（0xFF 一个没少）—— 那是"数组增长"，不是黑幕。
+                byte[] explored = new byte[Explored];
+                io.Write(shroud, explored, 0, Explored);
+                byte[] jitter = new byte[1000];
+                for (int i = 0; i < jitter.Length; i++) { jitter[i] = (byte)(0x10 + (i % 200)); }
+                io.Write(churn + 0x2000, jitter, 0, jitter.Length);
+                byte[] grew = new byte[Grew];
+                io.Write(grow, grew, 0, Grew);
+
+                // 采样**之前**把那两块的字节整个留一份，采完比对 —— 钉死"只读"
+                byte[] shroudBytesBefore = io.ReadBytes(shroud, Window);
+                byte[] churnBytesBefore = io.ReadBytes(churn, Window);
+
+                List<ShroudWindow> after = ShroudHunter.SampleRegions(
+                    io, regions, Window, 16L * 1024 * 1024, out note);
+                Check("黑幕猎手：第二张画像也采到四块", after.Count == 4,
+                    after.Count + " 块｜" + note);
+
+                byte[] shroudBytesAfter = io.ReadBytes(shroud, Window);
+                byte[] churnBytesAfter = io.ReadBytes(churn, Window);
+                Check("黑幕猎手：全程只读 —— 采样前后那两块的字节一个都没变",
+                    SameBytes(shroudBytesBefore, shroudBytesAfter)
+                        && SameBytes(churnBytesBefore, churnBytesAfter),
+                    "黑幕块 " + Window + " 字节 / 乱动块 " + Window + " 字节 均已逐字节比对");
+
+                // ④ 排序：只该认出"黑幕"那一块
+                List<ShroudCandidate> ranked = ShroudHunter.Rank(before, after);
+                bool shroudFound = ranked.Count >= 1 && ranked[0].Address == shroud;
+                Check("黑幕猎手：认出「0xFF 变少、0x00 等量变多」的那一块（排第一）", shroudFound,
+                    ranked.Count == 0 ? "一个候选都没有"
+                        : string.Format(CultureInfo.InvariantCulture,
+                            "第一名 0x{0:X8}（0xFF 减少 {1}｜0x00 增加 {2}｜其他字节 {3}）",
+                            ranked[0].Address, ranked[0].OnesDown, ranked[0].ZerosUp, ranked[0].OtherCount));
+                Check("黑幕猎手：变化量算得对（各 16 KB）",
+                    shroudFound && ranked[0].OnesDown == Explored && ranked[0].ZerosUp == Explored,
+                    shroudFound ? string.Format(CultureInfo.InvariantCulture,
+                        "0xFF 减少 {0}｜0x00 增加 {1}（期望各 {2}）",
+                        ranked[0].OnesDown, ranked[0].ZerosUp, Explored) : "没找到那一块");
+
+                bool quietExcluded = true;
+                bool churnExcluded = true;
+                bool growExcluded = true;
+                for (int i = 0; i < ranked.Count; i++)
+                {
+                    if (ranked[i].Address == quiet) { quietExcluded = false; }
+                    if (ranked[i].Address == churn) { churnExcluded = false; }
+                    if (ranked[i].Address == grow) { growExcluded = false; }
+                }
+                Check("黑幕猎手：从头到尾没变过的那一块不进候选（空内存不是黑幕）", quietExcluded,
+                    ranked.Count + " 个候选里" + (quietExcluded ? "没有" : "混进了") + "那一块");
+                Check("黑幕猎手：只乱动、但 0x00/0xFF 个数不变的那一块不进候选（计数器不是黑幕）",
+                    churnExcluded,
+                    ranked.Count + " 个候选里" + (churnExcluded ? "没有" : "混进了") + "那一块");
+                Check("黑幕猎手：只朝一个方向变的那一块不进候选（数组增长不是黑幕）", growExcluded,
+                    ranked.Count + " 个候选里" + (growExcluded ? "没有" : "混进了")
+                    + "那一块（0x00 多了 " + Grew + "、0xFF 一个没少）");
+
+                // ⑤ 旁证：动过的窗口数与"长得像对象数组"的窗口数
+                int moved;
+                int objectLike;
+                ShroudHunter.SummarizeChurn(before, after, out moved, out objectLike);
+                Check("黑幕猎手：旁证统计 —— 动过 3 块，其中 2 块是「对象数组那种长相」",
+                    moved == 3 && objectLike == 2,
+                    "动过 " + moved + " 块｜其中对象数组长相 " + objectLike + " 块"
+                    + "（期望 3 / 2：黑幕块 + 乱动块 + 只增不减块，后两者其他字节占多数）");
+
+                // ⑥ 报告的三个分支都要能出（真机报告就靠这段）
+                string report = ShroudHunter.Format(before, after, note, false);
+                Check("黑幕猎手：报告写出候选表（含地址与两个方向的量）",
+                    report.IndexOf("七、找黑幕数据") >= 0 && report.IndexOf("0x" + shroud.ToString("X8")) >= 0,
+                    report.Length + " 字");
+                Check("黑幕猎手：已校准过就跳过这一节（不重复折腾用户）",
+                    ShroudHunter.Format(before, after, note, true).IndexOf("已校准过") >= 0, "ok");
+                Check("黑幕猎手：什么都没采到时如实说明，而不是编造候选",
+                    ShroudHunter.Format(null, null, "没采到", false).IndexOf("没能采到内存画像") >= 0, "ok");
+            }
+            catch (Exception ex)
+            {
+                Check("黑幕猎手", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (blockShroud != IntPtr.Zero) { FreeBlock(self, blockShroud); }
+                if (blockQuiet != IntPtr.Zero) { FreeBlock(self, blockQuiet); }
+                if (blockChurn != IntPtr.Zero) { FreeBlock(self, blockChurn); }
+                if (blockGrow != IntPtr.Zero) { FreeBlock(self, blockGrow); }
+                self.Dispose();
+            }
+        }
+
+        private static bool SameBytes(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) { return false; }
+            for (int i = 0; i < a.Length; i++) { if (a[i] != b[i]) { return false; } }
+            return true;
+        }
+
+        /// <summary>释放自检自己申请的测试内存块（照 TechnoScene.Dispose 的做法）。</summary>
+        private static void FreeBlock(SelfHandle self, IntPtr block)
+        {
+            try { Win32Api.VirtualFreeEx(self.Handle, block, IntPtr.Zero, MEM_RELEASE); }
+            catch (Exception) { }
         }
 
         // ============================================================ 采集（S6/S4 校准辅助）

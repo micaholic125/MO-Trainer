@@ -8,10 +8,6 @@
     "powerOutput": {
       "enabled": false,
       "value": "0x7530"
-    },
-    "killEnemies": {
-      "enabled": true,
-      "value": "0x0"
     }
   }
 }

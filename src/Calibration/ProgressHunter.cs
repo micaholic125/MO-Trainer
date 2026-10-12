@@ -725,11 +725,17 @@ namespace MoTrainer.Calibration
 
             ProgressCandidate best = candidates[0];
             text.AppendLine();
+            text.AppendLine("⚠ **这一项已经做完了（2026-10-11 起）**：瞬间建造已按"
+                + "「我方房子 +0x53BC → 那个正在造的东西的 +0x24（已过拍数）」接线并真机验收通过。");
+            text.AppendLine("      所以下面这个「结论」**不再是要你去做的事**，它只是同一份数据里"
+                + "排名第一的字段，留作对照与回归用。");
+            text.AppendLine("      （真要再往前推，只剩**步兵 / 载具 / 防御工事** —— 那些不走这条流水线，"
+                + "见 `InstantBuild` 里「已知边界」那段注释。）");
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "结论：最像「建造进度」的是 对象 {0} 的 **+0x{1:X}**（得分 {2}）。",
+                "结论：本次数据里最像「建造进度」的是 对象 {0} 的 **+0x{1:X}**（得分 {2}）。",
                 best.ObjectLabel, best.Series.Offset, best.Score));
-            text.AppendLine("      下一步**不是**直接接线，而是真机试探：往这个字段写一个值 → 看建造是否立刻完成 →");
-            text.AppendLine("      立即还原（做法与「电力试探」同源，见 docs/05）。写错字段是要出事的，所以必须试探过才接线。");
+            text.AppendLine("      它**没有**被采用（上面那个已验收的方案用的不是它）；这里保留是为了"
+                + "下次换一局时能对照：如果两次数据指向同一个字段，那才值得再看一眼。");
             text.AppendLine();
             return text.ToString();
         }

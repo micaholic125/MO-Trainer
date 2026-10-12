@@ -208,6 +208,15 @@ namespace MoTrainer.Calibration
 
         private List<HarvestObjectRow> _lastRoster = new List<HarvestObjectRow>();
 
+        // ---- 「黑幕数据」画像（[S6-3] 全图视野，只读）----
+        //
+        // 只留**第一张与最后一张**：要判的是"这局里哪块地方单向地从 0xFF 变成 0x00"，
+        // 中间那些张没有额外信息，存着只是白占内存（每张几万条统计）。
+        private List<ShroudWindow> _shroudFirst;
+        private List<ShroudWindow> _shroudLast;
+        private string _shroudNote = "";
+        private double _lastShroudSecond = -999.0;
+
         // ---- 「阵营」这一列该用哪个偏移（见 EnsureOwnerOffset）----
         /// <summary>
         /// 本次采集**现场认定可用**的阵营字段偏移；0 = 还没认定出来。
@@ -525,6 +534,12 @@ namespace MoTrainer.Calibration
             text.Append(ProgressHunter.Format(trackedSnapshot, sampleSnapshot,
                 _target.ModuleBase, _target.ModuleSize));
 
+            // 「七、找黑幕数据」（[S6-3] 全图视野）——
+            // 写入那一半（`TechnoOps.RevealMap`）早就写好并自检过了，卡点只有"数据在哪"。
+            // 这一节把"哪块地方像黑幕"当场排好序，用户这一次的采集就能直接给答案。
+            text.Append(ShroudHunter.Format(_shroudFirst, _shroudLast, _shroudNote,
+                _profile != null && _profile.HasMapShroud));
+
             _inspectionText = text.ToString();
             Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
                 "自动巡检结束，耗时 {0:0.0} 秒", (DateTime.UtcNow - started).TotalSeconds));
@@ -600,6 +615,24 @@ namespace MoTrainer.Calibration
             for (int i = 0; i < _tracked.Count; i++)
             {
                 UpdateTracked(_tracked[i], memory, sample.Index);
+            }
+
+            // 「黑幕数据」画像（[S6-3] 全图视野）：每 20 秒拍一张，只留第一张与最后一张。
+            //
+            // 为什么挂在采集里、而不是单做一次：定位黑幕本来就需要"一局里黑幕被揭开"的过程，
+            // 而用户为了第 ④ 件本来就要开着采集正常玩三分钟 —— 一次开机多办一件事，
+            // 不额外占用用户的时间（这是与用户约定的"批次少、每批任务多"）。
+            if (ElapsedSeconds - _lastShroudSecond >= 20.0)
+            {
+                _lastShroudSecond = ElapsedSeconds;
+                string shroudNote;
+                List<ShroudWindow> shot = ShroudHunter.Sample(memory, out shroudNote);
+                if (shot.Count > 0)
+                {
+                    if (_shroudFirst == null) { _shroudFirst = shot; }
+                    _shroudLast = shot;
+                    _shroudNote = shroudNote;
+                }
             }
 
             lock (_lock) { _samples.Add(sample); }
@@ -1580,7 +1613,15 @@ namespace MoTrainer.Calibration
                         "  ⚠ 本对象变化太多，只记下了前 {0} 条 —— **后面的变化没有记全**（如实标注，别当成完整的）",
                         MaxChangeEventsPerObject));
                 }
-                text.AppendLine("  常见字段偏移对照：+0x06C 血量｜+0x0F0 阵营｜+0x07D 最大血量");
+                // 这一行必须**跟着本次实际用的偏移走**。
+                // 2026-10-12 用户报告里出现过自相矛盾的一版：抬头写着"阵营 +0x14C（现场推出）"，
+                // 明细里却印着 `+0x0F0 阵营` —— 那正是配置里那个人工试出、早已被真机否定的值。
+                // 同一份报告里两个数打架，比不印更糟（`CLAUDE.md` 7.4）。
+                text.AppendLine(_ownerOffset != 0
+                    ? string.Format(CultureInfo.InvariantCulture,
+                        "  常见字段偏移对照：+0x06C 血量｜+0x{0:X3} 阵营（本次实际使用）｜+0x07D 最大血量",
+                        _ownerOffset)
+                    : "  常见字段偏移对照：+0x06C 血量｜+0x07D 最大血量（「阵营」本次没能认定，原因见上方说明）");
                 }
                 catch (Exception ex)
                 {
