@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Text;
 using MoTrainer.Core;
 
@@ -486,6 +487,193 @@ namespace MoTrainer.Calibration
         // ============================================================ 报告
 
         /// <summary>写进采集报告的「找黑幕数据」一节。</summary>
+        /// <summary>
+        /// 把候选窗口的**原始字节**存成文件（**只读**），并画一张"长相图"。
+        ///
+        /// 为什么非要有这一步：报告里的统计只能说明"这块在变"，说明不了"它长什么样"。
+        /// 而黑幕位图有一个**肉眼可辨的形状** —— 一大片同值里嵌着一块**连通的**"已探索"区域；
+        /// 对象数组、字符串缓冲区、渲染缓冲区长的是别的样子。
+        /// 2026-10-12 两次采集都因为"只有数字、没有形状"而无法定论，
+        /// 所以这一步**放进采集收尾自动做**：用户不必为此多开一局游戏。
+        ///
+        /// 输出：`reports\shrouddump-日期-时间.txt`（每个候选一段：值分布 + 最长游程 + 字符图）。
+        /// 字符图的规则：该窗口里**最多的那个值**画成 `.`、**次多的**画成 `#`、其余画成 `+`
+        /// —— 这样"一大片 + 一块连通区域"会直接显形。
+        /// </summary>
+        public static string DumpTopCandidates(
+            MemoryIO memory, IList<IList<ShroudWindow>> samples, string folder,
+            uint moduleBase, uint moduleSize, int maxCandidates, out string note)
+        {
+            note = "";
+            if (memory == null) { note = "内存接口不可用"; return ""; }
+            if (samples == null || samples.Count < 2) { note = "快照不足两张"; return ""; }
+            if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+            {
+                note = "报告目录不存在：" + folder;
+                return "";
+            }
+
+            List<ShroudCandidate> ranked = RankByProgress(samples);
+            if (ranked.Count == 0) { ranked = Rank(samples); }
+            if (ranked.Count == 0) { note = "没有候选可存"; return ""; }
+
+            int count = ranked.Count < maxCandidates ? ranked.Count : maxCandidates;
+            string path = Path.Combine(folder, string.Format(CultureInfo.InvariantCulture,
+                "shrouddump-{0:yyyyMMdd-HHmmss}.txt", DateTime.Now));
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("=== 黑幕候选现场转储（只读） ===");
+            sb.AppendLine("生成时间：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+            sb.AppendLine("说明：每个候选取它那一整块窗口（" + WindowSize + " 字节）的原始内容；");
+            sb.AppendLine("      字符图里 `.` = 这块里最多的那个值，`#` = 次多的，`+` = 其余。");
+            sb.AppendLine("      黑幕位图应当长成「一大片 `.` 里嵌着一块连通的 `#` 区域」。");
+            sb.AppendLine();
+
+            int saved = 0;
+            for (int i = 0; i < count; i++)
+            {
+                ShroudCandidate c = ranked[i];
+                byte[] bytes = memory.ReadBytesQuiet(c.Address, c.Size);
+                if (bytes == null)
+                {
+                    sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                        "--- [{0}] 0x{1:X8} 读不到（地址可能已经失效） ---", i + 1, c.Address));
+                    sb.AppendLine();
+                    continue;
+                }
+                saved++;
+
+                sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "--- [{0}] 0x{1:X8}　变化 {2}｜{3}｜递增 {4}/{5} 段 ---",
+                    i + 1, c.Address, c.Direction,
+                    InModule(c.Address, moduleBase, moduleSize) ? "在游戏主程序范围内" : "在堆/动态内存里",
+                    c.Increases, c.Comparisons));
+                sb.AppendLine("  各段个数：" + c.Series);
+                sb.AppendLine("  值分布（前 6 名）：" + DescribeTopValues(bytes, 6));
+                sb.AppendLine("  最长同值游程（前 3 名）：" + DescribeRuns(bytes, 3));
+                sb.AppendLine("  字符图（每行 64 字节，前 64 行）：");
+                AppendAsciiMap(sb, bytes, 64, 64);
+                sb.AppendLine();
+            }
+
+            try
+            {
+                File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
+            }
+            catch (Exception ex)
+            {
+                note = "写转储文件失败：" + ex.Message;
+                return "";
+            }
+
+            note = string.Format(CultureInfo.InvariantCulture,
+                "候选原始字节已存成 {0}（列了 {1} 个，读到 {2} 个）", path, count, saved);
+            return path;
+        }
+
+        private static bool InModule(uint address, uint moduleBase, uint moduleSize)
+        {
+            return moduleSize != 0 && address >= moduleBase && address < moduleBase + moduleSize;
+        }
+
+        /// <summary>前几名值的个数。</summary>
+        private static string DescribeTopValues(byte[] bytes, int top)
+        {
+            int[] histogram = new int[256];
+            for (int i = 0; i < bytes.Length; i++) { histogram[bytes[i]]++; }
+
+            StringBuilder sb = new StringBuilder();
+            for (int slot = 0; slot < top; slot++)
+            {
+                int best = -1;
+                int bestCount = 0;
+                for (int v = 0; v < 256; v++)
+                {
+                    if (histogram[v] > bestCount) { bestCount = histogram[v]; best = v; }
+                }
+                if (best < 0 || bestCount == 0) { break; }
+                if (sb.Length > 0) { sb.Append("｜"); }
+                sb.Append(string.Format(CultureInfo.InvariantCulture,
+                    "0x{0:X2} 出现 {1} 次", best, bestCount));
+                histogram[best] = 0;
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>最长同值游程（前几名）—— "一大片"到底有多长，一眼能看出来。</summary>
+        private static string DescribeRuns(byte[] bytes, int top)
+        {
+            List<string> runs = new List<string>();
+            int bestLength = 0;
+            int start = 0;
+            byte value = bytes.Length > 0 ? bytes[0] : (byte)0;
+            for (int i = 1; i <= bytes.Length; i++)
+            {
+                if (i < bytes.Length && bytes[i] == value) { continue; }
+                int length = i - start;
+                if (length > bestLength)
+                {
+                    bestLength = length;
+                    runs.Add(string.Format(CultureInfo.InvariantCulture,
+                        "偏移 0x{0:X} 起 0x{1:X2} × {2}", start, value, length));
+                    if (runs.Count > 64) { runs.RemoveAt(0); }
+                }
+                if (i < bytes.Length) { start = i; value = bytes[i]; }
+            }
+
+            runs.Reverse();      // 只会在"更长"时才追加，所以倒过来就是最长的在前
+            int show = runs.Count < top ? runs.Count : top;
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < show; i++)
+            {
+                if (i > 0) { sb.Append("｜"); }
+                sb.Append(runs[i]);
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 画字符图：最多的值 → `.`、次多的 → `#`、其余 → `+`。**不做任何结论**，
+        /// 只是把形状摊开给读报告的人看。
+        /// </summary>
+        private static void AppendAsciiMap(StringBuilder sb, byte[] bytes, int columns, int maxRows)
+        {
+            int[] histogram = new int[256];
+            for (int i = 0; i < bytes.Length; i++) { histogram[bytes[i]]++; }
+
+            int first = -1;
+            int second = -1;
+            for (int slot = 0; slot < 2; slot++)
+            {
+                int best = -1;
+                int bestCount = 0;
+                for (int v = 0; v < 256; v++)
+                {
+                    if (histogram[v] > bestCount) { bestCount = histogram[v]; best = v; }
+                }
+                if (best < 0) { break; }
+                if (slot == 0) { first = best; } else { second = best; }
+                histogram[best] = 0;
+            }
+
+            int rows = (bytes.Length + columns - 1) / columns;
+            if (rows > maxRows) { rows = maxRows; }
+            for (int r = 0; r < rows; r++)
+            {
+                sb.Append("    ");
+                for (int c = 0; c < columns; c++)
+                {
+                    int index = r * columns + c;
+                    if (index >= bytes.Length) { break; }
+                    byte v = bytes[index];
+                    if (v == first) { sb.Append('.'); }
+                    else if (v == second) { sb.Append('#'); }
+                    else { sb.Append('+'); }
+                }
+                sb.AppendLine();
+            }
+        }
+
         /// <summary>写进采集报告的「七、找黑幕数据」一节。</summary>
         public static string Format(
             IList<IList<ShroudWindow>> samples, string sampleNote, bool calibrated)

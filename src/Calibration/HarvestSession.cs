@@ -543,6 +543,20 @@ namespace MoTrainer.Calibration
             text.Append(ShroudHunter.Format(_shroudSamples, _shroudNote,
                 _profile != null && _profile.HasMapShroud));
 
+            // 顺手把候选的**原始字节**存一份（**只读**）：报告里的统计只能说明"这块在变"，
+            // 说明不了"它长什么样" —— 而黑幕位图有一个肉眼可辨的形状（一大片同值里嵌着一块连通区域）。
+            // 2026-10-12 两次采集都因为"只有数字、没有形状"定不了论；
+            // 放在采集收尾做，**用户不必为此再多开一局游戏**。
+            string shroudDumpNote;
+            string reportsFolder = _store != null ? _store.ReportsFolder : "reports";
+            string shroudDumpPath = ShroudHunter.DumpTopCandidates(
+                _target.Memory, _shroudSamples, reportsFolder,
+                _target.ModuleBase, _target.ModuleSize, 8, out shroudDumpNote);
+            text.AppendLine(shroudDumpPath.Length > 0
+                ? ("候选现场：已存成 " + shroudDumpPath)
+                : ("候选现场没能存成：" + shroudDumpNote));
+            text.AppendLine();
+
             _inspectionText = text.ToString();
             Logger.Info("Harvest", string.Format(CultureInfo.InvariantCulture,
                 "自动巡检结束，耗时 {0:0.0} 秒", (DateTime.UtcNow - started).TotalSeconds));

@@ -742,15 +742,27 @@ namespace MoTrainer.Ui
                 ScrollableControl scrollable = page as ScrollableControl;
                 if (scrollable != null && scrollable.HorizontalScroll.Visible)
                 {
-                    for (int i = 0; i < page.Controls.Count; i++)
+                    // 退化尺寸时**不要**倾倒越界排查：窗口最小化/正在关闭时页面会缩到 1x1，
+                    // 那一刻"所有控件都越界"是必然的，倾倒出来只会吓人（2026-10-12 真机日志里
+                    // 就出现过一整片 `[越界排查]` 却是窗口宽 0 的假警报）。如实说明一句就够。
+                    if (page.ClientSize.Width < 320 || page.ClientSize.Height < 120)
                     {
-                        Control child = page.Controls[i];
-                        string label = child.Text == null ? "" : child.Text.Replace("\n", " ");
-                        if (label.Length > 14) { label = label.Substring(0, 14) + "…"; }
                         Logger.Info("Layout", string.Format(CultureInfo.InvariantCulture,
-                            "    [越界排查] {0}：「{1}」左 {2} 宽 {3} → 右 {4}（页面可用宽 {5}）",
-                            child.GetType().Name, label, child.Left, child.Width, child.Right,
-                            page.ClientSize.Width));
+                            "    （本页此刻只有 {0}x{1}，多半是最小化/正在关闭，跳过越界排查）",
+                            page.ClientSize.Width, page.ClientSize.Height));
+                    }
+                    else
+                    {
+                        for (int i = 0; i < page.Controls.Count; i++)
+                        {
+                            Control child = page.Controls[i];
+                            string label = child.Text == null ? "" : child.Text.Replace("\n", " ");
+                            if (label.Length > 14) { label = label.Substring(0, 14) + "…"; }
+                            Logger.Info("Layout", string.Format(CultureInfo.InvariantCulture,
+                                "    [越界排查] {0}：「{1}」左 {2} 宽 {3} → 右 {4}（页面可用宽 {5}）",
+                                child.GetType().Name, label, child.Left, child.Width, child.Right,
+                                page.ClientSize.Width));
+                        }
                     }
                 }
             }

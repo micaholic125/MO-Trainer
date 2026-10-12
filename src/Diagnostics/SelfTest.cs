@@ -5304,6 +5304,47 @@ namespace MoTrainer.Diagnostics
                 Check("黑幕猎手·渐进：**只看首末两张时两块的变化量完全一样**（所以必须留中间那些张）",
                     bothLookSame && twoShot.Count == 2,
                     "首末两张给出的候选 " + twoShot.Count + " 个，变化量均为 " + (3 * Step));
+
+                // 候选的**原始字节转储**（2026-10-12 加）：报告里的数字说明不了"它长什么样"，
+                // 而黑幕位图有一个肉眼可辨的形状。这里钉死三件事：文件出得来、
+                // 里面有那个候选的地址、字符图是 64 字符宽的整行。
+                string dumpFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "_selftest_shrouddump");
+                try
+                {
+                    if (Directory.Exists(dumpFolder)) { Directory.Delete(dumpFolder, true); }
+                    Directory.CreateDirectory(dumpFolder);
+
+                    string dumpNote;
+                    string dumpPath = ShroudHunter.DumpTopCandidates(
+                        io, samples, dumpFolder, 0, 0, 8, out dumpNote);
+                    Check("黑幕猎手·转储：候选原始字节出得来（只读）",
+                        dumpPath.Length > 0 && File.Exists(dumpPath), dumpPath.Length > 0 ? dumpPath : dumpNote);
+
+                    string dumpText = dumpPath.Length > 0 ? File.ReadAllText(dumpPath) : "";
+                    Check("黑幕猎手·转储：文件里有那个候选的地址与各段个数（能对着报告读）",
+                        dumpText.IndexOf("0x" + steady.ToString("X8")) >= 0
+                        && dumpText.IndexOf("各段个数") >= 0, dumpText.Length + " 字");
+
+                    bool mapOk = false;
+                    string[] dumpLines = dumpText.Split('\n');
+                    for (int i = 0; i < dumpLines.Length; i++)
+                    {
+                        string line = dumpLines[i].TrimEnd('\r');
+                        if (line.StartsWith("    ") && line.Length >= 4 + 64
+                            && (line.IndexOf('.') >= 0 || line.IndexOf('#') >= 0))
+                        {
+                            mapOk = true;
+                            break;
+                        }
+                    }
+                    Check("黑幕猎手·转储：字符图是 64 字符宽的整行（形状能一眼看出来）", mapOk,
+                        "共 " + dumpLines.Length + " 行");
+                }
+                finally
+                {
+                    try { if (Directory.Exists(dumpFolder)) { Directory.Delete(dumpFolder, true); } }
+                    catch { }
+                }
             }
             catch (Exception ex)
             {
