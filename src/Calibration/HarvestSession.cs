@@ -182,6 +182,16 @@ namespace MoTrainer.Calibration
         public const int MaxIntervalMs = 5000;
         public const int MaxSeconds = 1800;
 
+        /// <summary>
+        /// 「阵营」这一列在没有选中线索时，**至少要多少个名单对象现场核对通过**才敢用配置里那个值。
+        /// 取 2 而不是 1：一个对象"恰好"命中的偶然性太高（真机名单里混着大量非单位对象），
+        /// 两个各自独立地指向"金钱正好等于我此刻金钱的那座房子"就基本不可能是巧合。
+        /// </summary>
+        public const int OwnerCrossCheckMinSamples = 2;
+
+        /// <summary>现场核对最多读多少个名单对象（核对要的是"够不够构成证据"，不是把几百个全读一遍）。</summary>
+        public const int OwnerCrossCheckProbes = 96;
+
         private readonly ICalibrationTarget _target;
         private readonly CalibrationProfile _profile;
         private readonly ProfileStore _store;
@@ -197,6 +207,19 @@ namespace MoTrainer.Calibration
         private readonly ManualResetEvent _stop = new ManualResetEvent(false);
 
         private List<HarvestObjectRow> _lastRoster = new List<HarvestObjectRow>();
+
+        // ---- 「阵营」这一列该用哪个偏移（见 EnsureOwnerOffset）----
+        /// <summary>
+        /// 本次采集**现场认定可用**的阵营字段偏移；0 = 还没认定出来。
+        /// **绝不等于** `_profile.OffsetTechnoOwner` —— 那个是人工试出来的，见 `EnsureOwnerOffset` 的注释。
+        /// </summary>
+        private uint _ownerOffset;
+
+        /// <summary>认定成功时的说明（写进报告，让人知道这一列的出处）。</summary>
+        private string _ownerOffsetNote = "";
+
+        /// <summary>上一次"还没认定出来"的原因 —— 同一个原因只写一次日志，不按拍刷屏。</summary>
+        private string _ownerOffsetWaitLogged = "";
 
         // ---- "新出现的对象"跟踪（瞬间建造用）----
         /// <summary>已经见过的对象地址（用来判断"新出现"）。只增不减，见 TrackNewObjects 的注释。</summary>
@@ -525,6 +548,11 @@ namespace MoTrainer.Calibration
             List<HarvestObjectRow> roster = ReadRoster(memory, moduleBase, moduleSize, sample);
             lock (_lock) { _lastRoster = roster; }
 
+            // 「阵营」这一列该读哪个偏移 —— **现场认定**，绝不用配置里那个人工试出的 +0xF0。
+            // 放在名单读完之后：名单（地址）本身不依赖偏移，先拿到手，认定时才有样本可核对；
+            // 认定成功会把**本拍**这几行的阵营顺手补上，不必等到下一拍。
+            EnsureOwnerOffset(memory, roster);
+
             // 「新出现的对象」自动跟踪（瞬间建造用）：用户不必先选中它，程序自己盯
             TrackNewObjects(roster, memory, sample);
 
@@ -542,7 +570,8 @@ namespace MoTrainer.Calibration
             TrackProducingObject(memory, sample);
 
             // 阵营分组（用来判断阵营偏移是否有效：有效的表现是"少数几个阵营、各自聚集大量单位"）
-            if (_profile.OffsetTechnoOwner != 0 && roster.Count > 0)
+            // **门槛用的是现场认定出来的偏移，不是配置里那个** —— 见 EnsureOwnerOffset。
+            if (_ownerOffset != 0 && roster.Count > 0)
             {
                 Dictionary<uint, int> counts = new Dictionary<uint, int>();
                 for (int i = 0; i < roster.Count; i++)
@@ -587,6 +616,141 @@ namespace MoTrainer.Calibration
             uint value;
             if (!memory.ReadUInt32(address, out value)) { return 0; }
             return value;
+        }
+
+        /// <summary>
+        /// 现场认定「阵营」这一列该读哪个偏移 —— **绝不拿配置里那个人工试出的值充数**。
+        ///
+        /// ## 为什么要有这个方法（2026-10-10 记下的待办，2026-10-12 修）
+        ///
+        /// 报告里「阵营」这一列此前一直读 `_profile.OffsetTechnoOwner`，而配置里存的是
+        /// **`+0xF0` —— 2026-09-27 人工试出来的**。真机早已证明**那里读出来的不是阵营**
+        /// （动员兵的阵营指针在 `+0x14C`）。后果不是"少一列数据"，而是：
+        /// 用它算出来的「阵营分组」是**在噪声上做统计**，而报告里却写得像结论 ——
+        /// 用户照着它核对，得到的是一个早已知错的答案（2026-10-12 核对时发现，
+        /// 原计划的"顺手修"一直没做，所以第 1 批那件"核对阵营列"当时**验了也白验**）。
+        ///
+        /// ## 认定的两条路（都要求**现场证据**，没有任何"配置里有就用"的兜底）
+        ///
+        /// ① **有你选中的单位** → 走 `TechnoOwnership.ResolveOwnerOffsetForAnalysis`：
+        ///    与「自动查找」「预演」**同一份实现**（金钱锚定反推），真机验证过。
+        ///    这条路上**有线索却推不出来时直接放弃**，不回头去翻配置 —— 那正是要杜绝的做法。
+        /// ② **没有线索**（采集的用法是"你正常玩"，可能一直没选中任何东西）→
+        ///    拿**名单本身**现场核对配置里那个值：在若干对象上读该偏移，
+        ///    看它是不是"指向一个 +0x30C 正好等于我此刻金钱的房子"（`TryReadHouseMoney`）。
+        ///    核对通过才采用（报告里写明是"沿用配置值但已现场核对"），通不过就**不采用**。
+        ///
+        /// 认定不出来时：这一列**留空并在报告里写明为什么**（§4.2：缺数据必须拒绝执行并说明缺什么），
+        /// 「阵营分组」一节也不出 —— 宁可没有，也不给噪声。
+        ///
+        /// 认定成功一次就缓存（同一局里偏移不会变）。所以用户中途才选中单位也没关系：
+        /// 每拍都会重试，一选中就自动补上。
+        /// </summary>
+        private void EnsureOwnerOffset(MemoryIO memory, List<HarvestObjectRow> roster)
+        {
+            if (_ownerOffset != 0) { return; }
+
+            uint moduleBase = _target.ModuleBase;
+            uint moduleSize = _target.ModuleSize;
+
+            // 我方房子的"身份证"：此刻的金钱读数。偏移对不对，就看它指的房子钱对不对得上。
+            uint moneyAddress;
+            uint money;
+            string error;
+            if (_profile.Money == null || !_profile.Money.IsCalibrated
+                || !_profile.Money.TryResolve(memory, moduleBase, out moneyAddress, out error)
+                || !memory.ReadUInt32(moneyAddress, out money) || money == 0)
+            {
+                WaitOwnerOffset("读不到金钱值（金钱未校准，或本拍解析不出来）—— 没有\"身份证\"就没法核对阵营字段");
+                return;
+            }
+
+            // ---- 路 ①：有你选中的单位 → 金钱锚定反推（与「自动查找」同一份实现）----
+            List<uint> hints;
+            string hintsNote;
+            if (_selection != null
+                && _selection.TryReadSelectedObjects(_profile, SelectionProbe.MaxCount, false, out hints, out hintsNote)
+                && hints != null && hints.Count > 0)
+            {
+                string note;
+                uint offset = MoTrainer.Cheats.TechnoOwnership.ResolveOwnerOffsetForAnalysis(
+                    memory, hints, money, out note);
+                if (offset != 0)
+                {
+                    AdoptOwnerOffset(offset, roster,
+                        string.Format(CultureInfo.InvariantCulture,
+                            "+0x{0:X}（由 {1} 个选中单位的金钱锚定现场推出，**非**配置里的人工值）",
+                            offset, hints.Count));
+                    return;
+                }
+                WaitOwnerOffset(note);
+                return;
+            }
+
+            // ---- 路 ②：没有线索 → 拿名单现场核对配置里那个值 ----
+            uint stored = _profile.OffsetTechnoOwner;
+            int agree = CountRosterAgreeingWithMoney(memory, roster, stored, money, moduleBase, moduleSize);
+            if (agree >= OwnerCrossCheckMinSamples)
+            {
+                AdoptOwnerOffset(stored, roster,
+                    string.Format(CultureInfo.InvariantCulture,
+                        "+0x{0:X}（配置里存的值，**已在本次名单上现场核对**：{1} 个对象的该偏移指向你的房子）",
+                        stored, agree));
+                return;
+            }
+
+            WaitOwnerOffset(string.Format(CultureInfo.InvariantCulture,
+                "还没有选中任何自己的单位（反推需要一个线索）；配置里那个 +0x{0:X} 现场核对**没通过**"
+                + "（名单里只有 {1} 个对象在该偏移上指向你的房子）—— 所以这一列留空，不给噪声",
+                stored, agree));
+        }
+
+        /// <summary>在名单上核对某个偏移：有多少个对象的该偏移**指向我此刻金钱所在的那座房子**。</summary>
+        private static int CountRosterAgreeingWithMoney(
+            MemoryIO memory, List<HarvestObjectRow> roster, uint offset, uint money,
+            uint moduleBase, uint moduleSize)
+        {
+            if (offset == 0 || roster == null || roster.Count == 0) { return 0; }
+
+            int agree = 0;
+            // 只抽前若干个：核对只需要"够不够构成证据"，不需要把几百个对象全读一遍。
+            int limit = roster.Count < OwnerCrossCheckProbes ? roster.Count : OwnerCrossCheckProbes;
+            for (int i = 0; i < limit; i++)
+            {
+                uint value;
+                if (!memory.ReadUInt32(roster[i].Address + offset, out value)) { continue; }
+                uint houseMoney;
+                if (!MoTrainer.Cheats.TechnoOwnership.TryReadHouseMoney(
+                        memory, value, moduleBase, moduleSize, out houseMoney)) { continue; }
+                if (houseMoney == money) { agree++; }
+            }
+            return agree;
+        }
+
+        /// <summary>认定成功：缓存 + 把**本拍已经读出来的名单**顺手补上阵营（否则要等到下一拍才有值）。</summary>
+        private void AdoptOwnerOffset(uint offset, List<HarvestObjectRow> roster, string note)
+        {
+            _ownerOffset = offset;
+            _ownerOffsetNote = note;
+            _ownerOffsetWaitLogged = "";
+
+            if (roster != null)
+            {
+                for (int i = 0; i < roster.Count; i++)
+                {
+                    roster[i].Owner = TechnoWalker.ReadOwner(_target.Memory, roster[i].Address, offset);
+                }
+            }
+
+            Logger.Info("Harvest", "阵营字段现场认定：" + note);
+        }
+
+        /// <summary>还没认定出来 —— 同一个原因只写一次日志（认定前的每一拍都会走到这里）。</summary>
+        private void WaitOwnerOffset(string reason)
+        {
+            if (reason == _ownerOffsetWaitLogged) { return; }
+            _ownerOffsetWaitLogged = reason;
+            Logger.Info("Harvest", "阵营字段暂不可用：" + reason);
         }
 
         private List<HarvestObjectRow> ReadRoster(
@@ -635,7 +799,10 @@ namespace MoTrainer.Calibration
                 HarvestObjectRow row = new HarvestObjectRow();
                 row.Address = walk.Objects[i].Address;
                 row.VTable = walk.Objects[i].VTable;
-                row.Owner = TechnoWalker.ReadOwner(memory, row.Address, _profile.OffsetTechnoOwner);
+                // 阵营用**现场认定**的偏移（还没认定出来时读 0 = 空）。
+                // 这里刻意不读 `_profile.OffsetTechnoOwner`：那个是人工试出来的值，见 EnsureOwnerOffset。
+                row.Owner = _ownerOffset != 0
+                    ? TechnoWalker.ReadOwner(memory, row.Address, _ownerOffset) : 0;
                 row.Health = TechnoWalker.ReadHealth(memory, row.Address, _profile.OffsetTechnoHealth);
                 rows.Add(row);
             }
@@ -1256,9 +1423,26 @@ namespace MoTrainer.Calibration
             AppendLocator(text, "电力消耗", _profile.PowerDrain);
             AppendLocator(text, "选中数量", _profile.SelectedCount);
             AppendLocator(text, "全对象名单", _profile.TechnoArray);
+            // 「阵营」这一项**故意不写配置里那个值**：它是人工试出来的，真机证明读出来的不是阵营。
+            // 写"现场认定出来的偏移 + 出处"，认定不出来就写清为什么 —— 见 EnsureOwnerOffset。
+            uint ownerOffset;
+            string ownerNote;
+            string ownerWait;
+            lock (_lock)
+            {
+                ownerOffset = _ownerOffset;
+                ownerNote = _ownerOffsetNote;
+                ownerWait = _ownerOffsetWaitLogged;
+            }
+            string ownerText = ownerOffset != 0
+                ? ownerNote
+                : string.Format(CultureInfo.InvariantCulture,
+                    "**本次未能认定**（配置里存的 +0x{0:X} 未采用）—— {1}",
+                    _profile.OffsetTechnoOwner,
+                    ownerWait.Length > 0 ? ownerWait : "还没有现场证据");
             text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                "字段偏移：阵营 +0x{0:X}｜血量 +0x{1:X}｜最大血量 +0x{2:X}｜铁幕 +0x{3:X}｜生产进度 +0x{4:X}",
-                _profile.OffsetTechnoOwner, _profile.OffsetTechnoHealth, _profile.TechnoMaxHealth,
+                "字段偏移：阵营 {0}｜血量 +0x{1:X}｜最大血量 +0x{2:X}｜铁幕 +0x{3:X}｜生产进度 +0x{4:X}",
+                ownerText, _profile.OffsetTechnoHealth, _profile.TechnoMaxHealth,
                 _profile.OffsetTechnoIronCurtain, _profile.OffsetProductionTimer));
 
             // 对象名单的解析结果。**这几个数字是排查"名单读不出来"的唯一线索** ——
@@ -1296,6 +1480,12 @@ namespace MoTrainer.Calibration
             text.AppendLine();
             text.AppendLine("=== 一、时间线 ===");
             text.AppendLine("（房子数值 + 场上对象总数 + 阵营分组。阵营分组如果出现「少数几个阵营、各自聚集大量对象」，说明阵营偏移是对的。）");
+            if (ownerOffset == 0)
+            {
+                text.AppendLine("　⚠ **本次「阵营分组」整列为空**：阵营字段未能现场认定（原因见上方「字段偏移」那一行）。");
+                text.AppendLine("　　这是刻意留空 —— 以前这里填的是配置里一个人工试出来的偏移，真机证明读出来的不是阵营，");
+                text.AppendLine("　　那样统计出来的是噪声、却看起来像结论。想让这一列有值：**在游戏里选中一个自己的单位**即可（下一拍自动补上）。");
+            }
             text.AppendLine();
             // 刻意**不列**"跳过数"：对象数量字段没校准，所以每轮都按 4096 位上限探测，
             // 跳过数恒为 4096 减去有效对象数，是个没有信息量的常数。
@@ -1435,13 +1625,27 @@ namespace MoTrainer.Calibration
 
                 text.AppendLine();
                 text.AppendLine("明细：");
-                text.AppendLine("  地址        类型表      阵营        血量");
+                if (ownerOffset != 0)
+                {
+                    text.AppendLine("  地址        类型表      阵营        血量");
+                }
+                else
+                {
+                    // 阵营那一列**没有认定出来就不印数**。印一排 0x00000000 看起来像数据、
+                    // 实际是"什么都没读到"，比留空更误导（2026-10-12 修：这一列以前印的是
+                    // 配置里那个人工试出来的偏移读出来的噪声）。
+                    text.AppendLine("  地址        类型表      血量　（**阵营**那一列本次没能认定，故不印 —— 见上方「字段偏移」）");
+                }
                 for (int i = 0; i < roster.Count; i++)
                 {
                     HarvestObjectRow row = roster[i];
-                    text.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                        "  0x{0:X8}  0x{1:X8}  0x{2:X8}  {3}",
-                        row.Address, row.VTable, row.Owner, row.Health));
+                    text.AppendLine(ownerOffset != 0
+                        ? string.Format(CultureInfo.InvariantCulture,
+                            "  0x{0:X8}  0x{1:X8}  0x{2:X8}  {3}",
+                            row.Address, row.VTable, row.Owner, row.Health)
+                        : string.Format(CultureInfo.InvariantCulture,
+                            "  0x{0:X8}  0x{1:X8}  {2}",
+                            row.Address, row.VTable, row.Health));
                 }
             }
 

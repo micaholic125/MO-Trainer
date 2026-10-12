@@ -5418,14 +5418,32 @@ namespace MoTrainer.Diagnostics
                     uint obj = heap + 0x2000 + (uint)(i * 0x100);
                     io.WriteUInt32(obj, houseVtable);          // 同一类别（否则会被"孤例剔除"扔掉）
                     io.WriteUInt32(obj + 0x100, house);        // 指向我方房子
+                    // 再在 +0x108 上写一遍：对象之间只隔 0x100 字节，`obj + 0x100` 正好落在
+                    // **下一个对象的开头**，会被下一轮的 `obj + 0` 覆盖掉 —— 所以四个对象里
+                    // 其实只有最后一个的 +0x100 还指着房子。+0x108 不与任何人重叠，
+                    // 「阵营字段现场核对」那条断言要的是"至少 2 个对象一致"，用这个位置才成立。
+                    io.WriteUInt32(obj + 0x108, house);
                     io.WriteUInt32(rosterArray + (uint)(i * 4), obj);
                 }
                 io.WriteUInt32(rosterSlot, rosterArray);
+
+                // 「选中列表」也接上（**这项决定「阵营」这一列能不能走第一条路**）。
+                // 初始写 0 个选中 = 模拟"用户还没选任何单位"，前面几条断言要的正是这个形态；
+                // 需要时把它改成 2 并挂上数组，就变成"用户选中了两个自己的单位"。
+                uint countCell = moduleBase + 0x400;
+                uint slotCell = moduleBase + 0x404;
+                uint selectedArray = heap + 0x6000;
+                io.WriteUInt32(countCell, 0);
+                io.WriteUInt32(selectedArray, heap + 0x2000);        // 选中对象 #1
+                io.WriteUInt32(selectedArray + 4, heap + 0x2100);    // 选中对象 #2
+                io.WriteUInt32(slotCell, selectedArray);
 
                 CalibrationProfile profile = new CalibrationProfile();
                 profile.ModuleBase = moduleBase;
                 profile.ModuleSize = moduleSize;
                 profile.TechnoArray.SetStaticAddress(rosterSlot - moduleBase);
+                profile.SelectedCount.SetStaticAddress(countCell - moduleBase);
+                profile.SelectedList.SetStaticAddress(slotCell - moduleBase);
                 profile.Money.SetOffsets(new uint[] { 0x100, MoneyOffset });
                 profile.OffsetTechnoOwner = 0xF0;
                 profile.OffsetTechnoHealth = 0x6C;
@@ -5504,6 +5522,99 @@ namespace MoTrainer.Diagnostics
                         ? "已说明（含要发回来的提示）" : "报告里只字未提 —— 那样用户就白玩了");
                 if (path2.Length > 0 && File.Exists(path2)) { try { File.Delete(path2); } catch (Exception) { } }
                 second.Dispose();
+
+                // ---- 「阵营」这一列必须**现场认定**，绝不用配置里那个人工值（2026-10-12 修）----
+                //
+                // 本场景的形态与真机完全同构：配置里 `OffsetTechnoOwner` 是**人工试出来的错值**
+                // （这里给 0xF0，真机上就是 0xF0；真值是 0x14C），而名单里的对象是在 `+0x100` 上
+                // 指向我方房子的。修之前这一列会照读 0xF0 → 全是 0 / 噪声，报告里却像数据。
+                Check("采集器：阵营字段现场核对不通过时，如实写「未能认定」（不拿人工值充数）",
+                    text.IndexOf("未采用", StringComparison.Ordinal) >= 0
+                        && text.IndexOf("整列为空", StringComparison.Ordinal) >= 0
+                        && text.IndexOf("那一列本次没能认定", StringComparison.Ordinal) >= 0,
+                    text.IndexOf("未采用", StringComparison.Ordinal) >= 0
+                        ? "已如实说明（字段偏移行 / 时间线提示 / 明细表头 三处都写了）"
+                        : "报告里只字未提 —— 用户会以为那一列是真数据");
+
+                // 明细行也不能印 —— 表头改了但行照旧印，等于**一排 0x00000000 看起来像数据**。
+                // （这条是"改坏验证"逼出来的：第一版只查了表头，把读回人工值的写法放回去**没被抓到**。）
+                string bogusRow = string.Format(CultureInfo.InvariantCulture,
+                    "0x{0:X8}  0x{1:X8}  0x00000000", heap + 0x2000, houseVtable);
+                Check("采集器：未能认定时，明细行不印「阵营」那一列（不印一排假 0）",
+                    text.IndexOf(bogusRow, StringComparison.Ordinal) < 0,
+                    text.IndexOf(bogusRow, StringComparison.Ordinal) < 0
+                        ? "没有印假数据" : "印了假数据：" + bogusRow);
+
+                // 「只有 1 个对象对得上」也**不算通过** —— 钉住安全下限（`OwnerCrossCheckMinSamples = 2`）。
+                // 为什么这一条重要：真机名单里混着大量非单位对象，某一个字段"恰好"指到一座
+                // 金钱正好等于我此刻金钱的房子，单靠一个样本是**巧合**级别的证据。
+                // 本场景里只有最后一个对象的 +0x100 还指着房子（前面几个被下一轮写入覆盖了），
+                // 正好就是"只有 1 个"这个形态。
+                profile.OffsetTechnoOwner = 0x100;
+                HarvestSession single = new HarvestSession(target, profile, store);
+                single.Start(60, 200);
+                int ns = single.SampleCount;
+                WaitUntil(delegate { return single.SampleCount > ns + 1; }, 5000);
+                string path4 = single.Stop();
+                string text4 = (path4.Length > 0 && File.Exists(path4))
+                    ? File.ReadAllText(path4, Encoding.UTF8) : "";
+                Check("采集器：现场核对只对上 1 个对象时**不采用**（巧合不算证据）",
+                    text4.IndexOf("只有 1 个对象在该偏移上指向你的房子", StringComparison.Ordinal) >= 0
+                        && text4.IndexOf("未采用", StringComparison.Ordinal) >= 0,
+                    text4.IndexOf("只有 1 个对象在该偏移上指向你的房子", StringComparison.Ordinal) >= 0
+                        ? "已拒绝采用（只对上 1 个）"
+                        : "采用了只对上 1 个的偏移 —— 安全下限没起作用");
+                if (path4.Length > 0 && File.Exists(path4)) { try { File.Delete(path4); } catch (Exception) { } }
+                single.Dispose();
+
+                // 反过来：配置里的值**现场核对通过**时才采用，且报告里要写明"是核对过才用的"。
+                // 这条同时钉住"不能因为配置里有数就直接拿来用"和"核对通过也别浪费"两头。
+                profile.OffsetTechnoOwner = 0x108;      // 名单里 4 个对象确实都在这个偏移上指向我方房子
+                HarvestSession trusted = new HarvestSession(target, profile, store);
+                trusted.Start(60, 200);
+                int nt = trusted.SampleCount;
+                WaitUntil(delegate { return trusted.SampleCount > nt + 1; }, 5000);
+                string path3 = trusted.Stop();
+                string text3 = (path3.Length > 0 && File.Exists(path3))
+                    ? File.ReadAllText(path3, Encoding.UTF8) : "";
+                string houseGroup = string.Format(CultureInfo.InvariantCulture, "0x{0:X8}:4", house);
+                Check("采集器：配置值现场核对通过 → 采用，并写明「核对过」（阵营分组出现）",
+                    text3.IndexOf("已在本次名单上现场核对", StringComparison.Ordinal) >= 0
+                        && text3.IndexOf(houseGroup, StringComparison.Ordinal) >= 0
+                        && text3.IndexOf("整列为空", StringComparison.Ordinal) < 0,
+                    text3.IndexOf("已在本次名单上现场核对", StringComparison.Ordinal) >= 0
+                        ? "已采用（阵营分组 " + houseGroup + "）"
+                        : "没有采用 —— 「现场核对」这条路没走通");
+                if (path3.Length > 0 && File.Exists(path3)) { try { File.Delete(path3); } catch (Exception) { } }
+                trusted.Dispose();
+
+                // ---- 第一条路（真机上的主路）：从**你选中的单位**现场反推 ----
+                //
+                // 这一条才是真机上真正会走的路（采集时用户会选中单位），也是"配置里那个值是错的"
+                // 这个核心问题的正面覆盖：配置写 0xF0，而真值是 +0x108 —— 程序必须**用推出来的那个**。
+                // （先前漏了它，导致"把 ReadRoster 改回读配置值"这个改坏**没被抓到**。）
+                io.WriteUInt32(countCell, 2);           // 用户选中了两个自己的单位
+                profile.OffsetTechnoOwner = 0xF0;       // 配置里仍是那个人工试出的错值
+                HarvestSession derived = new HarvestSession(target, profile, store);
+                derived.Start(60, 200);
+                int nd = derived.SampleCount;
+                WaitUntil(delegate { return derived.SampleCount > nd + 3; }, 8000);
+                string path5 = derived.Stop();
+                string text5 = (path5.Length > 0 && File.Exists(path5))
+                    ? File.ReadAllText(path5, Encoding.UTF8) : "";
+                string bogusRow5 = string.Format(CultureInfo.InvariantCulture,
+                    "0x{0:X8}  0x{1:X8}  0x00000000", heap + 0x2000, houseVtable);
+                bool saidDerived = text5.IndexOf("金钱锚定现场推出", StringComparison.Ordinal) >= 0;
+                bool grouped = text5.IndexOf(houseGroup, StringComparison.Ordinal) >= 0;
+                bool noFakeRow = text5.IndexOf(bogusRow5, StringComparison.Ordinal) < 0;
+                Check("采集器：有选中单位时**以现场推出来的偏移为准**（配置里那个人工值只是摆设）",
+                    saidDerived && grouped && noFakeRow,
+                    "推导说明=" + (saidDerived ? "有" : "**无**")
+                        + "｜阵营分组 " + houseGroup + "=" + (grouped ? "有" : "**无**")
+                        + "｜明细印了假 0=" + (noFakeRow ? "否" : "**是**"));
+                if (path5.Length > 0 && File.Exists(path5)) { try { File.Delete(path5); } catch (Exception) { } }
+                derived.Dispose();
+                io.WriteUInt32(countCell, 0);
             }
             catch (Exception ex)
             {
