@@ -212,8 +212,11 @@ namespace MoTrainer.Calibration
         //
         // 只留**第一张与最后一张**：要判的是"这局里哪块地方单向地从 0xFF 变成 0x00"，
         // 中间那些张没有额外信息，存着只是白占内存（每张几万条统计）。
-        private List<ShroudWindow> _shroudFirst;
-        private List<ShroudWindow> _shroudLast;
+        // 2026-10-12 第 2 批之后改成**留全部快照**：黑幕是随着探路一点点积累的，
+        // 而"游戏新建了一个对象"是某一张里一下子变的 —— 只留首尾两张根本分不开这两种，
+        // 那次报告里两行数字一模一样（两个候选各 324/1711）就是这么来的。
+        // 每张画像约 2048 条统计（几十 KB），留十张也不到 1 MB。
+        private readonly List<IList<ShroudWindow>> _shroudSamples = new List<IList<ShroudWindow>>();
         private string _shroudNote = "";
         private double _lastShroudSecond = -999.0;
 
@@ -537,7 +540,7 @@ namespace MoTrainer.Calibration
             // 「七、找黑幕数据」（[S6-3] 全图视野）——
             // 写入那一半（`TechnoOps.RevealMap`）早就写好并自检过了，卡点只有"数据在哪"。
             // 这一节把"哪块地方像黑幕"当场排好序，用户这一次的采集就能直接给答案。
-            text.Append(ShroudHunter.Format(_shroudFirst, _shroudLast, _shroudNote,
+            text.Append(ShroudHunter.Format(_shroudSamples, _shroudNote,
                 _profile != null && _profile.HasMapShroud));
 
             _inspectionText = text.ToString();
@@ -617,20 +620,19 @@ namespace MoTrainer.Calibration
                 UpdateTracked(_tracked[i], memory, sample.Index);
             }
 
-            // 「黑幕数据」画像（[S6-3] 全图视野）：每 20 秒拍一张，只留第一张与最后一张。
+            // 「黑幕数据」画像（[S6-3] 全图视野）：**每 10 秒**拍一张，**全部留着**。
             //
             // 为什么挂在采集里、而不是单做一次：定位黑幕本来就需要"一局里黑幕被揭开"的过程，
             // 而用户为了第 ④ 件本来就要开着采集正常玩三分钟 —— 一次开机多办一件事，
             // 不额外占用用户的时间（这是与用户约定的"批次少、每批任务多"）。
-            if (ElapsedSeconds - _lastShroudSecond >= 20.0)
+            if (ElapsedSeconds - _lastShroudSecond >= 10.0)
             {
                 _lastShroudSecond = ElapsedSeconds;
                 string shroudNote;
                 List<ShroudWindow> shot = ShroudHunter.Sample(memory, out shroudNote);
                 if (shot.Count > 0)
                 {
-                    if (_shroudFirst == null) { _shroudFirst = shot; }
-                    _shroudLast = shot;
+                    _shroudSamples.Add(shot);
                     _shroudNote = shroudNote;
                 }
             }

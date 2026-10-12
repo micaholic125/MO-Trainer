@@ -166,6 +166,7 @@ namespace MoTrainer.Diagnostics
             // 猎手负责把"哪块地方像黑幕"从一次普通采集里排出来 —— 用户不必为此多开一局。
             Section("19. 黑幕数据猎手（[S6-3] 全图视野的前置）");
             CheckShroudHunter();
+            CheckShroudProgression();
             // 猎手负责"哪个像黑幕"，试探负责"到底是不是" —— 判定只能靠真人看着画面回答。
             // 试探是全项目第三个往游戏里写实验值的地方，标准与前两个一样：该拒绝就一个字节不写、
             // 写出去的一定原样还回来。
@@ -5016,12 +5017,19 @@ namespace MoTrainer.Diagnostics
                 byte[] pattern = new byte[Window];
                 for (int i = 0; i < pattern.Length; i++) { pattern[i] = 0x5A; }
 
+                // 第四块要造的是"**对象初始化**"那种形态：一大批**各不相同的值**被清成 0x00。
+                // 关键就在"各不相同的值"：**没有任何单一值减少得多**，所以"两种值此消彼长"这条判据
+                // 抓不到它（旧版测试这块填的是清一色 0x5A，那在"任意两种值"的新判据下**本来就该算候选** ——
+                // 0x5A 整块变成 0x00，跟"黑幕被揭开"在内存里长得一模一样，见 2026-10-12 那次断言转红）。
+                byte[] mixed = new byte[Window];
+                for (int i = 0; i < mixed.Length; i++) { mixed[i] = (byte)(i & 0xFF); }
+
                 bool wrote = io.Write(shroud, ones, 0, Window)
                     && io.Write(quiet, zeros, 0, Window)
                     && io.Write(churn, pattern, 0, Window)
-                    && io.Write(grow, pattern, 0, Window)
+                    && io.Write(grow, mixed, 0, Window)
                     && io.Write(reverse, zeros, 0, Window);
-                Check("黑幕猎手：五块测试内存已就位（未探索 / 空内存 / 乱动 / 只增不减 / 重新遮住）", wrote,
+                Check("黑幕猎手：五块测试内存已就位（未探索 / 空内存 / 乱动 / 对象初始化 / 重新遮住）", wrote,
                     wrote ? "ok" : "写入测试内存失败");
 
                 List<MemoryRegion> regions = new List<MemoryRegion>();
@@ -5040,7 +5048,7 @@ namespace MoTrainer.Diagnostics
 
                 // ③ "探索"：把黑幕那块的前 16 KB 揭开（0xFF 少、0x00 等量多）；
                 //    让第三块乱动 1000 个字节（0x00/0xFF 个数不变）；
-                //    让第四块只长出 8 KB 的 0x00（0xFF 一个没少）—— 那是"数组增长"，不是黑幕；
+                //    让第四块把前 8 KB 清成 0x00（那一段是"各不相同的值"）—— 那是对象初始化，不是黑幕；
                 //    让第五块反过来：8 KB 的 0x00 变成 0xFF（**"重新被盖住"**，也是真信号）。
                 byte[] explored = new byte[Explored];
                 io.Write(shroud, explored, 0, Explored);
@@ -5097,9 +5105,9 @@ namespace MoTrainer.Diagnostics
                 Check("黑幕猎手：只乱动、但 0x00/0xFF 个数不变的那一块不进候选（计数器不是黑幕）",
                     churnExcluded,
                     ranked.Count + " 个候选里" + (churnExcluded ? "没有" : "混进了") + "那一块");
-                Check("黑幕猎手：只朝一个方向变的那一块不进候选（数组增长不是黑幕）", growExcluded,
+                Check("黑幕猎手：一块「各不相同的值」被清零时不进候选（对象初始化不是黑幕）", growExcluded,
                     ranked.Count + " 个候选里" + (growExcluded ? "没有" : "混进了")
-                    + "那一块（0x00 多了 " + Grew + "、0xFF 一个没少）");
+                    + "那一块（0x00 多了 " + Grew + "，但没有任何单一值减少得多 —— 那是对象初始化，不是此消彼长）");
 
                 // 反向（重新被盖住）必须也认 —— 用户 2026-10-12 补充：间谍偷走雷达会失去全部视野，
                 // 敌方造了裂缝产生器也会让你丢掉那一片。事先并不知道"哪个值代表未探索"，
@@ -5133,14 +5141,14 @@ namespace MoTrainer.Diagnostics
                     + "（期望 4 / 2：黑幕块 + 乱动块 + 只增不减块 + 重新遮住块；后两者里只有乱动块和只增不减块是「其他字节占多数」）");
 
                 // ⑥ 报告的三个分支都要能出（真机报告就靠这段）
-                string report = ShroudHunter.Format(before, after, note, false);
+                string report = ShroudHunter.Format(TwoShots(before, after), note, false);
                 Check("黑幕猎手：报告写出候选表（含地址与两个方向的量）",
                     report.IndexOf("七、找黑幕数据") >= 0 && report.IndexOf("0x" + shroud.ToString("X8")) >= 0,
                     report.Length + " 字");
                 Check("黑幕猎手：已校准过就跳过这一节（不重复折腾用户）",
-                    ShroudHunter.Format(before, after, note, true).IndexOf("已校准过") >= 0, "ok");
+                    ShroudHunter.Format(TwoShots(before, after), note, true).IndexOf("已校准过") >= 0, "ok");
                 Check("黑幕猎手：什么都没采到时如实说明，而不是编造候选",
-                    ShroudHunter.Format(null, null, "没采到", false).IndexOf("没能采到内存画像") >= 0, "ok");
+                    ShroudHunter.Format(null, "没采到", false).IndexOf("没能采到内存画像") >= 0, "ok");
             }
             catch (Exception ex)
             {
@@ -5157,6 +5165,16 @@ namespace MoTrainer.Diagnostics
             }
         }
 
+        /// <summary>把两张画像拼成"一次采集的两张快照"（自检用）。</summary>
+        private static List<IList<ShroudWindow>> TwoShots(
+            List<ShroudWindow> first, List<ShroudWindow> last)
+        {
+            List<IList<ShroudWindow>> samples = new List<IList<ShroudWindow>>();
+            samples.Add(first);
+            samples.Add(last);
+            return samples;
+        }
+
         private static bool SameBytes(byte[] a, byte[] b)
         {
             if (a == null || b == null || a.Length != b.Length) { return false; }
@@ -5169,6 +5187,134 @@ namespace MoTrainer.Diagnostics
         {
             try { Win32Api.VirtualFreeEx(self.Handle, block, IntPtr.Zero, MEM_RELEASE); }
             catch (Exception) { }
+        }
+
+        /// <summary>
+        /// 「一路慢慢变」vs「一下子变」—— 这是 2026-10-12 第 2 批之后加的关键能力。
+        ///
+        /// 起因：那次报告里六个候选有两行数字一模一样（各 324/1711），
+        /// 而**只看首末两张根本分不开**"黑幕被一点点探开"和"游戏新建了一个对象"。
+        /// 这一条断言把两种形态**同时造出来**，要求排序器分得开：
+        ///   · `steady` 块：分三次各揭开 4 KB（模拟单位探路）；
+        ///   · `oneshot` 块：**某一张里一次性**清掉 8 KB（模拟对象初始化）。
+        /// 改坏验证：让 `BuildSeries` 无论怎样都报"一直递增"，本断言立刻转红。
+        /// </summary>
+        private static void CheckShroudProgression()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("黑幕猎手·渐进", false, "OpenProcess 失败"); return; }
+
+            IntPtr blockSteady = IntPtr.Zero;
+            IntPtr blockOneShot = IntPtr.Zero;
+            try
+            {
+                blockSteady = AllocLowBlock(self.Handle);
+                blockOneShot = AllocLowBlock(self.Handle);
+                if (blockSteady == IntPtr.Zero || blockOneShot == IntPtr.Zero)
+                {
+                    Check("黑幕猎手·渐进测试内存块", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+
+                MemoryIO io = new MemoryIO(self);
+                uint steady = (uint)blockSteady.ToInt64();
+                uint oneShot = (uint)blockOneShot.ToInt64();
+                const int Window = ShroudHunter.WindowSize;
+                const int Step = 0x1000;      // 每次 4 KB
+
+                byte[] ones = new byte[Window];
+                for (int i = 0; i < ones.Length; i++) { ones[i] = 0xFF; }
+                io.Write(steady, ones, 0, Window);
+                io.Write(oneShot, ones, 0, Window);
+
+                List<MemoryRegion> regions = new List<MemoryRegion>();
+                regions.Add(MakeRegion(steady, TestBlockSize));
+                regions.Add(MakeRegion(oneShot, TestBlockSize));
+
+                // ⚠ 写入的第二个参数是「**缓冲区内的**偏移」，不是"往地址上再加多少" ——
+                // 本方法第一版就是把 `io.Write(steady, zeros, Step, Step)` 当成"写到 steady+Step"，
+                // 结果三次都写在同一个地方，序列成了 0 → 4096 → 4096 → 4096（断言当场转红）。
+                byte[] zeros = new byte[Window];
+                List<IList<ShroudWindow>> samples = new List<IList<ShroudWindow>>();
+                string note;
+
+                // 第 0 张：都还是 0xFF
+                samples.Add(ShroudHunter.SampleRegions(io, regions, Window, 16L * 1024 * 1024, out note));
+
+                // 第 1 张：steady 揭开 4 KB（oneShot 不动）
+                io.Write(steady, zeros, 0, Step);
+                samples.Add(ShroudHunter.SampleRegions(io, regions, Window, 16L * 1024 * 1024, out note));
+
+                // 第 2 张：steady 再揭开 4 KB；oneShot **一次性**清掉 8 KB
+                io.Write(steady + (uint)Step, zeros, 0, Step);
+                io.Write(oneShot, zeros, 0, Step * 2);
+                samples.Add(ShroudHunter.SampleRegions(io, regions, Window, 16L * 1024 * 1024, out note));
+
+                // 第 3 张：steady 再揭开 4 KB（oneShot 保持不动）
+                io.Write(steady + (uint)(Step * 2), zeros, 0, Step);
+                samples.Add(ShroudHunter.SampleRegions(io, regions, Window, 16L * 1024 * 1024, out note));
+
+                Check("黑幕猎手·渐进：四张画像都采到了", samples.Count == 4
+                    && samples[0].Count == 2 && samples[3].Count == 2, "4 张 × 2 块");
+
+                List<ShroudCandidate> ranked = ShroudHunter.Rank(samples);
+                ShroudCandidate cSteady = null;
+                ShroudCandidate cOneShot = null;
+                for (int i = 0; i < ranked.Count; i++)
+                {
+                    if (ranked[i].Address == steady) { cSteady = ranked[i]; }
+                    if (ranked[i].Address == oneShot) { cOneShot = ranked[i]; }
+                }
+
+                Check("黑幕猎手·渐进：两块都成了候选（值变化都够大）",
+                    cSteady != null && cOneShot != null,
+                    "候选 " + ranked.Count + " 个");
+
+                Check("黑幕猎手·渐进：**一路慢慢探开**的那块被数出「三段都在涨」",
+                    cSteady != null && cSteady.Increases == 3 && cSteady.Comparisons == 3,
+                    cSteady == null ? "(没上榜)"
+                        : "递增 " + cSteady.Increases + "/" + cSteady.Comparisons + " 段｜各段个数：" + cSteady.Series);
+
+                Check("黑幕猎手·渐进：**某一张里一次性变**的那块只涨过一段（对象初始化就是这个样子）",
+                    cOneShot != null && cOneShot.Increases == 1 && cOneShot.Comparisons == 3,
+                    cOneShot == null ? "(没上榜)"
+                        : "递增 " + cOneShot.Increases + "/" + cOneShot.Comparisons + " 段｜各段个数：" + cOneShot.Series);
+
+                List<ShroudCandidate> sustained = ShroudHunter.RankByProgress(samples);
+                bool steadyIn = false;
+                bool oneShotIn = false;
+                for (int i = 0; i < sustained.Count; i++)
+                {
+                    if (sustained[i].Address == steady) { steadyIn = true; }
+                    if (sustained[i].Address == oneShot) { oneShotIn = true; }
+                }
+                Check("黑幕猎手·渐进：「一路慢慢变」榜里**只该有**探路那一块",
+                    steadyIn && !oneShotIn,
+                    "榜上 " + sustained.Count + " 块｜探路那块在=" + steadyIn + "｜一次性那块在=" + oneShotIn);
+
+                // 只看首末两张时两者长得一样 —— 这正是当初分不开的原因，如实钉住
+                List<ShroudWindow> first = (List<ShroudWindow>)samples[0];
+                List<ShroudWindow> last = (List<ShroudWindow>)samples[3];
+                List<ShroudCandidate> twoShot = ShroudHunter.Rank(first, last);
+                bool bothLookSame = true;
+                for (int i = 0; i < twoShot.Count; i++)
+                {
+                    if (twoShot[i].Address == steady && twoShot[i].Score != 3 * Step) { bothLookSame = false; }
+                }
+                Check("黑幕猎手·渐进：**只看首末两张时两块的变化量完全一样**（所以必须留中间那些张）",
+                    bothLookSame && twoShot.Count == 2,
+                    "首末两张给出的候选 " + twoShot.Count + " 个，变化量均为 " + (3 * Step));
+            }
+            catch (Exception ex)
+            {
+                Check("黑幕猎手·渐进", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (blockSteady != IntPtr.Zero) { FreeBlock(self, blockSteady); }
+                if (blockOneShot != IntPtr.Zero) { FreeBlock(self, blockOneShot); }
+                self.Dispose();
+            }
         }
 
         // ============================================================ 黑幕试探（[S6-3]）
