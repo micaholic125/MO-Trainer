@@ -41,6 +41,13 @@ namespace MoTrainer.Calibration
         /// <summary>窗口里既不是 0x00 也不是 0xFF 的字节数（位图应当接近 0，对象数组则很大）。</summary>
         public int OtherCount;
 
+        /// <summary>
+        /// 变化方向：**"揭开"** = 0xFF 减少、0x00 等量增加（单位探路把黑幕揭开）；
+        /// **"重新遮住"** = 反过来（间谍偷走雷达、敌方造了裂缝产生器都会造成这个）。
+        /// 两种都是真信号，只是方向不同 —— 到底哪个方向代表"未探索"，事先并不知道。
+        /// </summary>
+        public string Direction = "";
+
         public int Score;
     }
 
@@ -219,9 +226,23 @@ namespace MoTrainer.Calibration
                 if (!before.TryGetValue(now.Address, out was)) { continue; }
                 if (was.Size != now.Size) { continue; }
 
-                int onesDown = was.OnesCount - now.OnesCount;
-                int zerosUp = now.ZeroCount - was.ZeroCount;
-                if (onesDown < MinShift || zerosUp < MinShift) { continue; }
+                int onesDown = was.OnesCount - now.OnesCount;      // 0xFF 少了多少
+                int zerosUp = now.ZeroCount - was.ZeroCount;       // 0x00 多了多少
+                int zerosDown = was.ZeroCount - now.ZeroCount;     // 0x00 少了多少
+                int onesUp = now.OnesCount - was.OnesCount;        // 0xFF 多了多少
+
+                // **两个方向都要认**（2026-10-12 用户补充的领域知识换来的）：
+                //   · 正向：0xFF 减少、0x00 等量增加 —— "黑幕被揭开"（单位探路）；
+                //   · 反向：0x00 减少、0xFF 等量增加 —— "**重新被黑幕盖住**"。
+                // 用户实测过这条反向路径是真实存在的：**间谍偷走雷达会失去全部视野**，
+                // 敌方造了裂缝产生器也会让你丢掉那一片的视野。
+                //
+                // 为什么必须两个方向都认：这块数据到底是"1 = 未探索"还是"0 = 未探索"，
+                // 事先并不知道（新分配的内存本来就是 0x00）。**只认一个方向 = 赌一半**，
+                // 赌错了用户白开一局 —— 而用户的时间是本项目最贵的东西。
+                bool forward = onesDown >= MinShift && zerosUp >= MinShift;
+                bool backward = zerosDown >= MinShift && onesUp >= MinShift;
+                if (!forward && !backward) { continue; }
 
                 ShroudCandidate c = new ShroudCandidate();
                 c.Address = now.Address;
@@ -230,10 +251,13 @@ namespace MoTrainer.Calibration
                 c.ZerosUp = zerosUp;
                 c.ContentsMoved = was.Checksum != now.Checksum;
                 c.OtherCount = now.OtherCount;
+                c.Direction = forward ? "揭开" : "重新遮住";
 
-                // 评分取两个方向的**较小值**：单向且等量才是黑幕；
+                // 评分取该方向两个量里的**较小值**：单向且等量才是黑幕；
                 // 只朝一个方向猛变（数组增长之类）会被这个 min 压下去。
-                c.Score = onesDown < zerosUp ? onesDown : zerosUp;
+                c.Score = forward
+                    ? (onesDown < zerosUp ? onesDown : zerosUp)
+                    : (zerosDown < onesUp ? zerosDown : onesUp);
                 list.Add(c);
             }
 
@@ -300,9 +324,10 @@ namespace MoTrainer.Calibration
                 return sb.ToString();
             }
 
-            sb.AppendLine("说明：黑幕被揭开时，那块数据的样子非常干净 ——");
-            sb.AppendLine("**一片连续的 0xFF（未探索）持续减少、同时 0x00（已探索）等量增加**，");
-            sb.AppendLine("而且只朝一个方向走（黑幕不会自己盖回来）。下面就是按这个形态排出来的候选。");
+            sb.AppendLine("说明：黑幕数据一变就是一大片，而且**只朝一个方向**走。两个方向都算真信号 ——");
+            sb.AppendLine("  · **揭开**：0xFF 减少、0x00 等量增加（你的单位把路探开）；");
+            sb.AppendLine("  · **重新遮住**：0x00 减少、0xFF 等量增加（被间谍偷走雷达、敌方造了裂缝产生器）。");
+            sb.AppendLine("下面就是按这个形态排出来的候选。「方向」那一列告诉你是哪一种。");
             sb.AppendLine();
 
             if (last == null || last.Count == 0)
@@ -318,28 +343,30 @@ namespace MoTrainer.Calibration
             List<ShroudCandidate> ranked = Rank(first, last);
             if (ranked.Count == 0)
             {
-                sb.AppendLine("**没有找到符合「单向 + 等量」形态的地方。**");
+                sb.AppendLine("**没有找到符合「单向 + 等量」形态的地方**（两个方向都没有）。");
                 sb.AppendLine("可能的原因（按可能性排）：");
                 sb.AppendLine("  ① 这一局探索得太少/太快 —— 黑幕在采集期间几乎没被揭开；");
                 sb.AppendLine("  ② 黑幕不是一整片连续位图，而是**每个地图格子自己身上一个字节**");
                 sb.AppendLine("     （那种形态在下面「另一个信号」里会表现为大量小块乱动、而 0x00/0xFF 计数不动）；");
-                sb.AppendLine("  ③ 采样窗口 64 KB 相对黑幕太小/太大，被切碎了。");
+                sb.AppendLine("  ③ 采样窗口 64 KB 相对黑幕太小/太大，被切碎了；");
+                sb.AppendLine("  ④ 这块数据既不用 0x00 也不用 0xFF 表示「未探索」（例如用 1/2/3 表示黑幕等级）——");
+                sb.AppendLine("     这种情况本节看不见，需要在真机上另想办法（见开发日志的下一步）。");
                 sb.AppendLine();
             }
             else
             {
                 sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                    "候选 {0} 块（按「0xFF 减少量与 0x00 增加量中较小的那个」排序，前 12 名）：",
+                    "候选 {0} 块（按「该方向上两个变化量中较小的那个」排序，前 12 名）：",
                     ranked.Count));
                 sb.AppendLine();
-                sb.AppendLine("  地址        窗口      0xFF减少   0x00增加   其他字节");
+                sb.AppendLine("  地址        窗口      方向        0xFF变化   0x00变化   其他字节");
                 int shown = ranked.Count < 12 ? ranked.Count : 12;
                 for (int i = 0; i < shown; i++)
                 {
                     ShroudCandidate c = ranked[i];
                     sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
-                        "  0x{0:X8}  {1,6}  {2,9}  {3,9}   {4,8}",
-                        c.Address, c.Size, c.OnesDown, c.ZerosUp, c.OtherCount));
+                        "  0x{0:X8}  {1,6}  {2,-8}  {3,9}  {4,9}   {5,8}",
+                        c.Address, c.Size, c.Direction, c.OnesDown, c.ZerosUp, c.OtherCount));
                 }
                 sb.AppendLine();
                 sb.AppendLine("判读：真黑幕位图通常**连成一大片**（相邻地址一起上榜）、");

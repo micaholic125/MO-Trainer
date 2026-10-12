@@ -4980,14 +4980,16 @@ namespace MoTrainer.Diagnostics
             IntPtr blockQuiet = IntPtr.Zero;
             IntPtr blockChurn = IntPtr.Zero;
             IntPtr blockGrow = IntPtr.Zero;
+            IntPtr blockReverse = IntPtr.Zero;
             try
             {
                 blockShroud = AllocLowBlock(self.Handle);
                 blockQuiet = AllocLowBlock(self.Handle);
                 blockChurn = AllocLowBlock(self.Handle);
                 blockGrow = AllocLowBlock(self.Handle);
+                blockReverse = AllocLowBlock(self.Handle);
                 if (blockShroud == IntPtr.Zero || blockQuiet == IntPtr.Zero
-                    || blockChurn == IntPtr.Zero || blockGrow == IntPtr.Zero)
+                    || blockChurn == IntPtr.Zero || blockGrow == IntPtr.Zero || blockReverse == IntPtr.Zero)
                 {
                     Check("黑幕猎手测试内存块", false, Win32Api.LastErrorMessage());
                     return;
@@ -4998,13 +5000,16 @@ namespace MoTrainer.Diagnostics
                 uint quiet = (uint)blockQuiet.ToInt64();
                 uint churn = (uint)blockChurn.ToInt64();
                 uint grow = (uint)blockGrow.ToInt64();
+                uint reverse = (uint)blockReverse.ToInt64();
 
                 const int Window = ShroudHunter.WindowSize;      // 0x10000，正好一块
                 const int Explored = 0x4000;                     // 这一局"探索掉"的 16 KB
                 const int Grew = 0x2000;                         // "数组增长"那种：只多出 0x00
+                const int ReCovered = 0x2000;                    // "重新被黑幕盖住"那种：0x00 → 0xFF
 
                 // ① 造现场：一块 0xFF（未探索）、一块 0x00（空内存）、
-                //    一块 0x5A（像"别的数据"）、一块 0x5A 之后会长出 0x00（像数组增长）
+                //    一块 0x5A（像"别的数据"）、一块 0x5A 之后会长出 0x00（像数组增长）、
+                //    一块 0x00 之后会变成 0xFF（**重新被黑幕盖住** —— 用户补充：间谍偷雷达就是这样）
                 byte[] ones = new byte[Window];
                 for (int i = 0; i < ones.Length; i++) { ones[i] = 0xFF; }
                 byte[] zeros = new byte[Window];
@@ -5014,8 +5019,9 @@ namespace MoTrainer.Diagnostics
                 bool wrote = io.Write(shroud, ones, 0, Window)
                     && io.Write(quiet, zeros, 0, Window)
                     && io.Write(churn, pattern, 0, Window)
-                    && io.Write(grow, pattern, 0, Window);
-                Check("黑幕猎手：四块测试内存已就位（未探索 / 空内存 / 乱动 / 只增不减）", wrote,
+                    && io.Write(grow, pattern, 0, Window)
+                    && io.Write(reverse, zeros, 0, Window);
+                Check("黑幕猎手：五块测试内存已就位（未探索 / 空内存 / 乱动 / 只增不减 / 重新遮住）", wrote,
                     wrote ? "ok" : "写入测试内存失败");
 
                 List<MemoryRegion> regions = new List<MemoryRegion>();
@@ -5023,17 +5029,19 @@ namespace MoTrainer.Diagnostics
                 regions.Add(MakeRegion(quiet, TestBlockSize));
                 regions.Add(MakeRegion(churn, TestBlockSize));
                 regions.Add(MakeRegion(grow, TestBlockSize));
+                regions.Add(MakeRegion(reverse, TestBlockSize));
 
                 // ② 第一张画像（还没探索）
                 string note;
                 List<ShroudWindow> before = ShroudHunter.SampleRegions(
                     io, regions, Window, 16L * 1024 * 1024, out note);
-                Check("黑幕猎手：第一张画像采到四块", before.Count == 4,
+                Check("黑幕猎手：第一张画像采到五块", before.Count == 5,
                     before.Count + " 块｜" + note);
 
                 // ③ "探索"：把黑幕那块的前 16 KB 揭开（0xFF 少、0x00 等量多）；
                 //    让第三块乱动 1000 个字节（0x00/0xFF 个数不变）；
-                //    让第四块只长出 8 KB 的 0x00（0xFF 一个没少）—— 那是"数组增长"，不是黑幕。
+                //    让第四块只长出 8 KB 的 0x00（0xFF 一个没少）—— 那是"数组增长"，不是黑幕；
+                //    让第五块反过来：8 KB 的 0x00 变成 0xFF（**"重新被盖住"**，也是真信号）。
                 byte[] explored = new byte[Explored];
                 io.Write(shroud, explored, 0, Explored);
                 byte[] jitter = new byte[1000];
@@ -5041,6 +5049,9 @@ namespace MoTrainer.Diagnostics
                 io.Write(churn + 0x2000, jitter, 0, jitter.Length);
                 byte[] grew = new byte[Grew];
                 io.Write(grow, grew, 0, Grew);
+                byte[] recovered = new byte[ReCovered];
+                for (int i = 0; i < recovered.Length; i++) { recovered[i] = 0xFF; }
+                io.Write(reverse, recovered, 0, recovered.Length);
 
                 // 采样**之前**把那两块的字节整个留一份，采完比对 —— 钉死"只读"
                 byte[] shroudBytesBefore = io.ReadBytes(shroud, Window);
@@ -5048,7 +5059,7 @@ namespace MoTrainer.Diagnostics
 
                 List<ShroudWindow> after = ShroudHunter.SampleRegions(
                     io, regions, Window, 16L * 1024 * 1024, out note);
-                Check("黑幕猎手：第二张画像也采到四块", after.Count == 4,
+                Check("黑幕猎手：第二张画像也采到五块", after.Count == 5,
                     after.Count + " 块｜" + note);
 
                 byte[] shroudBytesAfter = io.ReadBytes(shroud, Window);
@@ -5090,14 +5101,36 @@ namespace MoTrainer.Diagnostics
                     ranked.Count + " 个候选里" + (growExcluded ? "没有" : "混进了")
                     + "那一块（0x00 多了 " + Grew + "、0xFF 一个没少）");
 
+                // 反向（重新被盖住）必须也认 —— 用户 2026-10-12 补充：间谍偷走雷达会失去全部视野，
+                // 敌方造了裂缝产生器也会让你丢掉那一片。事先并不知道"哪个值代表未探索"，
+                // 只认一个方向就是赌一半，赌错了用户白开一局。
+                bool reverseFound = false;
+                string reverseDirection = "(没上榜)";
+                for (int i = 0; i < ranked.Count; i++)
+                {
+                    if (ranked[i].Address == reverse)
+                    {
+                        reverseFound = true;
+                        reverseDirection = ranked[i].Direction;
+                    }
+                }
+                Check("黑幕猎手：**反向也认** —— 0x00 减少、0xFF 等量增加的那一块要上榜",
+                    reverseFound, ranked.Count + " 个候选里"
+                    + (reverseFound ? "有" : "没有") + "那一块");
+                Check("黑幕猎手：两个方向分别标对（正向标「揭开」、反向标「重新遮住」）",
+                    reverseDirection == "重新遮住"
+                    && ranked.Count >= 1 && ranked[0].Address == shroud && ranked[0].Direction == "揭开",
+                    "反向候选标注=" + reverseDirection
+                    + "｜第一名标注=" + (ranked.Count == 0 ? "(无)" : ranked[0].Direction));
+
                 // ⑤ 旁证：动过的窗口数与"长得像对象数组"的窗口数
                 int moved;
                 int objectLike;
                 ShroudHunter.SummarizeChurn(before, after, out moved, out objectLike);
-                Check("黑幕猎手：旁证统计 —— 动过 3 块，其中 2 块是「对象数组那种长相」",
-                    moved == 3 && objectLike == 2,
+                Check("黑幕猎手：旁证统计 —— 动过 4 块，其中 2 块是「对象数组那种长相」",
+                    moved == 4 && objectLike == 2,
                     "动过 " + moved + " 块｜其中对象数组长相 " + objectLike + " 块"
-                    + "（期望 3 / 2：黑幕块 + 乱动块 + 只增不减块，后两者其他字节占多数）");
+                    + "（期望 4 / 2：黑幕块 + 乱动块 + 只增不减块 + 重新遮住块；后两者里只有乱动块和只增不减块是「其他字节占多数」）");
 
                 // ⑥ 报告的三个分支都要能出（真机报告就靠这段）
                 string report = ShroudHunter.Format(before, after, note, false);
@@ -5119,6 +5152,7 @@ namespace MoTrainer.Diagnostics
                 if (blockQuiet != IntPtr.Zero) { FreeBlock(self, blockQuiet); }
                 if (blockChurn != IntPtr.Zero) { FreeBlock(self, blockChurn); }
                 if (blockGrow != IntPtr.Zero) { FreeBlock(self, blockGrow); }
+                if (blockReverse != IntPtr.Zero) { FreeBlock(self, blockReverse); }
                 self.Dispose();
             }
         }
