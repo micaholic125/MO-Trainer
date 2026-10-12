@@ -166,6 +166,10 @@ namespace MoTrainer.Diagnostics
             // 猎手负责把"哪块地方像黑幕"从一次普通采集里排出来 —— 用户不必为此多开一局。
             Section("19. 黑幕数据猎手（[S6-3] 全图视野的前置）");
             CheckShroudHunter();
+            // 猎手负责"哪个像黑幕"，试探负责"到底是不是" —— 判定只能靠真人看着画面回答。
+            // 试探是全项目第三个往游戏里写实验值的地方，标准与前两个一样：该拒绝就一个字节不写、
+            // 写出去的一定原样还回来。
+            CheckShroudProbe();
 
             Write("");
             Write("=================================================");
@@ -1710,6 +1714,43 @@ namespace MoTrainer.Diagnostics
                 TrainerSettings missing = new TrainerSettings();
                 Check("运行设置文件缺失时安全忽略",
                     !missing.Load(Path.Combine(tempRoot, "nope.json")), "ok");
+
+                // ---- 关窗时该记什么（2026-10-12：金钱那条设计从未生效过，本轮修） ----
+                //
+                // 规矩：只记"下次启动真的会恢复"的功能 —— 金钱记它关窗那一刻的真实状态，
+                // 其余（电力 + 三个高风险项）一律记 false。写 true 是没人读的死数据，
+                // 只会让看配置的人误判（2026-10-12 就差点据此误判）。
+                TrainerSettings exit1 = new TrainerSettings();
+                exit1.SetValue(CheatId.Money, 50000);
+                exit1.SetEnabled(CheatId.Money, true);
+                exit1.SetEnabled(CheatId.PowerOutput, true);       // 假装用户这一局开着电力和秒杀
+                exit1.SetEnabled(CheatId.KillEnemies, true);
+                exit1.CaptureExitState(true);                       // 关窗那一刻金钱是开着的
+                string exitPath = exit1.PathIn(tempRoot);
+                exit1.Save(exitPath);
+
+                TrainerSettings back1 = new TrainerSettings();
+                back1.Load(exitPath);
+                Check("关窗记录：金钱保持自动恢复（关窗那一刻开着 → 下次启动就是开着）",
+                    back1.GetEnabled(CheatId.Money) && back1.GetValue(CheatId.Money, 0) == 50000,
+                    back1.Describe());
+                Check("关窗记录：电力**不**自动恢复（用户 2026-10-12 拍板，避免忘了关时连敌人同类电厂一起变强）",
+                    !back1.GetEnabled(CheatId.PowerOutput), back1.Describe());
+                Check("关窗记录：高风险项不留「开着」的死数据（否则看配置的人会以为它一直开着）",
+                    !back1.GetEnabled(CheatId.KillEnemies)
+                    && !back1.GetEnabled(CheatId.SelectedInvincible)
+                    && !back1.GetEnabled(CheatId.InstantBuild),
+                    back1.Describe());
+
+                TrainerSettings exit2 = new TrainerSettings();
+                exit2.SetEnabled(CheatId.Money, true);
+                exit2.CaptureExitState(false);                      // 关窗那一刻金钱是关着的
+                string exitPath2 = exit2.PathIn(tempRoot);
+                exit2.Save(exitPath2);
+                TrainerSettings back2 = new TrainerSettings();
+                back2.Load(exitPath2);
+                Check("关窗记录：关窗那一刻金钱是关的 → 下次启动不会自己开",
+                    !back2.GetEnabled(CheatId.Money), back2.Describe());
             }
             catch (Exception ex)
             {
@@ -5094,6 +5135,148 @@ namespace MoTrainer.Diagnostics
         {
             try { Win32Api.VirtualFreeEx(self.Handle, block, IntPtr.Zero, MEM_RELEASE); }
             catch (Exception) { }
+        }
+
+        // ============================================================ 黑幕试探（[S6-3]）
+
+        /// <summary>
+        /// 「黑幕试探」（`[S6-3]` 全图视野的定位工具）—— 全项目第三个往游戏里写实验值的地方。
+        ///
+        /// 断言的中心与电力/房子试探同一标准：**该拒绝时一个字节都不写；写出去的一定原样还回来**。
+        /// 这里在合成内存上把它走完整：
+        ///   · 配置解析（两种写法 / 少了数 / 看不懂）；
+        ///   · **第一次点击只读**（逐字节比对，连一个字节都不许动）；
+        ///   · 第二次点击：只碰指定的一小片（前后哨兵字节不动）、**结束后逐字节还原**、
+        ///     报告里"已还原（回读一致）"为真；
+        ///   · 地址不合理 / 长度越界 / 页不可写 —— 一律拒绝并说明原因，且不写。
+        /// </summary>
+        private static void CheckShroudProbe()
+        {
+            // ---- ① 配置解析（不需要内存，先跑） ----
+            ShroudProbeSpec hexSpec;
+            string error;
+            bool hexOk = ShroudProbeSpec.TryParse("0x29B00000 4096", out hexSpec, out error);
+            Check("黑幕试探：配置认十六进制写法（0x 地址 + 长度）",
+                hexOk && hexSpec.Address == 0x29B00000u && hexSpec.Length == 4096,
+                hexOk ? hexSpec.Describe() : error);
+
+            ShroudProbeSpec decSpec;
+            bool decOk = ShroudProbeSpec.TryParse("12345678 512   # 行尾注释", out decSpec, out error);
+            Check("黑幕试探：配置认十进制写法，行尾注释不当成数",
+                decOk && decSpec.Address == 12345678u && decSpec.Length == 512,
+                decOk ? decSpec.Describe() : error);
+
+            Check("黑幕试探：配置只有地址、没有长度 → 拒绝并说明（绝不猜一个长度去写）",
+                !ShroudProbeSpec.TryParse("0x29B00000", out decSpec, out error)
+                && error.IndexOf("地址 长度") >= 0, error);
+            Check("黑幕试探：配置读不懂 → 拒绝并说明",
+                !ShroudProbeSpec.TryParse("这边是黑幕", out decSpec, out error), error);
+
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("黑幕试探", false, "OpenProcess 失败"); return; }
+
+            IntPtr block = IntPtr.Zero;
+            try
+            {
+                block = AllocLowBlock(self.Handle);
+                if (block == IntPtr.Zero) { Check("黑幕试探测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = new MemoryIO(self);
+                uint baseAddress = (uint)block.ToInt64();
+                uint target = baseAddress + 0x1000;
+                const int Window = 0x1000;                  // 只试探 4 KB
+
+                byte[] ones = new byte[TestBlockSize];
+                for (int i = 0; i < ones.Length; i++) { ones[i] = 0xFF; }
+                io.Write(baseAddress, ones, 0, ones.Length);
+
+                ShroudProbeSpec spec = new ShroudProbeSpec();
+                spec.Address = target;
+                spec.Length = Window;
+
+                // ---- ② 侦查阶段必须一个字节都不写 ----
+                byte[] before = io.ReadBytes(baseAddress, TestBlockSize);
+                ShroudProbeScout scout = ShroudProbe.Scout(io, spec);
+                byte[] afterScout = io.ReadBytes(baseAddress, TestBlockSize);
+                Check("黑幕试探：第一次点击只读 —— 侦查前后整块字节一个都没变",
+                    SameBytes(before, afterScout), TestBlockSize + " 字节已逐字节比对");
+                Check("黑幕试探：侦查念出「那一小片现在长什么样」（0xFF 计数 + 开头字节）",
+                    scout.Ok && scout.OnesCount == 512 && scout.HeadHex.StartsWith("FF"),
+                    scout.Ok ? "0xFF " + scout.OnesCount + "｜开头 " + scout.HeadHex.Substring(0, 11) : scout.Note);
+
+                // ---- ③ 真写：只碰指定的一小片，结束后原样还回来 ----
+                ShroudProbeResult ran = ShroudProbe.Run(io, spec);
+                Check("黑幕试探：真的写进去过（WriteProcessMemory 成功）", ran.Wrote,
+                    ran.Wrote ? ran.Describe() : ran.Note);
+                Check("黑幕试探：按住期间那一片确实被清零（32 字节回读全 0）",
+                    ran.HeadAfterHex.Replace(" ", "").Trim('0').Length == 0,
+                    "写入时 32 字节：" + ran.HeadAfterHex);
+                Check("黑幕试探：**结束后逐字节还原**（回读与原始内容一致）", ran.RestoreVerified,
+                    ran.Describe());
+
+                byte[] final = io.ReadBytes(baseAddress, TestBlockSize);
+                Check("黑幕试探：整块内存回到原样（哨兵字节也没被动过）", SameBytes(before, final),
+                    TestBlockSize + " 字节已逐字节比对");
+
+                // ---- ④ 该拒绝的一律拒绝，且一个字节都不写 ----
+                ShroudProbeSpec tooLow = new ShroudProbeSpec();
+                tooLow.Address = 0x800; tooLow.Length = 16;
+                Check("黑幕试探：地址小得不合理 → 拒绝",
+                    ShroudProbe.Run(io, tooLow).Note.IndexOf("小得不合理") >= 0, ShroudProbe.Run(io, tooLow).Note);
+
+                ShroudProbeSpec tooBig = new ShroudProbeSpec();
+                tooBig.Address = target; tooBig.Length = ShroudProbe.MaxLength + 1;
+                Check("黑幕试探：长度超过上限 → 拒绝（只许清一小片）",
+                    ShroudProbe.Run(io, tooBig).Note.IndexOf("长度必须") >= 0, ShroudProbe.Run(io, tooBig).Note);
+
+                ShroudProbeSpec notMapped = new ShroudProbeSpec();
+                notMapped.Address = 0x7FFF0000; notMapped.Length = 4096;
+                Check("黑幕试探：目标页不可写（这里根本没映射）→ 拒绝，且一个字节都没写",
+                    ShroudProbe.Run(io, notMapped).Note.IndexOf("不可写") >= 0, ShroudProbe.Run(io, notMapped).Note);
+
+                byte[] last = io.ReadBytes(baseAddress, TestBlockSize);
+                Check("黑幕试探：上面三次拒绝之后，整块内存仍然一个字节没变", SameBytes(before, last),
+                    "ok");
+
+                // ---- ⑤ 配置文件：没有 / 只有注释 → 如实说明，不猜地址 ----
+                string tempRoot = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "_selftest_shroud");
+                try
+                {
+                    if (Directory.Exists(tempRoot)) { Directory.Delete(tempRoot, true); }
+                    Directory.CreateDirectory(tempRoot);
+
+                    ShroudProbeSpec fromFile;
+                    string fileError;
+                    Check("黑幕试探：配置文件不存在时如实说明要写什么",
+                        !ShroudProbe.TryLoadTarget(tempRoot, out fromFile, out fileError)
+                        && fileError.IndexOf("地址 长度") >= 0, fileError);
+
+                    File.WriteAllText(ShroudProbe.PathIn(tempRoot), "# 只是注释\r\n", new UTF8Encoding(true));
+                    Check("黑幕试探：配置文件里只有注释 → 拒绝并说明",
+                        !ShroudProbe.TryLoadTarget(tempRoot, out fromFile, out fileError), fileError);
+
+                    File.WriteAllText(ShroudProbe.PathIn(tempRoot),
+                        "# 黑幕候选\r\n0x29B00000 4096\r\n", new UTF8Encoding(true));
+                    Check("黑幕试探：配置文件能读出目标（注释行被跳过）",
+                        ShroudProbe.TryLoadTarget(tempRoot, out fromFile, out fileError)
+                        && fromFile.Address == 0x29B00000u && fromFile.Length == 4096,
+                        fromFile == null ? fileError : fromFile.Describe());
+                }
+                finally
+                {
+                    try { if (Directory.Exists(tempRoot)) { Directory.Delete(tempRoot, true); } }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Check("黑幕试探", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (block != IntPtr.Zero) { FreeBlock(self, block); }
+                self.Dispose();
+            }
         }
 
         // ============================================================ 采集（S6/S4 校准辅助）

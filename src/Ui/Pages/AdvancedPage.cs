@@ -78,6 +78,7 @@ namespace MoTrainer.Ui.Pages
         private readonly Button _shroudButton;
         private readonly Button _powerProbeButton;
         private readonly Button _houseProbeButton;
+        private readonly Button _shroudProbeButton;
         private readonly Button _powerScoutButton;
         private readonly Button _harvestButton;
         private readonly Label _harvestStatus;
@@ -197,6 +198,15 @@ namespace MoTrainer.Ui.Pages
             _houseProbeButton.Click += OnHouseProbeClick;
             Controls.Add(_houseProbeButton);
 
+            // 「黑幕试探」（2026-10-12 新增，`[S6-3]` 全图视野用）：全项目**第三个**会往游戏里写试探值的按钮。
+            // 为什么需要：「采集报告『七』」给出的候选只是"**像**黑幕"，不是"**是**黑幕" ——
+            // 唯一可靠的判定是往那一小片写 0、看游戏画面上的黑幕是否真的散开一块，然后立刻还原。
+            // 目标写在一行配置里（`config\shroud-probe.txt`），同样**点两次**才真写；
+            // 按住期间反复写（防"游戏自己把黑幕画回来"），收尾无条件还原 + 回读确认（见 `ShroudProbe`）。
+            _shroudProbeButton = UiFactory.MakeButton("黑幕试探（点两次）", 168);
+            _shroudProbeButton.Click += OnShroudProbeClick;
+            Controls.Add(_shroudProbeButton);
+
             _harvestStatus = MakeHintLabel();
             _harvestStatus.Text = "采集期间你只需要在游戏里正常玩：选几个单位、造点东西、让单位挨点打。程序自己记录。";
             Controls.Add(_harvestStatus);
@@ -215,6 +225,11 @@ namespace MoTrainer.Ui.Pages
             _houseProbeTimer = new Timer();
             _houseProbeTimer.Interval = 400;
             _houseProbeTimer.Tick += OnHouseProbeTick;
+
+            // 黑幕试探的收尾轮询（后台线程里按住约 3.5 秒、还原、回读确认）。
+            _shroudProbeTimer = new Timer();
+            _shroudProbeTimer.Interval = 400;
+            _shroudProbeTimer.Tick += OnShroudProbeTick;
 
             _output = new TextBox();
             _output.Multiline = true;
@@ -298,8 +313,11 @@ namespace MoTrainer.Ui.Pages
                 left, rightLimit) + 6;
             y = LayoutHint(_hintTop, y, rightLimit - left) + 14;
 
+            // 注意：**新加的按钮必须同时加进这一行**，否则它会停在默认位置、
+            // 压住标题 —— 自检里那条"四档宽度下控件互不重叠"当场就抓到过（2026-10-12 加黑幕试探时）。
             y = LayoutButtonRow(y,
-                new Control[] { _shroudButton, _harvestButton, _powerProbeButton, _powerScoutButton, _houseProbeButton },
+                new Control[] { _shroudButton, _harvestButton, _powerProbeButton, _powerScoutButton,
+                    _houseProbeButton, _shroudProbeButton },
                 left, rightLimit) + 6;
             y = LayoutHint(_harvestStatus, y, rightLimit - left) + 14;
 
@@ -1571,6 +1589,12 @@ namespace MoTrainer.Ui.Pages
         private readonly Timer _houseProbeTimer;
         private HouseProbeSpec _houseProbePending;      // 第 1 次点击解析出的目标，等第 2 次确认才真写
 
+        // ---- 黑幕试探（[S6-3] 全图视野，2026-10-12）----
+        private System.Threading.Thread _shroudProbeThread;
+        private ShroudProbeResult _shroudProbeResult;
+        private readonly Timer _shroudProbeTimer;
+        private ShroudProbeSpec _shroudProbePending;    // 第 1 次点击（只读侦查）解析出的目标
+
         /// <summary>
         /// 「电力试探」（`[S4-3]` B 方案）：判定建筑对象上的候选字段是不是**电力产出的来源**。
         ///
@@ -1716,6 +1740,129 @@ namespace MoTrainer.Ui.Pages
         {
             string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
             return System.IO.Path.Combine(System.IO.Path.Combine(baseDirectory, "config"), "house-probe.txt");
+        }
+
+        // ============================================================ 黑幕试探（[S6-3] 全图视野）
+
+        /// <summary>
+        /// 「黑幕试探」：判定采集报告「七」给出的候选**是不是真的黑幕数据**。
+        ///
+        /// 做法与「房子试探」同一套路：**点两次才真写**（第一次只读侦查：念出地址、那一小片的构成、
+        /// 能不能写；第二次才动），收尾**无条件还原 + 回读逐字节确认**。
+        /// 不同之处：按住期间**每 200 毫秒重写一次** —— "游戏会不会把黑幕自己画回来"正是待验证的事之一，
+        /// 只写一次的话，那种情况在屏幕上看起来和"地址不对"一模一样，白白浪费一次机会。
+        ///
+        /// 判定要靠**人看屏幕**：那 3.5 秒里，地图上有没有一小块黑幕散开？程序替不了这一步。
+        /// </summary>
+        private void OnShroudProbeClick(object sender, EventArgs e)
+        {
+            StringBuilder text = new StringBuilder();
+            text.AppendLine("=== 黑幕试探（往一小片内存写 0，约 3.5 秒后自动还原）===");
+            text.AppendLine();
+
+            if (_shroudProbeThread != null && _shroudProbeThread.IsAlive)
+            {
+                text.AppendLine("上一次试探还在进行（约 3.5 秒），请稍候。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            if (_shroudProbePending == null)
+            {
+                ShroudProbeSpec spec;
+                string error;
+                if (!ShroudProbe.TryLoadTarget(ConfigFolderPath(), out spec, out error))
+                {
+                    text.AppendLine("还不能试探：" + error);
+                    text.AppendLine();
+                    text.AppendLine("目标来自**采集报告「七、找黑幕数据」**：把排在最前面的候选地址");
+                    text.AppendLine("（以及你想试多长，建议 4096）写成一行，例如：`0x29B00000 4096`。");
+                    SetOutput(text.ToString());
+                    return;
+                }
+
+                _shroudProbePending = spec;
+                text.AppendLine("**第一次点击只做说明，不会写任何东西。** 确认下面这些之后，再点一次才真写：");
+                text.AppendLine();
+                text.AppendLine("  准备写：" + spec.Describe());
+                if (_target != null && _target.IsReady)
+                {
+                    text.Append(ShroudProbe.Scout(_target.Memory, spec).Describe());
+                }
+                else
+                {
+                    text.AppendLine("  （游戏没连上，读不到现场情况 —— 先启动游戏、确认状态条显示「已连接」）");
+                }
+                text.AppendLine();
+                text.AppendLine("  怎么用：**先在游戏里把地图上那块地方移到画面里**（黑幕还在的位置），再点第二次；");
+                text.AppendLine("  然后盯住画面看那 3.5 秒：**有没有一小块黑幕散开了？**");
+                text.AppendLine("  写的是**数据**（不是代码）：不注入、不改游戏文件；地址不对时程序会拒绝写并说明原因。");
+                text.AppendLine("  **试探期间请不要关闭程序。**");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            ShroudProbeSpec pending = _shroudProbePending;
+            _shroudProbePending = null;
+
+            if (_target == null || !_target.IsReady)
+            {
+                text.AppendLine("游戏未连接 —— 先启动游戏、确认状态条显示「已连接」。");
+                SetOutput(text.ToString());
+                return;
+            }
+
+            MemoryIO memory = _target.Memory;
+            text.AppendLine("正在写…（约 3.5 秒）**现在看游戏画面：那一小块黑幕有没有散开？**");
+            SetOutput(text.ToString());
+
+            _shroudProbeResult = null;
+            _shroudProbeButton.Enabled = false;
+            _shroudProbeThread = new System.Threading.Thread(delegate()
+            {
+                ShroudProbeResult probe;
+                try { probe = ShroudProbe.Run(memory, pending); }
+                catch (Exception ex)
+                {
+                    probe = new ShroudProbeResult();
+                    probe.Note = ex.GetType().Name + ": " + ex.Message;
+                }
+                _shroudProbeResult = probe;     // 引用赋值：界面线程读到的要么是 null 要么是完整结果
+            });
+            _shroudProbeThread.IsBackground = true;
+            _shroudProbeThread.Start();
+            _shroudProbeTimer.Start();
+        }
+
+        private void OnShroudProbeTick(object sender, EventArgs e)
+        {
+            if (_shroudProbeResult == null) { return; }
+            _shroudProbeTimer.Stop();
+            _shroudProbeButton.Enabled = true;
+
+            ShroudProbeResult probe = _shroudProbeResult;
+            _shroudProbeResult = null;
+
+            StringBuilder text = new StringBuilder();
+            text.AppendLine("=== 黑幕试探结果 ===");
+            text.AppendLine();
+            text.Append(probe.Describe());
+            text.AppendLine();
+            text.AppendLine("请告诉我：**刚才那 3.5 秒里，地图上有没有一小块黑幕散开？**");
+            text.AppendLine("（散开了 = 这个地址就是黑幕；没反应 = 换个候选再试，否定一个候选同样是结论。）");
+            SetOutput(text.ToString());
+
+            string[] lines = text.ToString().Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                Logger.Info("Advanced", "黑幕试探：" + lines[i].TrimEnd('\r'));
+            }
+        }
+
+        /// <summary>`<exe目录>\config` —— 试探目标都写在那一行配置里（换目标不用重编译）。</summary>
+        private string ConfigFolderPath()
+        {
+            return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config");
         }
 
         /// <summary>

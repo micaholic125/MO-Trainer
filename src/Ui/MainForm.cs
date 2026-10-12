@@ -351,7 +351,14 @@ namespace MoTrainer.Ui
             power.MinValue = 1;
             power.MaxValue = 200000;
             power.TargetValue = _settings.GetValue(CheatId.PowerOutput, 30000);
-            power.Enabled = _settings.GetEnabled(CheatId.PowerOutput);
+
+            // 电力**不自动恢复**（用户 2026-10-12 拍板）。
+            //
+            // 为什么它和金钱不一样：电力的做法是改"同型号共用一份的说明书"里的发电量，
+            // 而同一个型号**敌人也有** —— 万一用户上次忘了关，这一局一开头就顺手把
+            // **敌人的同类电厂**也一起变强了。这种"帮到对手"的副作用不该由"忘了关"引发，
+            // 所以每次都要用户亲手打开（数值目标仍按上次记的恢复，省得每次重填）。
+            power.Enabled = false;
             power.Detail =
                 "做法：把**你名下**发电建筑对应的「型号说明书」里的发电量改大，"
                 + "让游戏自己算出更多的电。\n"
@@ -954,13 +961,29 @@ namespace MoTrainer.Ui
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            // 先把功能全关掉再退出：留一个还在写内存的线程不合规矩
+            // ⚠ **顺序不能反**：先把"下次启动要恢复的那个开关"读出来，**再**关功能。
+            //
+            // 2026-10-12 查出来的真 bug：这里原本是 `StopAllFeatures()` 在前、
+            // 读 `_engine.Find(Money).Enabled` 在后 —— 而 StopAllFeatures 已经把金钱关掉了，
+            // 于是记下来的**永远是 false**，"金钱下次自动开"这条设计**从未生效过**。
+            // 证据：当天每次启动的运行日志里，恢复的都只有 `killEnemies=0`（一条死数据），
+            // 金钱一次都没被恢复过。用户 2026-10-12 明确选择：**金钱保持自动恢复**。
+            CheatFeature moneyFeature = _engine.Find(CheatId.Money);
+            bool moneyWasOn = moneyFeature != null && moneyFeature.Enabled;
+
+            // 然后才把功能全关掉再退出：留一个还在写内存的线程不合规矩
             // （虽然进程退出会连带结束线程，但显式收尾才能保证日志完整）
             StopAllFeatures();
 
-            _settings.SetEnabled(CheatId.Money, _engine.Find(CheatId.Money) != null
-                && _engine.Find(CheatId.Money).Enabled);
+            // 落盘只记"下次真的会恢复"的功能（金钱一个），其余一律记 false ——
+            // 理由见 TrainerSettings.CaptureExitState 的注释。
+            _settings.CaptureExitState(moneyWasOn);
             _settings.Save(_settings.PathIn(_profileStore.ConfigFolder));
+
+            // 留一行痕迹：下次排查"为什么这个开关自己开着/自己关了"时，
+            // 这行就是唯一能对上的记录（本项目吃过"只能靠人回忆"的亏）。
+            Logger.Info("MainForm", "关闭记录：下次启动只恢复金钱（本次为 "
+                + (moneyWasOn ? "开" : "关") + "）；电力与高风险项一律不自动开启");
 
             _uiTimer.Stop();
             UnregisterHotkeys();

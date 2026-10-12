@@ -51,6 +51,28 @@ namespace MoTrainer.Cheats
             _enabled.Clear();
         }
 
+        /// <summary>
+        /// 关闭窗口时该往文件里记什么（**只记"下次启动真的会恢复"的功能**）。
+        ///
+        /// 规矩（2026-10-12 用户拍板）：
+        ///   · **金钱**：记它关闭那一刻的真实状态 —— 下次启动照它恢复；
+        ///   · **其余全部记 false**：电力（用户明确选了"不自动开"，理由见 `MainForm` 里那段注释）
+        ///     与三个高风险项（无敌 / 秒杀 / 瞬间建造，每次都要用户亲手勾确认，`CLAUDE.md` §4.6）
+        ///     都**不会被恢复**，写 true 只是**没人读的死数据**，
+        ///     却会让看配置的人以为"某某一直开着"（2026-10-12 就差点据此误判，见开发日志附录三补记）。
+        ///
+        /// 注意这里的 `moneyWasEnabled` 必须是**关功能之前**取的值 —— 见 `MainForm.OnFormClosing`：
+        /// 曾经因为顺序写反（先关功能、再读状态），"金钱下次自动开"这条设计**从未真正生效过**。
+        /// </summary>
+        public void CaptureExitState(bool moneyWasEnabled)
+        {
+            CheatId[] all = (CheatId[])Enum.GetValues(typeof(CheatId));
+            for (int i = 0; i < all.Length; i++)
+            {
+                SetEnabled(all[i], all[i] == CheatId.Money && moneyWasEnabled);
+            }
+        }
+
         // ---------------- 落盘 ----------------
 
         public string PathIn(string configFolder)
