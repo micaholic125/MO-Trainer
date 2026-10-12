@@ -9,10 +9,6 @@
       "enabled": false,
       "value": "0x7530"
     },
-    "selectedInvincible": {
-      "enabled": true,
-      "value": "0x0"
-    },
     "killEnemies": {
       "enabled": true,
       "value": "0x0"

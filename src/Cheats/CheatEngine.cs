@@ -258,6 +258,29 @@ namespace MoTrainer.Cheats
             {
                 CheatFeature feature = _features[i];
 
+                // 「保护名单只在**开启那一刻**建立」这件事，必须由开关自己的跳变来驱动。
+                //
+                // 曾经用"两拍间隔超过 1 秒 == 刚开启"去猜（当时以为没有开关回调可用），
+                // 2026-10-12 真机把它证伪了：玩家"取消选中 A → 再选中 B"要花 1 秒以上，
+                // 而这段时间里 ApplySelectedInvincible 一直在 `count == 0` 那一支提前返回、
+                // **没刷新计时**；等 B 被选中、函数第一次走到计时那一行时，间隔自然超过 1 秒
+                // ⇒ 被误判成"刚开启" ⇒ **B 也被建进了保护名单**。
+                // 症状（用户实测原话）："开启前选中 A，开启后改选 B 让它挨打，B 没死"。
+                // 日志铁证：`15:41:52 保护 0x2827C928`（A，正确）与 `15:42:09 保护 0x2827BB18`（B，错误）。
+                //
+                // 现在改成**只看开关自己的 false→true 跳变**（引擎每拍都看得见 Enabled），
+                // 与"拍与拍之间隔了多久"彻底解耦。
+                if (feature.Id == CheatId.SelectedInvincible)
+                {
+                    if (feature.Enabled && !_invincibleEnabledPrev) { _invincibleArmPending = true; }
+                    else if (!feature.Enabled)
+                    {
+                        _invincibleArmPending = false;
+                        _invincibleArmNote = "";   // 关掉就把"名单是空的"那条提示收起来
+                    }
+                    _invincibleEnabledPrev = feature.Enabled;
+                }
+
                 // 判 IsUsable 而不是 IsCalibrated：被刻意停用的功能（例如电力，
                 // 校准数据看着是好的、真机实测却证明那个位置没用）**必须一个字节都不写**。
                 // 这是引擎层的最后一道闸门 —— 界面置灰与主窗口的裁决都可能被绕过，
@@ -410,6 +433,17 @@ namespace MoTrainer.Cheats
             // Note 里既有"写不了"的原因，也有"现在没有东西在造"这类状态 —— 一律如实显示，不静默。
             feature.LastError = r.Note;
             if (r.Wrote) { feature.WriteCount++; }
+
+            // **真的推了一把的时候必须留痕**。此前 `r.Note` 一为空就什么都不记，
+            // 于是"到底推没推"在导出的日志里完全没有痕迹（只有卡片上的写入次数），
+            // 用户说"感觉快了一点"也无从对证 —— 2026-10-12 复核那一次，是靠
+            // "已过拍数在 0.4 秒里从 0 跳到 51"反推才确认推过的。这种反推不该是常态。
+            if (r.Wrote)
+            {
+                Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                    "瞬间建造：已推进进度 —— {0} 拍 → {1} 拍（对象 0x{2:X8}｜还差 {3} 没付完）",
+                    r.ElapsedBefore, r.ElapsedAfter, r.ProducingAddress, r.Remaining));
+            }
 
             // **状态一变就写一行日志**（不按拍刷屏）。理由：真机上"为什么没效果"以前只出现在卡片上，
             // 事后查不到 —— 而本项目有明确规矩：能让程序自己写进日志的，就不要靠人去描述
@@ -673,7 +707,23 @@ namespace MoTrainer.Cheats
             // 这与早先"只在被选中时采样"是同一类错误：把清理动作加在了玩家不得不走的路径上。
             //
             // 保留基准反而是想要的效果：单位离队期间受的伤，选回来时会自动补满。
-            if (count == 0) { feature.LastError = ""; return; }
+            if (count == 0)
+            {
+                // 读得到"选中 0 个"时，把待建立的名单标记消费掉：这说明开启那一刻**确实**
+                // 什么都没选中，按用户要的语义，之后才选中的单位**不该**进名单。
+                //
+                // 注意这里也是 2026-10-12 那个 bug 的现场：早先在这一支里 `return` 之前
+                // 什么都不记，于是"取消选中"的那段时间被误当成了"刚开启"。
+                if (_invincibleArmPending)
+                {
+                    _invincibleArmPending = false;
+                    _invincibleArmNote = "开启时没有选中任何单位 —— 保护名单是空的"
+                        + "（请先选中自己的单位，再把开关关掉重开一次）";
+                    LogInvincibleNote(_invincibleArmNote);
+                }
+                feature.LastError = _invincibleArmNote;
+                return;
+            }
             if (count > SelectionProbe.MaxCount)
             {
                 feature.LastError = string.Format(CultureInfo.InvariantCulture,
@@ -697,29 +747,39 @@ namespace MoTrainer.Cheats
 
             uint desiredOverride = feature.TargetValue;
 
-            // 保护名单 = 当前选中的单位 ∪ **曾经选中过的**单位。
+            // 保护名单 = **开启那一刻**选中的本方单位（用户确认过的语义），建立之后**只增不减**。
             //
-            // 为什么必须并上后者：真机现象是"不选中时单位正常掉血，选中后回满血"——
+            // 为什么必须只增不减：真机现象是"不选中时单位正常掉血，选中后回满血"——
             // 因为选中列表里只有"当前选中"的对象，而游戏机制又要求
             // **先取消选中才能让它挨打**（玩家多轮反馈反复确认）。
             // 于是单位恰好在我们最需要保护它的时候被排除在遍历之外。
-            //
             // 这与 S5k（只在被选中时采样）、S5u（取消选中就清血量基准）是**同一类错误**：
             // 把关键动作挂在了"玩家不得不取消选中"这条必经路径上。第三次了，这次改成只增不减。
-            // 语义（用户确认过的）：**开启那一刻选中的本方单位进入保护名单**。
-            // 开启后才选中/新造的单位不自动无敌 —— 用户明确说"只选中 A1 进无敌，A2 死亡正是我想要的结果"。
             //
-            // 名单只在"开启那一刻"建立：引擎开启期间每 33ms 调一次，
-            // 两拍间隔超过 1 秒即视为刚开启（没有额外的开关回调可用）。
-            bool freshStart = (DateTime.UtcNow - _lastInvincibleTick).TotalSeconds > 1.0;
-            _lastInvincibleTick = DateTime.UtcNow;
-
-            if (freshStart)
+            // **开启后才选中 / 新造的单位不进名单** —— 用户明确说过"只选中 A1 进无敌，
+            // A2 死亡正是我想要的结果"。名单**只在开关 false→true 那一刻**建立，
+            // 由 `_invincibleArmPending` 说了算（见 ApplyAll 里那段注释：
+            // 曾经拿"两拍间隔超过 1 秒"当"刚开启"的判据，2026-10-12 被真机证伪 ——
+            // 玩家"取消选中 A → 再选中 B"必然超过 1 秒，于是 B 也被建进了名单）。
+            if (_invincibleArmPending)
             {
+                _invincibleArmPending = false;
+
+                // 重新开启 = **重新建立**名单：上一次保护的那些全部作废。
+                //
+                // 为什么不接着用旧名单：用户对"开启"的理解就是"保护我现在选中的这些"。
+                // 不清的话名单只增不减、永远缩小不了，也没法靠"关掉再开"换一批保护的兵。
+                //（"取消选中也不踢出名单"是另一回事 —— 那发生在**开启期间**，见上面的注释。）
+                int carried = _healthPeak.Count;
+                _healthPeak.Clear();
+
+                int seen = 0;
+                int added = 0;
                 for (int i = 0; i < (int)count; i++)
                 {
                     uint selectedObject;
                     if (!_target.Memory.ReadUInt32(arrayAddress + (uint)(i * 4), out selectedObject)) { break; }
+                    seen++;
                     if (selectedObject < 0x10000) { continue; }
                     if (!_selection.IsOwnedObject(_profile, selectedObject)) { continue; }
 
@@ -728,12 +788,27 @@ namespace MoTrainer.Cheats
                     if (!_target.Memory.ReadUInt32(healthAddress, out healthNow) || healthNow == 0) { continue; }
 
                     uint existing;
-                    if (_healthPeak.TryGetValue(selectedObject, out existing) && existing >= healthNow) { continue; }
+                    if (_healthPeak.TryGetValue(selectedObject, out existing) && existing >= healthNow) { added++; continue; }
 
                     _healthPeak[selectedObject] = healthNow;
+                    added++;
                     Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
                         "选中单位无敌：保护 0x{0:X8}，基准血量 {1}", selectedObject, healthNow));
                 }
+
+                // 名单为空必须**说得出来**：否则就是"开关亮着、程序一个单位都不保护"，
+                // 而玩家只会以为工具坏了（§4.2 最忌讳的形态）。结论同时进日志与卡片。
+                _invincibleArmNote = added > 0 ? "" : (seen > 0
+                    ? string.Format(CultureInfo.InvariantCulture,
+                        "开启时选中的 {0} 个都不是本方单位 —— 保护名单是空的（只保护自己的单位）", seen)
+                    : "开启时没有选中任何单位 —— 保护名单是空的（请先选中自己的单位，再把开关关掉重开一次）");
+                feature.LastError = _invincibleArmNote;
+                if (_invincibleArmNote.Length > 0) { LogInvincibleNote(_invincibleArmNote); }
+
+                Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                    "选中单位无敌：已按「开启那一刻」建立保护名单 —— 选中 {0} 个，本方 {1} 个进名单"
+                    + "（之后新选中的单位不会自动加入{2}）",
+                    seen, added, carried > 0 ? "；上一次保护的 " + carried + " 个已作废" : ""));
             }
 
             List<uint> targets = new List<uint>();
@@ -1262,7 +1337,24 @@ namespace MoTrainer.Cheats
         private string _lastInvincibleNote = "(未开始)";
 
         private DateTime _lastInvincibleWriteLog = DateTime.MinValue;
-        private DateTime _lastInvincibleTick = DateTime.MinValue;
+
+        /// <summary>
+        /// 待建立的"开启瞬间保护名单"标记：由 <see cref="ApplyAll"/> 里**开关的 false→true 跳变**置位
+        /// （游戏重新连接时也会重新置位，见 <see cref="OnTargetReadyAgain"/>）。
+        ///
+        /// 只在"能明确读到选中名单"的那一拍才消费掉 —— 读失败（游戏没连上、数组解析不出来、
+        /// 数量异常）时保留着，下一拍再试，绝不因为一次读取失败就把名单建空。
+        /// </summary>
+        private bool _invincibleArmPending;
+
+        /// <summary>上一拍这个开关是不是开着的（用来认出 false→true 那一瞬）。</summary>
+        private bool _invincibleEnabledPrev;
+
+        /// <summary>
+        /// 建立名单时的结论（空 = 正常）。名单为空时它会被显示在卡片上并留在日志里 ——
+        /// 绝不出现"开关开着、程序什么都不做、还不说为什么"。
+        /// </summary>
+        private string _invincibleArmNote = "";
 
         // ---------------- 秒杀敌人（S6-1）的运行时状态 ----------------
 
@@ -1345,6 +1437,13 @@ namespace MoTrainer.Cheats
             _lastKillRun = DateTime.MinValue;
             _healthPeak.Clear();
             _selection.Reset();
+
+            // 无敌：名单刚被清空，而开关**可能还开着**（游戏崩了又重开、换了一局……）。
+            // 这时候必须重新按"此刻选中的单位"建一次名单 —— 否则表现就是"开关亮着、
+            // 一个单位都不保护"，正是 §4.2 最忌讳的"开关能点、程序悄悄什么都不做"。
+            // 重新建立照样会写日志说明（见 ApplySelectedInvincible 里的 _invincibleArmNote）。
+            CheatFeature invincibleFeature = Find(CheatId.SelectedInvincible);
+            if (invincibleFeature != null && invincibleFeature.Enabled) { _invincibleArmPending = true; }
 
             // 电力：**丢弃记账，但绝不做写回**。
             // 新一局的内存是重建的，记账里那些"说明书地址"早就不是原来那份了 ——

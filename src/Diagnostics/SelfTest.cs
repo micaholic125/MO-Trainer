@@ -156,6 +156,12 @@ namespace MoTrainer.Diagnostics
             CheckTypeIdScan();
             CheckHarvestHouseTracking();
 
+            // 「保护名单只在开启那一刻建立」这条语义 2026-10-12 在真机上翻过车
+            //（开了无敌之后**新选中**的兵也打不死），而当时 371 项断言里没有一条覆盖
+            // "中途取消选中、再选中别人"这个形态。它必须**照真机时序**跑，否则测不出来。
+            Section("18. 无敌的保护名单（只保护开启那一刻选中的 · [S5-6] 反向用例）");
+            CheckInvincibleSnapshot();
+
             Write("");
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
@@ -4729,6 +4735,178 @@ namespace MoTrainer.Diagnostics
             finally
             {
                 AllyGuard.Reset();   // 静态状态：任何一个用例抛异常都不能把"友军标记"留给后面
+                if (engine != null) { try { engine.Dispose(); } catch (Exception) { } }
+                if (scene != null) { scene.Dispose(); }
+                self.Dispose();
+            }
+        }
+
+        // ============================================================ 无敌的保护名单（S5-6 反向用例）
+
+        /// <summary>
+        /// 「保护名单只在**开启那一刻**建立」这条语义 —— 也就是 [S5-6] 的反向用例。
+        ///
+        /// **2026-10-12 真机事故**：用户先选中动员兵 A、开启无敌，然后**取消 A 的选中**、
+        /// 再选中动员兵 B 让它去挨打 —— B 居然也打不死。程序自己的日志里两行铁证：
+        /// `15:41:52 保护 0x2827C928`（A，正确）与 `15:42:09 保护 0x2827BB18`（B，不该发生）。
+        ///
+        /// 根因：当时用"两拍间隔超过 1 秒 == 刚开启"去猜开启时刻，而 `count == 0` 那一支
+        /// 提前返回、**不刷新计时**；玩家"取消选中 → 再选中"必然超过 1 秒
+        /// ⇒ B 被误判成"开启时选中的单位"，一并进了名单。
+        ///
+        /// 这条断言**照着真机的时序走**（这是关键 —— 先前没有覆盖"中途取消选中再选别人"这个形态，
+        /// 所以 371 项全绿也没能提前发现）：选中 A → 开启 → 取消选中并空转 1.2 秒 → 选中 B，
+        /// 然后分别给 A、B 制造伤害，看谁被补回来。
+        /// **改坏验证**：把判据退回"按两拍间隔猜"，B 那条会立刻转红。
+        /// </summary>
+        private static void CheckInvincibleSnapshot()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("无敌保护名单", false, "OpenProcess 失败"); return; }
+
+            CheatEngine engine = null;
+            TechnoScene scene = null;
+            try
+            {
+                scene = TechnoScene.Create(self);
+                if (scene == null) { Check("无敌保护名单测试内存块", false, Win32Api.LastErrorMessage()); return; }
+
+                MemoryIO io = scene.Io;
+                uint module = scene.ModuleBase;
+
+                const uint Money = 4321;
+                const uint HealthOffset = TechnoScene.HealthOffset;
+
+                uint house = scene.MyOwner;
+                io.WriteUInt32(house + TechnoOwnership.HouseMoneyOffset, Money);
+
+                uint unitA = scene.Team[0];   // 开启之前就选中的那个（该受保护）
+                uint unitB = scene.Team[1];   // 开启之后才选中的那个（**不该**受保护）
+
+                // 选中名单：数量 + 指针槽（槽里放一张只有一个对象的数组 —— 与真机一致）
+                uint selCount = module + 0x300;
+                uint selSlot = module + 0x304;
+                uint selArray = scene.Arrays + 0x1800;
+                io.WriteUInt32(selSlot, selArray);
+                io.WriteUInt32(selArray, unitA);
+                io.WriteUInt32(selCount, 1);
+
+                // 金钱链：静态根（模块内）→ 我方房子 → +0x30C
+                io.WriteUInt32(module + 0x100, house);
+
+                CalibrationProfile profile = new CalibrationProfile();
+                profile.Money.SetOffsets(new uint[] { 0x100, TechnoOwnership.HouseMoneyOffset });
+                profile.SelectedCount.SetStaticAddress(0x300);
+                profile.SelectedList.SetStaticAddress(0x304);
+                profile.OffsetTechnoHealth = HealthOffset;
+
+                List<MemoryRegion> heap = new List<MemoryRegion>();
+                heap.Add(MakeRegion(scene.Heap, TestBlockSize));
+                List<MemoryRegion> pointer = new List<MemoryRegion>();
+                pointer.Add(MakeRegion(scene.ModuleBase, TestBlockSize));
+                pointer.Add(MakeRegion(scene.Heap, TestBlockSize));
+                SyntheticTarget target = new SyntheticTarget(
+                    io, scene.ModuleBase, TechnoScene.FakeModuleSize, heap, pointer);
+
+                engine = new CheatEngine(target, new TrainerSettings());
+                CheatFeature invincible = engine.Add(new CheatFeature(
+                    CheatId.SelectedInvincible, "无敌", "测试用", SynchRisk.High, false));
+                engine.BindProfile(profile);
+
+                invincible.Enabled = true;
+                engine.Start();
+
+                // ⚠ 时序：**必须等"建立名单"那一拍真的跑过**再制造伤害。
+                // 本方法第一版就是在这里栽的：开启后立刻把 A 写成 40，于是名单里的
+                // "基准血量"被记成 40，而锁定值取的就是基准 ⇒ 之后 40 既不高于也不低于它，
+                // 一个字节都不会写 —— 三条断言全红，看起来像功能坏了，其实是我把真机上
+                // 不可能出现的顺序（开着无敌的瞬间单位恰好是伤血）当成了测试前提。
+                Thread.Sleep(400);
+
+                // ① 开启那一刻选中的 A 必须受保护
+                io.WriteUInt32(unitA + HealthOffset, 40);
+                bool aHealed = WaitUntil(delegate
+                {
+                    return io.ReadUInt32Or(unitA + HealthOffset, 0) == 100;
+                }, 2000);
+                Check("无敌：开启那一刻选中的单位受保护（A 被打掉后自动补回）", aHealed,
+                    "A 当前血量 " + io.ReadUInt32Or(unitA + HealthOffset, 0));
+
+                // ② 照真机的时序：取消选中 → 空转 1.2 秒（旧判据正是在这里被骗）→ 再选中 B
+                io.WriteUInt32(selCount, 0);
+                Thread.Sleep(1200);
+                io.WriteUInt32(selArray, unitB);
+                io.WriteUInt32(selCount, 1);
+                Thread.Sleep(400);
+
+                // ③ B 挨打**不该**被补回来 —— 这就是用户 2026-10-12 报的那一条
+                io.WriteUInt32(unitB + HealthOffset, 40);
+                Thread.Sleep(900);
+                uint bNow = io.ReadUInt32Or(unitB + HealthOffset, 0);
+                Check("无敌：开启之后才选中的单位不进名单（B 掉血后不被补回）", bNow == 40,
+                    "B 当前血量 " + bNow + "（期望仍是 40；被补成 100 = 名单被误扩，正是真机那个 bug）");
+
+                // ④ 但开启期间**取消选中**不会把已保护的单位踢出去（这是"只增不减"的本意）
+                io.WriteUInt32(unitA + HealthOffset, 40);
+                bool aStill = WaitUntil(delegate
+                {
+                    return io.ReadUInt32Or(unitA + HealthOffset, 0) == 100;
+                }, 2000);
+                Check("无敌：开启期间取消选中，已保护的单位照样补血（A 仍在名单里）", aStill,
+                    "A 当前血量 " + io.ReadUInt32Or(unitA + HealthOffset, 0));
+
+                // ⑤ 关掉再打开 = 用**此刻选中的单位**重新建立名单：
+                //    此时选中的只有 B ⇒ B 该受保护，而 A **要退出名单**（说明是"重建"不是"追加"）。
+                invincible.Enabled = false;
+                Thread.Sleep(200);
+                io.WriteUInt32(unitA + HealthOffset, 100);   // 模拟游戏那边两个兵都恢复了满血
+                io.WriteUInt32(unitB + HealthOffset, 100);
+                invincible.Enabled = true;
+                Thread.Sleep(400);
+                io.WriteUInt32(unitA + HealthOffset, 40);
+                io.WriteUInt32(unitB + HealthOffset, 40);
+                bool bArmed = WaitUntil(delegate
+                {
+                    return io.ReadUInt32Or(unitB + HealthOffset, 0) == 100;
+                }, 2000);
+                Thread.Sleep(300);
+                uint aAfterRebuild = io.ReadUInt32Or(unitA + HealthOffset, 0);
+                Check("无敌：关掉再打开会用「此刻选中的单位」重建名单（B 这时才该受保护）", bArmed,
+                    "B 当前血量 " + io.ReadUInt32Or(unitB + HealthOffset, 0)
+                    + "（重开时选中的是 B，所以这次该被补回）");
+                Check("无敌：重建是**推倒重来**，上一次保护的单位不再补血（A 这次该保持伤血）",
+                    aAfterRebuild == 40,
+                    "A 当前血量 " + aAfterRebuild + "（期望 40；被补成 100 = 旧名单没作废，只增不减）");
+
+                // ⑥ 重开时什么都没选中 → 名单为空，而且**必须说得出来**（不能开关亮着却不干活）
+                invincible.Enabled = false;
+                Thread.Sleep(200);
+                io.WriteUInt32(unitA + HealthOffset, 100);
+                io.WriteUInt32(selCount, 0);
+                invincible.Enabled = true;
+                Thread.Sleep(400);
+                io.WriteUInt32(selArray, unitA);
+                io.WriteUInt32(selCount, 1);
+                Thread.Sleep(400);
+                io.WriteUInt32(unitA + HealthOffset, 40);
+                Thread.Sleep(900);
+                uint aNow = io.ReadUInt32Or(unitA + HealthOffset, 0);
+                Check("无敌：开启时没选中任何单位 → 名单为空，之后（哪怕再选中）也不会自动进名单",
+                    aNow == 40,
+                    "A 当前血量 " + aNow + "（期望仍是 40；被补成 100 = 又照「此刻选中」建了名单）");
+                Check("无敌：名单为空时必须在卡片上说清原因（不能开关亮着、程序悄悄不干活）",
+                    invincible.LastError.IndexOf("保护名单是空的") >= 0,
+                    invincible.LastError.Length == 0 ? "(卡片上什么都没写)" : invincible.LastError);
+
+                engine.Stop();
+                engine = null;
+            }
+            catch (Exception ex)
+            {
+                Check("无敌保护名单", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
                 if (engine != null) { try { engine.Dispose(); } catch (Exception) { } }
                 if (scene != null) { scene.Dispose(); }
                 self.Dispose();
