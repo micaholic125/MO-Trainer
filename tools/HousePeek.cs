@@ -15,8 +15,27 @@
 //   HousePeek dump    <addr> <len>
 //   HousePeek ptrs    <base> <lo> <hi>
 //   HousePeek watch   <base> <lo> <hi> <seconds> <hz>
+//   HousePeek map
 //
 // Read-only. Nothing is ever written to the game.
+//
+// `map` prints the current shroud state of the whole map, using the layout
+// from the Ares team's YRpp headers (archived at
+// <repo>\证据归档\2026-10-13-网络方向\YRpp\), verified offline against two
+// independent samples on 2026-10-13 (the Ares crash dump and the spy-satellite
+// before/after snapshots) -- see docs\07-全图视野交接说明.md section 10:
+//     MapClass instance : 0x0087F7E8  (a global object in .data, NOT a pointer)
+//       +0x13C          : Cells.Items    -> CellClass* array on the heap
+//       +0xEC           : MapRect (left, top, right, bottom)
+//     CellClass (one heap object per cell, size 0x148):
+//       +0x24 X (short)   +0x26 Y (short)
+//       +0x120 Shroudedness: -2(0xFE)=shrouded  -1(0xFF)=visible  0..48=fade anim
+//       +0x121 Foggedness  (same value set)
+//     index formula: idx = (Y << 9) + X   (MapClass::GetCellIndex)
+// Every printed line of the map is guarded by two checks that random data
+// cannot pass: the cell vtable must be inside the game module, and the cell's
+// own X/Y must reproduce its slot index.  Anything failing is counted and
+// skipped, never guessed.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -83,6 +102,7 @@ namespace MoTools
             {
                 string cmd = args[0].ToLowerInvariant();
                 if (cmd == "resolve") { return Resolve(); }
+                if (cmd == "map") { return MapPrint(); }
                 if (cmd == "dump")
                 {
                     return Dump(ParseHex(args[1]), (int)ParseHex(args[2]));
@@ -568,6 +588,159 @@ namespace MoTools
         private static bool IsKnown(uint offset)
         {
             return offset == 0x30C || offset == 0x53A4 || offset == 0x53A8 || offset == 0x53BC;
+        }
+
+        // ================================================================
+        // map -- print the current shroud state of the whole map.
+        // Read-only, and it stays read-only: this file has no
+        // WriteProcessMemory declaration at all.  (The write experiment is
+        // option B and belongs to a separate, deliberately-written tool.)
+        //
+        // Layout source: Ares team's YRpp headers, archived at
+        // 证据归档\2026-10-13-网络方向\YRpp\, verified 2026-10-13 against two
+        // independent samples (Ares crash dump 10527/10527 index equation,
+        // spy-satellite snapshots 349 cells FE->FF).  See docs\07 section 10.
+        // ================================================================
+
+        private const uint MapClassInstance = 0x0087F7E8; // global object, not a pointer
+        private const int MapRectOffset = 0xEC;           // left, top, right, bottom (ints)
+        private const int CellsItemsOffset = 0x13C;       // VectorClass<CellClass*> Items
+        private const int CellsCapacityOffset = 0x140;    // ... Capacity (= 0x40000, constant)
+        private const int CellXOffset = 0x24;             // short
+        private const int CellYOffset = 0x26;             // short
+        private const int CellShroudOffset = 0x120;       // -2 black / -1 visible / 0..48 anim
+        private const int CellFogOffset = 0x121;
+        private const int CellProbeBytes = 0x124;         // enough to cover +0x120/+0x121
+        private const int MaxCells = 0x40000;
+
+        private static int MapPrint()
+        {
+            byte[] head;
+            if (!TryRead(MapClassInstance, 0x160, out head))
+            {
+                Console.WriteLine("cannot read MapClass instance at 0x"
+                    + MapClassInstance.ToString("X8") + " -- is the game in a match?");
+                return 5;
+            }
+
+            int left = (int)ReadU32(head, MapRectOffset);
+            int top = (int)ReadU32(head, MapRectOffset + 4);
+            int right = (int)ReadU32(head, MapRectOffset + 8);
+            int bottom = (int)ReadU32(head, MapRectOffset + 12);
+            int capacity = (int)ReadU32(head, CellsCapacityOffset);
+
+            uint items = ReadU32(head, CellsItemsOffset);
+            uint mapVt = ReadU32(head, 0);
+
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "MapClass @ 0x{0:X8}  vt=0x{1:X8}{2}", MapClassInstance, mapVt,
+                InModule(mapVt) ? " (in module)" : "  <-- NOT in module, suspicious"));
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "MapRect = ({0},{1})-({2},{3})  {4}x{5}   Cells capacity = 0x{6:X}",
+                left, top, right, bottom, right - left, bottom - top, capacity));
+            if (items < 0x10000 || capacity != MaxCells)
+            {
+                Console.WriteLine("Cells chain looks wrong (items=0x" + items.ToString("X8")
+                    + ", capacity=0x" + capacity.ToString("X")
+                    + ") -- not in a match? Refusing to print a guessed map.");
+                return 5;
+            }
+            Console.WriteLine("Cells.Items = 0x" + items.ToString("X8"));
+            Console.WriteLine();
+
+            // Pass 1: walk all 0x40000 slots, keep only cells that pass BOTH gates
+            // (vtable inside module, own X/Y reproduces slot index).  Measure the
+            // real coordinate range from what survives -- never assume it.
+            int passed = 0, failedEq = 0, failedVt = 0, nullSlots = 0, unreadable = 0;
+            int minX = int.MaxValue, maxX = int.MinValue, minY = int.MaxValue, maxY = int.MinValue;
+            Dictionary<int, byte[]> cells = new Dictionary<int, byte[]>();
+            for (int idx = 0; idx < capacity; idx++)
+            {
+                byte[] slot;
+                if (!TryRead(items + (uint)(idx * 4), 4, out slot)) { unreadable++; break; }
+                uint cell = ReadU32(slot, 0);
+                if (cell < 0x10000) { nullSlots++; continue; }
+
+                byte[] body;
+                if (!TryRead(cell, CellProbeBytes, out body)) { unreadable++; continue; }
+                if (!InModule(ReadU32(body, 0))) { failedVt++; continue; }
+
+                int x = (short)(body[CellXOffset] | (body[CellXOffset + 1] << 8));
+                int y = (short)(body[CellYOffset] | (body[CellYOffset + 1] << 8));
+                if (((y << 9) + x) != idx) { failedEq++; continue; }
+
+                passed++;
+                cells[idx] = body;
+                if (x < minX) { minX = x; }
+                if (x > maxX) { maxX = x; }
+                if (y < minY) { minY = y; }
+                if (y > maxY) { maxY = y; }
+            }
+
+            if (passed == 0)
+            {
+                Console.WriteLine("no cell passed the index equation -- structure mismatch, print nothing.");
+                return 5;
+            }
+
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "cells: passed {0} | null {1} | index-eq failed {2} | vtable failed {3} | unreadable {4}",
+                passed, nullSlots, failedEq, failedVt, unreadable));
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "cell coordinate range: X {0}..{1} ({2} cols)  Y {3}..{4} ({5} rows)",
+                minX, maxX, maxX - minX + 1, minY, maxY, maxY - minY + 1));
+            Console.WriteLine();
+
+            int nShroud = 0, nVisible = 0, nAnim = 0;
+            int fShroud = 0, fVisible = 0, fAnim = 0;
+            foreach (byte[] body in cells.Values)
+            {
+                int s = (sbyte)body[CellShroudOffset];
+                if (s == -2) { nShroud++; } else if (s == -1) { nVisible++; } else { nAnim++; }
+                int f = (sbyte)body[CellFogOffset];
+                if (f == -2) { fShroud++; } else if (f == -1) { fVisible++; } else { fAnim++; }
+            }
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "Shroudedness: black {0} | visible {1} | anim {2}",
+                nShroud, nVisible, nAnim));
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "Foggedness  : black {0} | visible {1} | anim {2}",
+                fShroud, fVisible, fAnim));
+            Console.WriteLine();
+            Console.WriteLine("legend:  # black   . visible   0-9/a-z anim frame   (blank = no cell)");
+            Console.WriteLine("         X -> right, Y -> down");
+            Console.WriteLine();
+
+            // ruler line so the user can eyeball coordinates
+            StringBuilder ruler = new StringBuilder("     ");
+            for (int x = 0; x <= maxX - minX; x++)
+            {
+                ruler.Append((x + minX) % 10 == 0 ? (char)('0' + ((x + minX) / 10) % 10) : ' ');
+            }
+            Console.WriteLine(ruler.ToString());
+
+            for (int y = minY; y <= maxY; y++)
+            {
+                StringBuilder line = new StringBuilder();
+                line.Append(y.ToString("D3", CultureInfo.InvariantCulture)).Append("  ");
+                for (int x = minX; x <= maxX; x++)
+                {
+                    byte[] body;
+                    if (!cells.TryGetValue((y << 9) + x, out body))
+                    {
+                        line.Append(' ');
+                        continue;
+                    }
+                    int s = (sbyte)body[CellShroudOffset];
+                    if (s == -2) { line.Append('#'); }
+                    else if (s == -1) { line.Append('.'); }
+                    else if (s >= 0 && s <= 9) { line.Append((char)('0' + s)); }
+                    else if (s >= 10 && s <= 35) { line.Append((char)('a' + s - 10)); }
+                    else { line.Append('*'); }
+                }
+                Console.WriteLine(line.ToString());
+            }
+            return 0;
         }
 
         /// <summary>One pointed-to object we are following.</summary>
