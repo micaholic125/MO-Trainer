@@ -91,7 +91,20 @@ def clusters(addrs, gap=64):
 
 
 def main():
-    files = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # 带值的选项，值本身不是文件名（曾经把 --exclude 的值当成快照文件名，报错了）
+    OPTS = ("--exclude", "--out", "--top")
+    files = []
+    skip = False
+    for a in sys.argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if a in OPTS:
+            skip = True
+            continue
+        if a.startswith("--"):
+            continue
+        files.append(a)
     if len(files) < 2:
         raise SystemExit(__doc__)
     out_path = "once.txt"
@@ -100,6 +113,17 @@ def main():
     top = 40
     if "--top" in sys.argv:
         top = int(sys.argv[sys.argv.index("--top") + 1])
+
+    # 2026-10-13：空闲实测发现，噪音的 98.5% 集中在游戏的**画面缓冲**
+    # 0x0B500000..0x0B850000（大块重绘、密度 0.96~1.00）。把这一段整个跳过，
+    # 「只变过一次」的噪音从 175 万直接掉到 2.6 万 —— 这才让信号有机会露头。
+    excl = []
+    if "--exclude" in sys.argv:
+        for spec in sys.argv[sys.argv.index("--exclude") + 1].split(","):
+            a, b = spec.split("-")
+            excl.append((int(a, 16), int(b, 16)))
+        print("excluding %d ranges: %s"
+              % (len(excl), ", ".join("0x%08X-0x%08X" % e for e in excl)))
 
     once = {}       # page -> bytearray of transition counts (capped at 3)
     when = {}       # page -> bytearray of "which gap" for the single transition
@@ -117,6 +141,8 @@ def main():
             hot = 0
             changed_bytes = 0
             for p in sorted(set(prev) | set(cur)):
+                if any(lo <= p < hi for lo, hi in excl):
+                    continue
                 a = prev.get(p, ZERO)
                 b = cur.get(p, ZERO)
                 if a == b:

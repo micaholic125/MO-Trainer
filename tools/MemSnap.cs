@@ -54,11 +54,18 @@ namespace MoTrainer.Tools
             {
                 Console.WriteLine("usage: MemSnap snap <outfile> [all]");
                 Console.WriteLine("       MemSnap info <snapfile>");
+                Console.WriteLine("       MemSnap probe <hexaddress>");
                 return 1;
             }
             if (string.Equals(args[0], "info", StringComparison.OrdinalIgnoreCase))
             {
                 return Info(args[1]);
+            }
+            // 诊断用：直接问活的进程"这个地址所在的内存页是什么属性"，
+            // 用来解释"为什么某个地址没进快照"。
+            if (string.Equals(args[0], "probe", StringComparison.OrdinalIgnoreCase))
+            {
+                return Probe(args[1]);
             }
             if (!string.Equals(args[0], "snap", StringComparison.OrdinalIgnoreCase))
             {
@@ -110,11 +117,15 @@ namespace MoTrainer.Tools
                 for (int i = 0; i < regions.Count; i++)
                 {
                     MemoryRegion region = regions[i];
-                    if (region.Size < (ulong)BlockSize) { continue; }
+                    // 2026-10-13 修正：原先是 `Size < BlockSize(64KB) 就整块跳过`，
+                    // 于是"小于 64KB 的区域"一个字节都进不了快照 ——
+                    // 结果把 `0x683D4C`（金钱那条链的静态根）漏掉了。
+                    // 现在只挡 1 页以下的碎片，并且**允许最后一块不足 64KB**。
+                    if (region.Size < 4096) { continue; }
                     if (!region.Readable) { continue; }
                     if (Win32Api.IsExecutableProtect(region.Protect)) { continue; }
 
-                    ulong blocks = region.Size / (ulong)BlockSize;
+                    ulong blocks = (region.Size + (ulong)BlockSize - 1) / (ulong)BlockSize;
                     if (blocks == 0) { continue; }
 
                     bw.Write((byte)1);
@@ -125,9 +136,13 @@ namespace MoTrainer.Tools
 
                     for (ulong b = 0; b < blocks; b++)
                     {
-                        ulong raw = region.Base + b * (ulong)BlockSize;
+                        ulong off = b * (ulong)BlockSize;
+                        ulong raw = region.Base + off;
                         if (raw > 0xFFFFFFFFul) { break; }
-                        byte[] data = io.ReadBytesQuiet((uint)raw, BlockSize);
+                        ulong remain = region.Size - off;
+                        int len = remain < (ulong)BlockSize ? (int)remain : BlockSize;
+                        if (len <= 0) { break; }
+                        byte[] data = io.ReadBytesQuiet((uint)raw, len);
                         if (data == null) { continue; }
                         if (IsAllZero(data)) { totalZeroBlocks++; continue; }
 
@@ -168,6 +183,48 @@ namespace MoTrainer.Tools
                 "done: {0}  {1} blocks  {2:0.0} MB  (skipped {3} zero blocks)  {4:0.0}s",
                 outPath, totalBlocks, totalBytes / 1048576.0, totalZeroBlocks,
                 (DateTime.UtcNow - started).TotalSeconds));
+            return 0;
+        }
+
+        /// <summary>问活的进程：这个地址所在的区域是什么属性？为什么没进快照？</summary>
+        private static int Probe(string hex)
+        {
+            uint addr;
+            string text = hex.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? hex.Substring(2) : hex;
+            if (!uint.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out addr))
+            {
+                Console.WriteLine("bad address: " + hex);
+                return 1;
+            }
+            ProcessAttach attach = new ProcessAttach();
+            if (!attach.TryAttach())
+            {
+                Console.WriteLine("attach failed: " + attach.Describe());
+                return 2;
+            }
+            MemoryIO io = new MemoryIO(attach);
+            MemoryRegion region = io.Describe((ulong)addr);
+            Console.WriteLine("address 0x" + addr.ToString("X8"));
+            Console.WriteLine("  region base   0x" + region.Base.ToString("X8"));
+            Console.WriteLine("  region size   0x" + region.Size.ToString("X") + "  (" + region.Size + " bytes)");
+            Console.WriteLine("  protect       0x" + region.Protect.ToString("X")
+                + "  writable=" + region.Writable + " readable=" + region.Readable
+                + " executable=" + Win32Api.IsExecutableProtect(region.Protect));
+            Console.WriteLine("  type          0x" + region.Type.ToString("X") + "  (" + region.TypeText + ")");
+            Console.WriteLine("  offset in region 0x" + (addr - region.Base).ToString("X"));
+            if (region.Size < 4096) { Console.WriteLine("  => 会被跳过：区域小于 1 页"); }
+            else if (!region.Readable) { Console.WriteLine("  => 会被跳过：不可读"); }
+            else if (Win32Api.IsExecutableProtect(region.Protect)) { Console.WriteLine("  => 会被跳过：可执行页"); }
+            else { Console.WriteLine("  => 应当会被收进快照（除非整块全零）"); }
+            byte[] probe = io.ReadBytesQuiet(addr, 16);
+            if (probe == null) { Console.WriteLine("  read 16 bytes: FAILED"); }
+            else
+            {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < probe.Length; i++) { sb.Append(probe[i].ToString("X2")); sb.Append(' '); }
+                Console.WriteLine("  read 16 bytes: " + sb.ToString());
+            }
+            attach.Dispose();
             return 0;
         }
 

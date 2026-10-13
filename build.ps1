@@ -7,17 +7,22 @@
       powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Test -RunTest
       powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Clean
       powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -NoKill
+      powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Check
 
     The built exe is locked while the trainer is running. Rather than emitting a
     second binary under a different name, this script closes the running instance
     and republishes to the same path. Pass -NoKill to refuse and fail instead.
+
+    -Check only answers one question: "is the exe on disk older than the code?"
+    Nothing is compiled and nothing is closed. Exit code 1 means stale.
 #>
 [CmdletBinding()]
 param(
     [switch]$Clean,
     [switch]$Test,
     [switch]$RunTest,
-    [switch]$NoKill
+    [switch]$NoKill,
+    [switch]$Check
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,6 +89,80 @@ $manifest   = Join-Path $srcDir 'app.manifest'
 $exeMain    = Join-Path $outDir 'MentalOmegaTrainer.exe'
 $exeTest    = Join-Path $outDir '_selftest.exe'
 
+# ---------------------------------------------------------------- staleness
+# Why this exists (2026-10-13): on 2026-10-12 the trainer was rebuilt, then a
+# source line was edited afterwards and nobody rebuilt. The exe on disk silently
+# lagged behind the code, and the only way to notice was to compare timestamps
+# by hand -- which relies on somebody remembering to do it. It will not always
+# be remembered, so the script now says it out loud by itself.
+#
+# Timestamps have coarse resolution, so a two-second grace period keeps a
+# just-finished build from being reported as stale against the file it read.
+$staleGrace = [TimeSpan]::FromSeconds(2)
+
+function Get-NewestInput([string[]]$Paths) {
+    $newest = $null
+    foreach ($p in $Paths) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $item = Get-Item -LiteralPath $p
+        if (($newest -eq $null) -or ($item.LastWriteTime -gt $newest.LastWriteTime)) { $newest = $item }
+    }
+    return $newest
+}
+
+# Returns $true when $Exe is older than the newest of $Inputs.
+function Test-Stale([string]$Exe, [string[]]$Inputs, [switch]$Quiet) {
+    if (-not (Test-Path -LiteralPath $Exe)) {
+        if (-not $Quiet) {
+            Write-Host ('stale    : {0} does not exist yet' -f (Split-Path -Leaf $Exe)) -ForegroundColor Yellow
+        }
+        return $true
+    }
+    $exeItem = Get-Item -LiteralPath $Exe
+    $newest = Get-NewestInput $Inputs
+    if ($newest -eq $null) { return $false }
+
+    if ($newest.LastWriteTime -gt $exeItem.LastWriteTime.Add($staleGrace)) {
+        Write-Host ('STALE    : {0} is OLDER than its source.' -f $exeItem.Name) -ForegroundColor Red
+        Write-Host ('           exe built at : {0}' -f $exeItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) -ForegroundColor Red
+        Write-Host ('           newest source: {0}' -f $newest.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) -ForegroundColor Red
+        Write-Host ('                          {0}' -f $newest.FullName) -ForegroundColor Red
+        Write-Host '           => this exe does NOT include the latest source changes.' -ForegroundColor Red
+        return $true
+    }
+    if (-not $Quiet) {
+        Write-Host ('up-to-date: {0} is newer than every source' -f $exeItem.Name) -ForegroundColor Green
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------- -Check only
+# No compiler needed, nothing is compiled, no running instance is touched.
+# Handy as a gate right before testing or before handing the exe to somebody:
+#   powershell -File build.ps1 -Check    (exit code 1 = stale)
+if ($Check) {
+    Write-Host '=== MO-Trainer stale check (nothing is built) ===' -ForegroundColor Cyan
+    $checkInputs = @()
+    if (Test-Path -LiteralPath $srcDir) {
+        $checkInputs += @(Get-ChildItem -LiteralPath $srcDir -Recurse -Filter '*.cs' |
+                          ForEach-Object { $_.FullName })
+        $checkInputs += @($manifest)
+    }
+    if ($checkInputs.Count -eq 0) {
+        Write-Host 'error    : no sources found to compare against.' -ForegroundColor Red
+        exit 2
+    }
+    $exitCode = 0
+    if (Test-Stale $exeMain $checkInputs) { $exitCode = 1 }
+    if (Test-Path -LiteralPath $exeTest) { [void](Test-Stale $exeTest $checkInputs) }
+    if ($exitCode -eq 0) {
+        Write-Host 'verdict  : OK' -ForegroundColor Green
+    } else {
+        Write-Host 'verdict  : STALE' -ForegroundColor Red
+    }
+    exit $exitCode
+}
+
 Write-Host '=== MO-Trainer build ===' -ForegroundColor Cyan
 Write-Host ("root     : {0}" -f $root)
 
@@ -143,6 +222,12 @@ if ($allSources.Count -eq 0) { throw 'no .cs source files found' }
 $mainSources = @($allSources | Where-Object { (Split-Path -Leaf $_) -ne 'SelfTest.cs' })
 Write-Host ("sources  : {0} files ({1} for main build)" -f $allSources.Count, $mainSources.Count)
 
+# What was on disk until now? A stale exe here means code was edited after the
+# last build and never rebuilt -- exactly the 2026-10-12 failure mode. Reporting
+# it before the rebuild turns "silently shipped old code" into a visible event.
+$buildInputs = $allSources + @($manifest)
+[void](Test-Stale $exeMain $buildInputs -Quiet)
+
 # /codepage:65001 is mandatory: our .cs files are UTF-8 and the in-box
 # compiler would otherwise fall back to the system ANSI code page and
 # corrupt every Chinese string literal.
@@ -180,6 +265,15 @@ if ($rc -ne 0 -or -not (Test-Path -LiteralPath $exeMain)) {
 } else {
     $size = (Get-Item -LiteralPath $exeMain).Length
     Write-Host ("main build ok: {0} bytes in {1} ms" -f $size, $sw.ElapsedMilliseconds) -ForegroundColor Green
+
+    # The exe we just produced must be newer than everything it was built from.
+    # If it is not, something is genuinely wrong (clock skew, or the compiler
+    # silently did nothing) and shipping it would repeat the same mistake.
+    if (Test-Stale $exeMain $buildInputs -Quiet) {
+        Write-Host 'ERROR    : the exe that was just built is STILL older than its sources.' -ForegroundColor Red
+        Write-Host '           the compiler probably did not actually run -- do not ship this.' -ForegroundColor Red
+        $failed = $true
+    }
 }
 
 # ---------------------------------------------------------------- selftest exe
