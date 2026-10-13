@@ -378,32 +378,20 @@ namespace MoTrainer.Cheats
                 return;
             }
 
-            uint target;
-            if (!_target.Memory.ReadUInt32(house + HarvestSession.ProducingPointerOffset, out target)
-                || target == 0)
+            // 2026-10-13 起这里看的是**房子上所有**的生产流水线，不再只盯着 +0x53BC 一条 ——
+            // 真机采样证明步兵 / 载具 / 防御挂在别的槽位上，只报一条会让玩家以为"工具没看见我在造"。
+            List<InstantBuildResult> lines = InstantBuild.Peek(
+                _target.Memory, house, _target.ModuleBase, _target.ModuleSize);
+
+            if (lines.Count == 0)
             {
                 feature.LastError = "现在没有东西在造";
                 return;
             }
 
-            uint typeTable;
-            if (!_target.Memory.ReadUInt32(target, out typeTable)
-                || typeTable < _target.ModuleBase
-                || typeTable >= _target.ModuleBase + _target.ModuleSize)
-            {
-                feature.LastError = "「正在造的东西」那个指针不像游戏对象（可能这一拍正好在换）";
-                return;
-            }
-
-            uint elapsed;
-            if (!_target.Memory.ReadUInt32(target + InstantBuild.ElapsedOffset, out elapsed))
-            {
-                feature.LastError = "读不到「已经造了多少拍」";
-                return;
-            }
-
-            feature.Address = target;
-            feature.LastSeenValue = elapsed;
+            InstantBuildResult first = lines[0];
+            feature.Address = first.ProducingAddress;
+            feature.LastSeenValue = first.ElapsedBefore;
             feature.LastError = "";
         }
 
@@ -425,37 +413,67 @@ namespace MoTrainer.Cheats
                 return;
             }
 
-            InstantBuildResult r = InstantBuild.Tick(
+            // 2026-10-13：房子上可能**同时挂着好几条**生产流水线（建筑 / 防御 / 步兵 / 载具 …），
+            // 所以这里一次推全部，而不是只推原来那一条。见 `InstantBuild` 类注释里的真机采样表。
+            List<InstantBuildResult> all = InstantBuild.TickAll(
                 _target.Memory, house, _target.ModuleBase, _target.ModuleSize);
 
-            feature.Address = r.ProducingAddress;
-            feature.LastSeenValue = r.Wrote ? r.ElapsedAfter : r.ElapsedBefore;
-            // Note 里既有"写不了"的原因，也有"现在没有东西在造"这类状态 —— 一律如实显示，不静默。
-            feature.LastError = r.Note;
-            if (r.Wrote) { feature.WriteCount++; }
+            int wrote = 0;
+            StringBuilder notes = new StringBuilder();
+            InstantBuildResult shown = null;
 
-            // **真的推了一把的时候必须留痕**。此前 `r.Note` 一为空就什么都不记，
-            // 于是"到底推没推"在导出的日志里完全没有痕迹（只有卡片上的写入次数），
-            // 用户说"感觉快了一点"也无从对证 —— 2026-10-12 复核那一次，是靠
-            // "已过拍数在 0.4 秒里从 0 跳到 51"反推才确认推过的。这种反推不该是常态。
-            if (r.Wrote)
+            for (int i = 0; i < all.Count; i++)
             {
-                Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
-                    "瞬间建造：已推进进度 —— {0} 拍 → {1} 拍（对象 0x{2:X8}｜还差 {3} 没付完）",
-                    r.ElapsedBefore, r.ElapsedAfter, r.ProducingAddress, r.Remaining));
+                InstantBuildResult r = all[i];
+                if (r.ProducingAddress != 0) { shown = r; }
+
+                if (r.Wrote)
+                {
+                    wrote++;
+                    feature.WriteCount++;
+
+                    // **真的推了一把的时候必须留痕**。此前 `r.Note` 一为空就什么都不记，
+                    // 于是"到底推没推"在导出的日志里完全没有痕迹（只有卡片上的写入次数），
+                    // 用户说"感觉快了一点"也无从对证 —— 2026-10-12 复核那一次，是靠
+                    // "已过拍数在 0.4 秒里从 0 跳到 51"反推才确认推过的。这种反推不该是常态。
+                    Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
+                        "瞬间建造：已推进进度 —— {0} 拍 → {1} 拍（对象 0x{2:X8}｜还差 {3} 没付完）",
+                        r.ElapsedBefore, r.ElapsedAfter, r.ProducingAddress, r.Remaining));
+                }
+
+                if (r.Note.Length > 0)
+                {
+                    if (notes.Length > 0) { notes.Append("；"); }
+                    notes.Append(r.Note);
+                }
             }
+
+            if (shown == null) { shown = all.Count > 0 ? all[0] : null; }
+            if (shown != null)
+            {
+                feature.Address = shown.ProducingAddress;
+                feature.LastSeenValue = shown.Wrote ? shown.ElapsedAfter : shown.ElapsedBefore;
+            }
+            else
+            {
+                feature.Address = 0;
+            }
+
+            // Note 里既有"写不了"的原因，也有"现在没有东西在造"这类状态 —— 一律如实显示，不静默。
+            // 推出了东西就不用报流水账；一条都没推成时才把原因摊开。
+            string summary = wrote > 0 ? "" : notes.ToString();
+            feature.LastError = summary;
 
             // **状态一变就写一行日志**（不按拍刷屏）。理由：真机上"为什么没效果"以前只出现在卡片上，
             // 事后查不到 —— 而本项目有明确规矩：能让程序自己写进日志的，就不要靠人去描述
             //（2026-10-11 用户报"防御工事 / 步兵 / 载具不能瞬间建造"时，日志里就什么都没有）。
-            if (r.Note != _instantBuildLastNote)
+            if (summary != _instantBuildLastNote)
             {
-                _instantBuildLastNote = r.Note;
-                if (r.Note.Length > 0)
+                _instantBuildLastNote = summary;
+                if (summary.Length > 0)
                 {
                     Logger.Info("Engine", string.Format(CultureInfo.InvariantCulture,
-                        "瞬间建造：{0}（对象 0x{1:X8}｜类别 0x{2:X8}｜已过拍数 {3}）",
-                        r.Note, r.ProducingAddress, r.TypeTable, r.ElapsedBefore));
+                        "瞬间建造：{0}（共看到 {1} 条流水线）", summary, all.Count));
                 }
             }
         }

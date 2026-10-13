@@ -6794,6 +6794,8 @@ namespace MoTrainer.Diagnostics
                 uint heap = (uint)heapBlock.ToInt64();
                 MemoryIO io = new MemoryIO(self);
 
+                InstantBuild.ResetWatching();   // 临时块的地址会被系统重用，先把上一个场景的观测清掉
+
                 uint producingClass = moduleBase + 0x3000;   // 合成世界里的"那一类"（真机上是 0x007E88D0）
                 uint otherClass = moduleBase + 0x4000;
                 uint house = heap + 0x1000;
@@ -6900,6 +6902,125 @@ namespace MoTrainer.Diagnostics
             catch (Exception ex)
             {
                 Check("瞬间建造", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (moduleBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, moduleBlock, IntPtr.Zero, MEM_RELEASE); }
+                if (heapBlock != IntPtr.Zero) { Win32Api.VirtualFreeEx(self.Handle, heapBlock, IntPtr.Zero, MEM_RELEASE); }
+                self.Dispose();
+            }
+
+            CheckInstantBuildMultiLine();
+        }
+
+        /// <summary>
+        /// 「瞬间建造」的一条流水线 → **好几条流水线**的回归（2026-10-13 新增）。
+        ///
+        /// 为什么要单独测：原来的实现只读 `房子 + 0x53BC` **一个**槽位，于是
+        /// 步兵 / 载具 / 防御（挂在别的槽位上）永远推不动 —— 而用户 2026-10-11 就报了这件事，
+        /// 当时归因到"它们不走这条流水线"，**归因错了**。真机采样（`tools\HousePeek.cs`）证明
+        /// 房子上同时挂着好几条**同一类别**的流水线，只是原来只推了其中一条。
+        ///
+        /// 这一组守三件事：**都看得见** / **都推得动** / **Peek 一个字节都不写**。
+        /// </summary>
+        private static void CheckInstantBuildMultiLine()
+        {
+            SelfHandle self = SelfHandle.Create();
+            if (self == null || !self.IsReady) { Check("瞬间建造多条流水线", false, "OpenProcess 失败"); return; }
+
+            IntPtr moduleBlock = IntPtr.Zero;
+            IntPtr heapBlock = IntPtr.Zero;
+            try
+            {
+                moduleBlock = AllocLowBlock(self.Handle);
+                heapBlock = AllocLowBlock(self.Handle);
+                if (moduleBlock == IntPtr.Zero || heapBlock == IntPtr.Zero)
+                {
+                    Check("瞬间建造多条流水线（测试内存块）", false, Win32Api.LastErrorMessage());
+                    return;
+                }
+                if (!IsLowAddress(moduleBlock) || !IsLowAddress(heapBlock))
+                {
+                    WarnItem("瞬间建造多条流水线", "测试块不在 4GB 以下，跳过");
+                    return;
+                }
+
+                InstantBuild.ResetWatching();
+
+                uint moduleBase = (uint)moduleBlock.ToInt64();
+                uint moduleSize = TestBlockSize;
+                uint heap = (uint)heapBlock.ToInt64();
+                MemoryIO io = new MemoryIO(self);
+
+                uint producingClass = moduleBase + 0x3000;
+                uint otherClass = moduleBase + 0x4000;
+                uint house = heap + 0x1000;
+
+                // 真机上观察到的两个槽位：+0x53B4 与 +0x53CC（+0x53BC 空着，模拟"这条线没在造"）
+                uint lineA = heap + 0x2000;
+                uint lineB = heap + 0x3000;
+                io.WriteUInt32(house + 0x53B4, lineA);
+                io.WriteUInt32(house + 0x53BC, 0);
+                io.WriteUInt32(house + 0x53CC, lineB);
+                io.WriteUInt32(lineA, producingClass);
+                io.WriteUInt32(lineB, producingClass);
+                io.WriteUInt32(lineA + InstantBuild.ElapsedOffset, 20);
+                io.WriteUInt32(lineA + InstantBuild.RemainingOffset, 1482);
+                io.WriteUInt32(lineB + InstantBuild.ElapsedOffset, 20);
+                io.WriteUInt32(lineB + InstantBuild.RemainingOffset, 1482);
+
+                // ---- Peek：只读，必须"看得见两条、且一个字节都不改" ----
+                List<InstantBuildResult> seen = InstantBuild.Peek(io, house, moduleBase, moduleSize, producingClass);
+                Check("瞬间建造：房子上挂着两条流水线时，**两条都要看得见**（原来只认 +0x53BC 一条）",
+                    seen.Count == 2, "看到 " + seen.Count + " 条");
+
+                uint peekA;
+                uint peekB;
+                io.ReadUInt32(lineA + InstantBuild.ElapsedOffset, out peekA);
+                io.ReadUInt32(lineB + InstantBuild.ElapsedOffset, out peekB);
+                Check("瞬间建造：关闭状态下的探测（Peek）**一个字节都不写**",
+                    peekA == 20 && peekB == 20, "两条线各自还是 " + peekA + " / " + peekB);
+
+                // ---- 同一拍里，两条都要被推进 ----
+                InstantBuild.TickAll(io, house, moduleBase, moduleSize, producingClass);   // 先量一拍
+                io.WriteUInt32(lineA + InstantBuild.ElapsedOffset, 21);
+                io.WriteUInt32(lineA + InstantBuild.RemainingOffset, 1445);
+                io.WriteUInt32(lineB + InstantBuild.ElapsedOffset, 21);
+                io.WriteUInt32(lineB + InstantBuild.RemainingOffset, 1445);
+
+                List<InstantBuildResult> pushed = InstantBuild.TickAll(io, house, moduleBase, moduleSize, producingClass);
+                int wrote = 0;
+                for (int i = 0; i < pushed.Count; i++) { if (pushed[i].Wrote) { wrote++; } }
+                Check("瞬间建造：两条流水线在**同一拍里都被推进**（不是只推第一条）",
+                    wrote == 2, "推进了 " + wrote + " 条（共看到 " + pushed.Count + " 条）");
+
+                uint doneA;
+                uint doneB;
+                io.ReadUInt32(lineA + InstantBuild.ElapsedOffset, out doneA);
+                io.ReadUInt32(lineB + InstantBuild.ElapsedOffset, out doneB);
+                Check("瞬间建造：两条流水线在内存里**都真的变了**（不是只印了个数）",
+                    doneA == 57 && doneB == 57, "内存现值 " + doneA + " / " + doneB);
+
+                // ---- 没验过的那一类不许顶掉验过的 ----
+                io.WriteUInt32(house + 0x53B4, 0);
+                io.WriteUInt32(house + 0x53CC, 0);
+                io.WriteUInt32(lineA, otherClass);       // 唯一的槽位指着一个没验过的类别
+                io.WriteUInt32(house + 0x53BC, lineA);
+                io.WriteUInt32(lineA + InstantBuild.ElapsedOffset, 20);
+                io.WriteUInt32(lineA + InstantBuild.RemainingOffset, 1482);
+                InstantBuild.ResetWatching();
+
+                List<InstantBuildResult> wrong = InstantBuild.TickAll(io, house, moduleBase, moduleSize, producingClass);
+                uint stillThere;
+                io.ReadUInt32(lineA + InstantBuild.ElapsedOffset, out stillThere);
+                Check("瞬间建造：唯一的槽位指着没验过的类别时，**说出理由、且一个字节都不写**",
+                    wrong.Count == 1 && !wrong[0].Wrote && stillThere == 20
+                        && wrong[0].Note.IndexOf("不是真机验过的那一类", StringComparison.Ordinal) >= 0,
+                    wrong.Count > 0 ? wrong[0].Note : "（没有结果）");
+            }
+            catch (Exception ex)
+            {
+                Check("瞬间建造多条流水线", false, ex.GetType().Name + ": " + ex.Message);
             }
             finally
             {
