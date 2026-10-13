@@ -107,6 +107,15 @@ def main():
     if "--top" in sys.argv:
         top = int(sys.argv[sys.argv.index("--top") + 1])
 
+    # --require-before 0xFF keeps only runs that overwrote a uniform block of that
+    # byte. "Unexplored" is stored as one repeated value, so a strip of map being
+    # revealed must show up as a uniform block of it being replaced. Without this,
+    # the report is swamped by zeroed memory being filled for the first time, which
+    # looks identical in every other respect.
+    require_before = None
+    if "--require-before" in sys.argv:
+        require_before = int(sys.argv[sys.argv.index("--require-before") + 1], 16)
+
     fh_a, mm_a, stamp_a, recs_a, regs_a = index_records(args[0])
     fh_b, mm_b, stamp_b, recs_b, regs_b = index_records(args[1])
     print("A: %s  regions=%d" % (stamp_a, len(regs_a)))
@@ -136,15 +145,81 @@ def main():
             # how uniform is the run? a real shroud flips one value to another
             same_before = all(a[off + k] == before for k in range(ln))
             same_after = all(b[off + k] == after for k in range(ln))
-            hits.append((ln, addr, before, after, same_before and same_after,
-                         a[off:off + min(ln, 8)].hex(), b[off:off + min(ln, 8)].hex()))
+            # Three grades, not one:
+            #   both  -- uniform before AND after (a straight swap of one value)
+            #   wipe  -- uniform BEFORE, mixed after: exactly what overwriting an
+            #            untouched "all unexplored" strip with real terrain looks like
+            #   other -- neither
+            if same_before and same_after:
+                grade = "both"
+            elif same_before:
+                grade = "wipe"
+            elif same_after:
+                grade = "fill"
+            else:
+                grade = "other"
+            # "spare": does the run still have a NEIGHBOUR holding the old value in
+            # snapshot B? A revealed strip of map is surrounded by map that is still
+            # unexplored, so the answer is yes. A block that was freshly allocated and
+            # then zeroed has no such survivor -- the whole allocation goes at once.
+            # This is what separates the two, which look identical otherwise.
+            spare = False
+            if off > 0 and b[off - 1] == before:
+                spare = True
+            if off + ln < len(b) and b[off + ln] == before:
+                spare = True
 
-    hits.sort(key=lambda h: -h[0])
+            hits.append((ln, addr, before, after, grade,
+                         a[off:off + min(ln, 8)].hex(), b[off:off + min(ln, 8)].hex(),
+                         spare))
+
+    # per-region histogram, so the handful of repainting surfaces can be named and
+    # set aside instead of drowning everything else
+    if "--by-region" in sys.argv:
+        byreg = {}
+        for ln, addr, before, after, flat, ba, bb, spare in hits:
+            base = None
+            for rbase in regmap:
+                if rbase <= addr < rbase + regmap[rbase][0]:
+                    base = rbase
+                    break
+            key = base if base is not None else addr
+            e = byreg.setdefault(key, [0, 0, 0])
+            e[0] += 1
+            e[1] += ln
+            if flat:
+                e[2] += 1
+        rows = sorted(byreg.items(), key=lambda kv: -kv[1][0])
+        print()
+        print("=== runs grouped by memory region (top 25) ===")
+        print("%-12s %-8s %-14s %-6s %s" % ("region", "runs", "run-bytes", "flat", "size / protect / type"))
+        for base, (n, tot, fl) in rows[:25]:
+            info = regmap.get(base)
+            desc = ("size=0x%X prot=0x%X type=0x%X" % (info[0], info[1], info[2])) if info else "(unknown)"
+            print("0x%08X   %-8d %-14d %-6d %s" % (base, n, tot, fl, desc))
+
+    if require_before is not None:
+        hits = [h for h in hits if h[2] == require_before]
+        print()
+        print("filtered to runs whose BEFORE value is 0x%02X: %d remain" % (require_before, len(hits)))
+
+    flat_hits = [h for h in hits if h[4] in ("both", "wipe") and h[7]]
+    rest = [h for h in hits if not (h[4] in ("both", "wipe") and h[7])]
+    flat_hits.sort(key=lambda h: -h[0])
+    rest.sort(key=lambda h: -h[0])
+    hits = flat_hits + rest
+
     print()
-    print("runs of >= %d consecutive changed bytes: %d" % (minimum, len(hits)))
+    print("runs of >= %d consecutive changed bytes: %d   (of which FLAT: %d)"
+          % (minimum, len(hits), len(flat_hits)))
+    print()
+    print("FLAT means every byte in the run held the SAME value before and the SAME")
+    print("value after -- which is what a revealed strip of a shroud table looks like.")
+    print("A repainted rendering surface is never flat, which is why this is the")
+    print("discriminator that finally makes the report readable.")
     print()
     print("%-7s %-10s %-22s %-6s %s" % ("len", "address", "before -> after", "flat", "first 8 bytes"))
-    for ln, addr, before, after, flat, ba, bb in hits[:top]:
+    for ln, addr, before, after, flat, ba, bb, spare in hits[:top]:
         base = None
         for rbase in regmap:
             if rbase <= addr < rbase + regmap[rbase][0]:
