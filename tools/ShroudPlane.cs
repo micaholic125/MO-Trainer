@@ -170,6 +170,11 @@ namespace MoTools
             {
                 return Show(ParseHex(args[1]), (int)ParseHex(args[2]), (int)ParseHex(args[3]));
             }
+            if (args.Length > 0 && args[0].ToLowerInvariant() == "cells")
+            {
+                int want = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 5;
+                return PrintCells(want);
+            }
             return Scan();
         }
 
@@ -322,6 +327,62 @@ namespace MoTools
                 Show(h.Base + (uint)h.Offset, h.Size, StrideFor(h.Size));
                 drawn++;
             }
+            return 0;
+        }
+
+        /// <summary>
+        /// Print the addresses of a few BLACK cells, so a debugger can be pointed
+        /// at "cell + 0x120" and asked who writes it.  The engine rewrites that
+        /// byte every frame (experiment #1, 2026-10-14), so the writing code is
+        /// reachable at any moment -- and that code must reference the per-house
+        /// book directly.  This is the one measurement no amount of shape-guessing
+        /// can replace.  Read-only.
+        /// </summary>
+        private static int PrintCells(int want)
+        {
+            int fe, ff, other;
+            Dictionary<int, byte> grid;
+            string note;
+            if (!ReadTruth(out fe, out ff, out other, out grid, out note))
+            {
+                Console.WriteLine("truth unavailable: " + note);
+                return 5;
+            }
+            Console.WriteLine(note);
+            Console.WriteLine("cell layer: black=" + fe + " visible=" + ff + " anim=" + other);
+            Console.WriteLine();
+            Console.WriteLine("MapClass = 0x" + MapClassInstance.ToString("X8")
+                + "   Cells.Items = (see HousePeek map)");
+
+            // Walk the slot array again, this time remembering where each cell lives.
+            byte[] head;
+            TryRead(MapClassInstance, 0x160, out head);
+            uint items = ReadU32(head, CellsItemsOffset);
+            int capacity = (int)ReadU32(head, CellsCapacityOffset);
+
+            int found = 0;
+            Console.WriteLine();
+            Console.WriteLine("=== BLACK cells to breakpoint (address to use = cell + 0x120) ===");
+            for (int idx = 0; idx < capacity && found < want; idx++)
+            {
+                byte[] slot;
+                if (!TryRead(items + (uint)(idx * 4), 4, out slot)) { break; }
+                uint cell = ReadU32(slot, 0);
+                if (cell < 0x10000) { continue; }
+                byte[] body;
+                if (!TryRead(cell, CellProbeBytes, out body)) { continue; }
+                if (!InModule(ReadU32(body, 0))) { continue; }
+                int x = (short)(body[CellXOffset] | (body[CellXOffset + 1] << 8));
+                int y = (short)(body[CellYOffset] | (body[CellYOffset + 1] << 8));
+                if (((y << 9) + x) != idx) { continue; }
+                if (body[CellShroudOffset] != BLACK) { continue; }
+                found++;
+                Console.WriteLine("  cell 0x" + cell.ToString("X8")
+                    + "   X=" + x + " Y=" + y
+                    + "   >>> breakpoint address: 0x" + (cell + 0x120).ToString("X8")
+                    + "   (now = 0x" + body[CellShroudOffset].ToString("X2") + ")");
+            }
+            if (found == 0) { Console.WriteLine("(no black cell found -- is the map fully explored?)"); }
             return 0;
         }
 
