@@ -109,17 +109,22 @@ namespace MoTrainer.Ui.Pages
             card.Dock = DockStyle.Fill;
             card.Margin = new Padding(0, 0, 0, 0);
 
-            string[] lines = new string[]
+            // 这一份说明**照 HotkeyTable 生成**，不手写 ——
+            // 手写的话就会出现"说明里写着 Ctrl+Alt+5、程序那边其实没接上"这种对不上的情况
+            //（2026-10-16 用户反馈的"瞬间建造热键没反应"正是这一类：说明有、注册有、处理没有）。
+            int hotkeyCount = HotkeyTable.All.Length;
+            string[] lines = new string[hotkeyCount + 3];
+            for (int i = 0; i < hotkeyCount; i++)
             {
-                HotkeyLine(CheatId.Money, "Ctrl + Alt + 1        金钱开关"),
-                HotkeyLine(CheatId.PowerOutput, "Ctrl + Alt + 2        电力开关"),
-                HotkeyLine(CheatId.SelectedInvincible, "Ctrl + Alt + 3        选中单位无敌开关"),
-                HotkeyLine(CheatId.KillEnemies, "Ctrl + Alt + 4        秒杀敌人开关"),
-                HotkeyLine(CheatId.InstantBuild, "Ctrl + Alt + 5        瞬间建造开关"),
-                "",
-                "提示：游戏若是独占全屏，Windows 可能把热键让给游戏窗口而收不到。",
-                "本工具不修改任何游戏文件，只读写游戏进程的内存。"
-            };
+                HotkeyDef def = HotkeyTable.All[i];
+                CheatFeature feature = _engine.Find(def.Feature);
+                string name = feature == null ? def.Feature.ToString() : feature.Name;
+                lines[i] = HotkeyLine(def.Feature, HotkeyTable.Describe(def, name));
+            }
+            lines[hotkeyCount] = "";
+            lines[hotkeyCount + 1] = "提示：游戏若是独占全屏，Windows 可能把热键让给游戏窗口而收不到。";
+            lines[hotkeyCount + 2] = "本工具不修改任何游戏文件，只读写游戏进程的内存。";
+
             card.Height = 34 + 8 + lines.Length * 20 + 14;
 
             int y = card.TitleHeight + 6;
@@ -127,12 +132,12 @@ namespace MoTrainer.Ui.Pages
             {
                 Label line = new Label();
                 line.AutoSize = true;
-                line.Font = i >= 5 ? Theme.Small : Theme.Body;
-                line.ForeColor = i >= 5 ? Theme.Text2 : Theme.Text1;
+                line.Font = i >= hotkeyCount ? Theme.Small : Theme.Body;
+                line.ForeColor = i >= hotkeyCount ? Theme.Text2 : Theme.Text1;
                 line.Text = lines[i];
                 line.Location = new Point(Theme.CardPadding + 6, y);
                 card.Controls.Add(line);
-                y += i >= 4 ? 18 : 20;
+                y += i >= hotkeyCount - 1 ? 18 : 20;
             }
             return card;
         }

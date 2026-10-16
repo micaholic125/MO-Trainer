@@ -172,6 +172,13 @@ namespace MoTrainer.Diagnostics
             // 写出去的一定原样还回来。
             CheckShroudProbe();
 
+            // [S5b] 全局热键：2026-10-16 用户真机反馈「瞬间建造热键按了没反应」之后补的一节。
+            // 当时 433 项断言里**没有一条**碰过热键 —— 所以"键注册了、按下去没人处理"
+            // 这种 bug 能一路全绿地活到真机上。热键是"人还在游戏里"时唯一的入口，
+            // 它坏了玩家只会以为工具坏了，必须自己盯着。
+            Section("20. 全局热键（[S5b] 注册与分发必须同一份名单）");
+            CheckHotkeys();
+
             Write("");
             Write("=================================================");
             Write(string.Format(CultureInfo.InvariantCulture,
@@ -2915,6 +2922,100 @@ namespace MoTrainer.Diagnostics
         private static void Section(string title)
         {
             Write("--- " + title + " ---");
+        }
+
+        /// <summary>
+        /// 全局热键（[S5b]）—— 2026-10-16 用户真机反馈"瞬间建造热键按了没反应"之后补的一节。
+        ///
+        /// 当时的成因（已核实）：注册名单上有 5 条，而处理按键的 `switch` 里只有 4 个分支，
+        /// 瞬间建造落进 `default: return;` 被**静默丢弃** —— 启动日志里照样写着
+        /// 「热键已注册：Ctrl+Alt+5」。而自检里**没有任何热键断言**，所以体检一路全绿。
+        ///
+        /// 现在注册与分发共用 `HotkeyTable` 这一份名单，"注册了却没人处理"在结构上不可能再发生；
+        /// 下面这几条盯的是"这张表本身别被改错"（少一条 / 两行调换 / 文案对不上）。
+        /// </summary>
+        private static void CheckHotkeys()
+        {
+            MoTrainer.Ui.HotkeyDef[] all = MoTrainer.Ui.HotkeyTable.All;
+
+            // ① 瞬间建造那一条必须在 —— 它就是当初漏掉的那条，也是本次 bug 的靶子。
+            bool hasInstantBuild = false;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].Feature == CheatId.InstantBuild) { hasInstantBuild = true; }
+            }
+            Check("热键表里有「瞬间建造」这一条", hasInstantBuild, "共 " + all.Length + " 条");
+
+            Check("热键表条数为 5（金钱 / 电力 / 无敌 / 秒杀 / 瞬间建造）",
+                all.Length == 5, "实际 " + all.Length + " 条");
+
+            // ② 编号与按键都不许重复：编号重复 = 后注册的顶掉先注册的；
+            //    按键重复 = RegisterHotKey 直接失败（日志里那条"可能被其它程序占用"就是这么来的）。
+            bool idUnique = true;
+            bool keyUnique = true;
+            for (int i = 0; i < all.Length; i++)
+            {
+                for (int j = i + 1; j < all.Length; j++)
+                {
+                    if (all[i].Id == all[j].Id) { idUnique = false; }
+                    if (all[i].Key == all[j].Key) { keyUnique = false; }
+                }
+            }
+            Check("热键编号互不重复", idUnique, "");
+            Check("热键按键互不重复", keyUnique, "");
+
+            // ③ **正对本次 bug 的断言**：注册名单上的每一个编号，都必须能在同一张表里
+            //    找回"同一条"（引用相等）—— 也就是"注册了就一定有人处理"。
+            int resolvable = 0;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (object.ReferenceEquals(MoTrainer.Ui.HotkeyTable.Find(all[i].Id), all[i]))
+                {
+                    resolvable++;
+                }
+            }
+            Check("注册名单上的每个热键都能被分发查到（注册 = 有人处理）",
+                resolvable == all.Length, resolvable + " / " + all.Length);
+
+            // ④ 编号与功能的对应关系：防止有人把两行调换（键没变、功能换了，玩家按下去开错功能）。
+            Check("Ctrl+Alt+1 指向「金钱」",
+                FeatureKeyOf(all, "1") == CheatNames.Key(CheatId.Money), FeatureKeyOf(all, "1"));
+            Check("Ctrl+Alt+2 指向「电力」",
+                FeatureKeyOf(all, "2") == CheatNames.Key(CheatId.PowerOutput), FeatureKeyOf(all, "2"));
+            Check("Ctrl+Alt+3 指向「选中单位无敌」",
+                FeatureKeyOf(all, "3") == CheatNames.Key(CheatId.SelectedInvincible), FeatureKeyOf(all, "3"));
+            Check("Ctrl+Alt+4 指向「秒杀敌人」",
+                FeatureKeyOf(all, "4") == CheatNames.Key(CheatId.KillEnemies), FeatureKeyOf(all, "4"));
+            Check("Ctrl+Alt+5 指向「瞬间建造」",
+                FeatureKeyOf(all, "5") == CheatNames.Key(CheatId.InstantBuild), FeatureKeyOf(all, "5"));
+
+            // ⑤ 不在表里的编号必须查出来是"空"，好让分发那边**留下一条日志**再忽略，
+            //    而不是像修之前那样静默 return（静默正是这个 bug 藏了 5 天的原因）。
+            Check("不在表里的热键编号查出来是空（分发处会记一条日志，不静默丢弃）",
+                MoTrainer.Ui.HotkeyTable.Find(0x7FFF) == null, "0x7FFF");
+
+            // ⑥ 界面上的热键说明是**照这张表拼出来**的（不再手写），所以拼法也得钉住：
+            //    少一个空格、少一个"开关"，界面上就对不齐了。
+            string line5 = "";
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].Label == "5")
+                {
+                    line5 = MoTrainer.Ui.HotkeyTable.Describe(all[i], "测试名");
+                }
+            }
+            Check("热键说明文案拼得对（Ctrl + Alt + 5        测试名开关）",
+                line5 == "Ctrl + Alt + 5        测试名开关", line5);
+        }
+
+        /// <summary>取某个按键尾号（"1"~"5"）对应的功能在配置里的稳定名字；没有这一条返回 "(无)"。</summary>
+        private static string FeatureKeyOf(MoTrainer.Ui.HotkeyDef[] all, string label)
+        {
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].Label == label) { return CheatNames.Key(all[i].Feature); }
+            }
+            return "(无)";
         }
 
         private static void Check(string name, bool ok, string detail)

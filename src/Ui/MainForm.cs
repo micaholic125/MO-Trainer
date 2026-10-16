@@ -21,12 +21,9 @@ namespace MoTrainer.Ui
         private const int NavTopOffset = 72;
         private const int NavItemHeight = 44;
 
-        // 热键 ID：只要在本窗口内唯一即可
-        private const int HotkeyMoney = 0xA001;
-        private const int HotkeyPower = 0xA002;
-        private const int HotkeyInvincible = 0xA003;
-        private const int HotkeyKillEnemies = 0xA004;
-        private const int HotkeyInstantBuild = 0xA005;
+        // 热键的 id / 按键 / 对应功能**只在 `HotkeyTable` 里定义一份**（2026-10-16 起）：
+        // 原先"注册"与"按下之后怎么办"是两处各写各的，漏了一处就变成"注册成功、按下没反应"。
+        // 见 `src\Ui\HotkeyTable.cs` 顶部注释。
 
         private readonly ProcessAttach _attach;
         private readonly MemoryIO _memory;
@@ -452,15 +449,18 @@ namespace MoTrainer.Ui
         // ============================================================ 热键
         private void RegisterHotkeys()
         {
-            RegisterHotkey(HotkeyMoney, CheatId.Money, Keys.D1, "1");
-            RegisterHotkey(HotkeyPower, CheatId.PowerOutput, Keys.D2, "2");
-            RegisterHotkey(HotkeyInvincible, CheatId.SelectedInvincible, Keys.D3, "3");
-            RegisterHotkey(HotkeyKillEnemies, CheatId.KillEnemies, Keys.D4, "4");
-            RegisterHotkey(HotkeyInstantBuild, CheatId.InstantBuild, Keys.D5, "5");
+            // 只认 HotkeyTable 这一份名单 —— 注册与分发共用它，"注册了却没人处理"不可能再发生。
+            for (int i = 0; i < HotkeyTable.All.Length; i++)
+            {
+                RegisterHotkey(HotkeyTable.All[i]);
+            }
         }
 
-        private void RegisterHotkey(int id, CheatId featureId, Keys key, string label)
+        private void RegisterHotkey(HotkeyDef def)
         {
+            int id = def.Id;
+            string label = def.Label;
+
             // 被**刻意停用**的功能不注册热键。
             //
             // 为什么：注册了也是白注册 —— 按下去只会被裁决拒掉，而玩家此刻人在游戏里、
@@ -470,7 +470,7 @@ namespace MoTrainer.Ui
             // 注意这里**只看"刻意停用"，不看"未校准"**：未校准 = "还没去校准"，
             // 玩家可能是启动程序之后才到校准页点一下的，而热键只在窗口创建时注册一次 ——
             // 若在这里一并跳过，就会变成"校准完了、热键却永远不生效"。
-            CheatFeature feature = _engine.Find(featureId);
+            CheatFeature feature = _engine.Find(def.Feature);
             if (feature != null && !feature.IsAvailable)
             {
                 Logger.Info("MainForm", "跳过 Ctrl+Alt+" + label + " 的热键注册（"
@@ -486,7 +486,7 @@ namespace MoTrainer.Ui
 
             // MOD_NOREPEAT：按住不放时只触发一次，否则会疯狂开关
             uint modifiers = Win32Api.MOD_CONTROL | Win32Api.MOD_ALT | Win32Api.MOD_NOREPEAT;
-            if (Win32Api.RegisterHotKey(Handle, id, modifiers, (uint)key))
+            if (Win32Api.RegisterHotKey(Handle, id, modifiers, (uint)def.Key))
             {
                 _registeredHotkeys.Add(id);
                 Logger.Info("MainForm", "热键已注册：Ctrl+Alt+" + label);
@@ -519,19 +519,20 @@ namespace MoTrainer.Ui
 
         private void OnHotkey(int id)
         {
-            CheatId target;
-            switch (id)
+            // 2026-10-16 修的 bug 就在这一行：原先这里是一张手写的 switch，
+            // 只列了 4 个功能，`HotkeyInstantBuild` 落进 `default: return;`
+            // —— 键注册成功、按下去却什么都不发生。现在改成查 HotkeyTable（与注册同一份）。
+            HotkeyDef def = HotkeyTable.Find(id);
+            if (def == null)
             {
-                case HotkeyMoney: target = CheatId.Money; break;
-                case HotkeyPower: target = CheatId.PowerOutput; break;
-                case HotkeyInvincible: target = CheatId.SelectedInvincible; break;
-                case HotkeyKillEnemies: target = CheatId.KillEnemies; break;
-                default: return;
+                // 找不到也**必须留下痕迹**，不许静默丢弃：静默正是这个 bug 藏了 5 天的原因。
+                Logger.Warn("MainForm", "收到一个不在热键表里的热键编号 " + id + "，已忽略");
+                return;
             }
 
-            CheatFeature feature = _engine.Find(target);
+            CheatFeature feature = _engine.Find(def.Feature);
             if (feature == null) { return; }
-            SetFeatureEnabled(target, !feature.Enabled, "热键");
+            SetFeatureEnabled(def.Feature, !feature.Enabled, "热键");
         }
 
         // ============================================================ 开关裁决
