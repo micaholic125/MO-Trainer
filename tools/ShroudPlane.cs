@@ -175,6 +175,11 @@ namespace MoTools
                 int want = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 5;
                 return PrintCells(want);
             }
+            if (args.Length > 0 && args[0].ToLowerInvariant() == "frontier")
+            {
+                int want = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 3;
+                return PrintFrontier(want);
+            }
             return Scan();
         }
 
@@ -383,6 +388,175 @@ namespace MoTools
                     + "   (now = 0x" + body[CellShroudOffset].ToString("X2") + ")");
             }
             if (found == 0) { Console.WriteLine("(no black cell found -- is the map fully explored?)"); }
+            return 0;
+        }
+
+        /// <summary>
+        /// Print BLACK cells that sit right at the edge of the explored area --
+        /// the cells a player is most likely to reveal next, and therefore the
+        /// cells whose Shroudedness the engine will actually write.
+        ///
+        /// Why this matters: the engine only writes the byte when its own
+        /// computed value DIFFERS from what is stored (that is why watching a
+        /// plain black cell produced no hits at all).  A frontier cell is the
+        /// one most likely to get revealed by simply walking outward.
+        ///
+        /// Also prints the direction in screen terms, using the isometric
+        /// mapping (screen x ~ X-Y, screen y ~ X+Y), so it can be described to
+        /// a player as "walk toward the upper-left of your base".
+        /// Read-only.
+        /// </summary>
+        private static int PrintFrontier(int want)
+        {
+            int fe, ff, other;
+            Dictionary<int, byte> grid;
+            string note;
+            if (!ReadTruth(out fe, out ff, out other, out grid, out note))
+            {
+                Console.WriteLine("truth unavailable: " + note);
+                return 5;
+            }
+            Console.WriteLine(note);
+            Console.WriteLine("black=" + fe + " visible=" + ff + " anim=" + other);
+
+            // Cell object addresses, so we can hand out "cell + 0x120".
+            Dictionary<int, uint> cellAt = new Dictionary<int, uint>();
+            byte[] head;
+            TryRead(MapClassInstance, 0x160, out head);
+            uint items = ReadU32(head, CellsItemsOffset);
+            int capacity = (int)ReadU32(head, CellsCapacityOffset);
+            for (int idx = 0; idx < capacity; idx++)
+            {
+                byte[] slot;
+                if (!TryRead(items + (uint)(idx * 4), 4, out slot)) { break; }
+                uint cell = ReadU32(slot, 0);
+                if (cell < 0x10000) { continue; }
+                byte[] body;
+                if (!TryRead(cell, CellProbeBytes, out body)) { continue; }
+                if (!InModule(ReadU32(body, 0))) { continue; }
+                int x = (short)(body[CellXOffset] | (body[CellXOffset + 1] << 8));
+                int y = (short)(body[CellYOffset] | (body[CellYOffset + 1] << 8));
+                if (((y << 9) + x) != idx) { continue; }
+                cellAt[idx] = cell;
+            }
+
+            // Visible centroid, in screen space, for the direction hints.
+            double sx = 0, sy = 0;
+            int vis = 0;
+            foreach (KeyValuePair<int, byte> kv in grid)
+            {
+                if (kv.Value != VISIBLE) { continue; }
+                int x = kv.Key & 511;
+                int y = kv.Key >> 9;
+                sx += (x - y);
+                sy += (x + y);
+                vis++;
+            }
+            if (vis == 0) { Console.WriteLine("no visible cells -- cannot compute the base position"); }
+            else { sx /= vis; sy /= vis; }
+
+            Console.WriteLine();
+            Console.WriteLine("=== FRONTIER BLACK CELLS (adjacent to the explored area) ===");
+            // NOTE: black and visible cells are separated by ANIMATION cells
+            // (Shroudedness 1..48) -- the fade-in/fade-out band.  So "black next
+            // to visible" finds nothing; the frontier must count animation cells
+            // as explored too.  (Learned the hard way, 2026-10-17.)
+            List<int> frontier = new List<int>();
+            List<int> animating = new List<int>();
+            foreach (KeyValuePair<int, byte> kv in grid)
+            {
+                byte v = kv.Value;
+                if (v != BLACK && v != VISIBLE && v != 0) { animating.Add(kv.Key); }
+                if (v != BLACK) { continue; }
+                int x = kv.Key & 511;
+                int y = kv.Key >> 9;
+                bool touch = false;
+                for (int dx = -1; dx <= 1 && !touch; dx++)
+                {
+                    for (int dy = -1; dy <= 1 && !touch; dy++)
+                    {
+                        if (dx == 0 && dy == 0) { continue; }
+                        int nx = x + dx, ny = y + dy;
+                        if (nx < 0 || ny < 0) { continue; }
+                        byte nv;
+                        if (grid.TryGetValue((ny << 9) + nx, out nv) && nv != BLACK) { touch = true; }
+                    }
+                }
+                if (touch) { frontier.Add(kv.Key); }
+            }
+            // Closest to the base centre first: most likely to be walked over.
+            frontier.Sort(delegate(int a, int b)
+            {
+                double da = Math.Abs((a & 511) - (a >> 9) - sx) + Math.Abs((a & 511) + (a >> 9) - sy);
+                double db = Math.Abs((b & 511) - (b >> 9) - sx) + Math.Abs((b & 511) + (b >> 9) - sy);
+                return da.CompareTo(db);
+            });
+            Console.WriteLine("frontier cells: " + frontier.Count
+                + "   animating cells: " + animating.Count);
+            Console.WriteLine();
+            Console.WriteLine("### BEST TARGET: cells that are animating RIGHT NOW");
+            Console.WriteLine("    (the engine is writing these every frame, so a write");
+            Console.WriteLine("     breakpoint on one of them fires immediately)");
+            for (int i = 0; i < animating.Count && i < 3; i++)
+            {
+                int idx = animating[i];
+                uint cell;
+                if (!cellAt.TryGetValue(idx, out cell)) { continue; }
+                Console.WriteLine("  cell 0x" + cell.ToString("X8") + "  X=" + (idx & 511)
+                    + " Y=" + (idx >> 9) + "  now=0x" + grid[idx].ToString("X2")
+                    + "   >>> breakpoint: 0x" + (cell + 0x120).ToString("X8"));
+            }
+            Console.WriteLine();
+            Console.WriteLine("### FRONTIER (walk outward from your base to reveal these)");
+            for (int i = 0; i < frontier.Count && i < want; i++)
+            {
+                int idx = frontier[i];
+                int x = idx & 511;
+                int y = idx >> 9;
+                uint cell;
+                if (!cellAt.TryGetValue(idx, out cell)) { continue; }
+                double ddx = (x - y) - sx;
+                double ddy = (x + y) - sy;
+                Console.WriteLine("  cell 0x" + cell.ToString("X8") + "  X=" + x + " Y=" + y
+                    + "   >>> breakpoint: 0x" + (cell + 0x120).ToString("X8")
+                    + string.Format(CultureInfo.InvariantCulture,
+                        "   screen offset from base: dx={0:F0} dy={1:F0}", ddx, ddy));
+            }
+
+            // Side effect for the debugger step: drop the best target into a file
+            // so a .bat can hand it straight to WriteSpy.exe -- no human copying
+            // hex around, and only one UAC prompt for the whole thing.
+            try
+            {
+                string pick = "";
+                for (int i = 0; i < animating.Count && pick.Length == 0; i++)
+                {
+                    uint c;
+                    if (cellAt.TryGetValue(animating[i], out c)) { pick = (c + 0x120).ToString("X8"); }
+                }
+                for (int i = 0; i < frontier.Count && pick.Length == 0; i++)
+                {
+                    uint c;
+                    if (cellAt.TryGetValue(frontier[i], out c)) { pick = (c + 0x120).ToString("X8"); }
+                }
+                if (pick.Length == 0 && cellAt.Count > 0)
+                {
+                    // Fully explored map: no frontier left, so any cell will do --
+                    // the fog byte (+0x121) still changes as units move.
+                    foreach (KeyValuePair<int, uint> kv in cellAt)
+                    {
+                        pick = (kv.Value + 0x120).ToString("X8");
+                        break;
+                    }
+                }
+                if (pick.Length > 0)
+                {
+                    System.IO.File.WriteAllText("spy-target.txt", pick);
+                    Console.WriteLine();
+                    Console.WriteLine("spy-target.txt = " + pick);
+                }
+            }
+            catch (Exception) { }
             return 0;
         }
 
