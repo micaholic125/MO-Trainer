@@ -6919,17 +6919,18 @@ namespace MoTrainer.Diagnostics
                 io.WriteUInt32(elapsedField, 21);
                 io.WriteUInt32(remainingField, 1445);
                 InstantBuildResult ok = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
-                // 还差 1445 / 37 ≈ 39 拍；21 + 39 − 3 = 57 —— 这就是"推到这儿就停"
-                Check("瞬间建造：按量出来的拍数往前推，并**留 3 拍余量**（21 → 57）",
+                // 还差 1445 / (37+1) = 38 拍；21 + 38 − 3 = 56 —— 这就是"推到这儿就停"
+                //（除数加 1 是 2026-10-18 的修正，见 InstantBuild.TickOne 里的注释）
+                Check("瞬间建造：按量出来的拍数往前推，并**留 3 拍余量**（21 → 56）",
                     ok.Ok && ok.Wrote && ok.ProducingAddress == producing
-                        && ok.ElapsedAfter == 57,
+                        && ok.ElapsedAfter == 56,
                     "写前 " + ok.ElapsedBefore + " → 写后 " + ok.ElapsedAfter
                         + "（还差 " + ok.Remaining + "，这一拍扣了 37）");
 
                 uint nowElapsed;
                 io.ReadUInt32(elapsedField, out nowElapsed);
                 Check("瞬间建造：内存里确认真的写进去了（不是只印了个数）",
-                    nowElapsed == 57, "内存现值 " + nowElapsed);
+                    nowElapsed == 56, "内存现值 " + nowElapsed);
                 io.WriteUInt32(elapsedField, 20);          // 复位，后面几条用得到
 
                 // ---- 拒绝路径：每一条都要"不写 + 说得出为什么" ----
@@ -6999,6 +7000,33 @@ namespace MoTrainer.Diagnostics
                     pushed.Wrote && afterPush + InstantBuild.ReserveTicks <= 21 + 1445 / 37,
                     "推到 " + afterPush + "，估算总拍数 " + (21 + 1445 / 37)
                         + "（余量" + InstantBuild.ReserveTicks + " 拍）");
+
+                // ---- 2026-10-18 新增：**廉价单位（每拍只扣 1 块）绝不能被推过终点** ----
+                //
+                // 真机现象（用户 2026-10-18 实测）：造价低于约 400 的单位 —— 美国大兵 / 军犬 /
+                // 工程师 / 闸门(250) / 冷冻地雷(300) / 动力涡轮(200) —— **全都造不出来**：
+                // 读条满、单位不出厂、整条队列卡死；而造价 450 以上（飞行兵 / 机枪碉堡 / 海豹）正常。
+                //
+                // 根因：每拍扣款 p 正比于造价，而"还差的钱 ÷ p"这一步取整的误差随 p 变小而放大 ——
+                // p=1 时能多算近一倍，于是把进度推过终点（详见 InstantBuild.TickOne 里的注释）。
+                // 真机日志（10-15）里 `1 拍 → 97 拍｜还差 99`（每拍只扣 1 块）就是这条现场。
+                //
+                // 这条用合成场景复现最极端的一档：造价 100、每拍只扣 1 块、总共 54 拍。
+                //   老公式：2 + 98/1 − 3 = 97 拍  → **远超 54，推过终点**（改坏验证就靠这条转红）
+                //   新公式：2 + 98/2 − 3 = 48 拍  → 留在终点之前
+                InstantBuild.ResetWatching();
+                io.WriteUInt32(elapsedField, 1);
+                io.WriteUInt32(remainingField, 99);      // 造价 100，第一拍只扣了 1 块
+                InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);   // 先量一拍
+                io.WriteUInt32(elapsedField, 2);
+                io.WriteUInt32(remainingField, 98);      // 游戏自己走了一拍：还是只扣 1 块
+                InstantBuildResult cheap = InstantBuild.Tick(io, house, moduleBase, moduleSize, producingClass);
+
+                const uint cheapTotalTicks = 54;         // 这个合成世界里这东西总共 54 拍
+                Check("瞬间建造：**每拍只扣 1 块的廉价单位也绝不被推过终点**（造价越低越容易推过头）",
+                    cheap.Wrote && cheap.ElapsedAfter < cheapTotalTicks,
+                    "推到 " + cheap.ElapsedAfter + " 拍，这东西总共 " + cheapTotalTicks
+                        + " 拍（每拍只扣 1 块）");
             }
             catch (Exception ex)
             {
@@ -7100,7 +7128,7 @@ namespace MoTrainer.Diagnostics
                 io.ReadUInt32(lineA + InstantBuild.ElapsedOffset, out doneA);
                 io.ReadUInt32(lineB + InstantBuild.ElapsedOffset, out doneB);
                 Check("瞬间建造：两条流水线在内存里**都真的变了**（不是只印了个数）",
-                    doneA == 57 && doneB == 57, "内存现值 " + doneA + " / " + doneB);
+                    doneA == 56 && doneB == 56, "内存现值 " + doneA + " / " + doneB);
 
                 // ---- 没验过的那一类不许顶掉验过的 ----
                 io.WriteUInt32(house + 0x53B4, 0);
