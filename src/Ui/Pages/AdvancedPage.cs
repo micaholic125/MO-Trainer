@@ -78,7 +78,6 @@ namespace MoTrainer.Ui.Pages
         private readonly Button _shroudButton;
         private readonly Button _powerProbeButton;
         private readonly Button _houseProbeButton;
-        private readonly Button _shroudProbeButton;
         private readonly Button _powerScoutButton;
         private readonly Button _harvestButton;
         private readonly Label _harvestStatus;
@@ -86,11 +85,24 @@ namespace MoTrainer.Ui.Pages
         private HarvestSession _harvest;
         private readonly TextBox _output;
 
-        public AdvancedPage(ICalibrationTarget target, CalibrationProfile profile, ProfileStore store)
+        /// <summary>
+        /// 是否显示**开发期调试按钮**（电力试探 / 电力侦查 / 房子试探 / 全图视野 /
+        /// 开始采集 / 黑幕相关）。交付版默认 false，只有加命令行 `--dev` 启动才显示。
+        ///
+        /// 为什么（2026-10-23，S8 交付整理）：这些按钮是给"找地址"用的，
+        /// 其中三个会**真的往游戏内存里写试探值**。对不懂代码的玩家来说，
+        /// 它们只有风险没有收益；而 S8 的要求是"点哪个按钮 → 看到什么"能讲清楚。
+        /// 工具本身仍保留在源码里，将来继续排查时用 `--dev` 打开即可。
+        /// </summary>
+        private readonly bool _developerMode;
+
+        public AdvancedPage(ICalibrationTarget target, CalibrationProfile profile, ProfileStore store,
+            bool developerMode)
         {
             _target = target;
             _profile = profile == null ? new CalibrationProfile() : profile;
             _store = store;
+            _developerMode = developerMode;
             _selection = target == null ? null : new SelectionResolver(target);
 
             // 把模块区间交给「单位校准」的探测逻辑，让它多一条硬判定：
@@ -122,7 +134,7 @@ namespace MoTrainer.Ui.Pages
             _subtitle.Font = Theme.Body;
             // 副标题刻意短：页面高度只有 484 像素（窗口 660 高时），文案一长就把内容顶出竖向滚动条，
             // 而竖向条会连锁引出横向条（见 `RelayoutAll` 的注释）。
-            _subtitle.Text = "秒杀 / 瞬间建造 / 全图视野 —— 本页只读不写。";
+            _subtitle.Text = "秒杀 / 瞬间建造的辅助工具 —— 正常游玩用不到。";
             Controls.Add(_subtitle);
 
             // 第一组：名单与秒杀（四个按钮挨着放，提示文字单独占一行在它们下面）
@@ -169,25 +181,25 @@ namespace MoTrainer.Ui.Pages
             // 对比前后就能把它定位出来，再分片清零。
             _shroudButton = UiFactory.MakePrimaryButton("全图视野（点两次）", 168);
             _shroudButton.Click += OnShroudClick;
-            Controls.Add(_shroudButton);
+            if (_developerMode) { Controls.Add(_shroudButton); }
 
             _harvestButton = UiFactory.MakePrimaryButton("开始采集（3 分钟）", 180);
             _harvestButton.Click += OnHarvestClick;
-            Controls.Add(_harvestButton);
+            if (_developerMode) { Controls.Add(_harvestButton); }
 
             // 「电力试探」（2026-10-09 新增，`[S4-3]` B 方案）：**唯一一个会往游戏里写试探值**的按钮，
             // 所以做成"点两次"（与「全图视野」同一套路）：第 1 次只给说明与警告，第 2 次才真试。
             // 试探值只存在约 4 秒，随后**无条件还原**（见 `PowerProbe`）。
             _powerProbeButton = UiFactory.MakeButton("电力试探（点两次）", 168);
             _powerProbeButton.Click += OnPowerProbeClick;
-            Controls.Add(_powerProbeButton);
+            if (_developerMode) { Controls.Add(_powerProbeButton); }
 
             // 「电力侦查」：**纯只读**地把选中那座建筑"摊开看一遍"——找它指向的类型对象与像电力读数的字段。
             // 为什么需要：`+0xD0` 那个候选已被真机试探否掉（写 5000，界面电力读数纹丝不动 260→260→260），
             // 而真正的来源最可能在**建筑类型对象**里，类型对象整局不变、采集报告里永远看不到它。
             _powerScoutButton = UiFactory.MakeButton("电力侦查（只读）", 168);
             _powerScoutButton.Click += OnPowerScoutClick;
-            Controls.Add(_powerScoutButton);
+            if (_developerMode) { Controls.Add(_powerScoutButton); }
 
             // 「房子字段试探」（2026-10-10 新增，`[S6-2]` 用）：全项目**第二个**会往游戏里写试探值的按钮。
             // 为什么需要：追了两轮采集，"进度字段"的形状判据全用遍也没找到 —— 数据反而指出
@@ -196,40 +208,35 @@ namespace MoTrainer.Ui.Pages
             // 目标写在一行配置里（`config\house-probe.txt`），并且**点两次**才真写（与电力试探同一套路）。
             _houseProbeButton = UiFactory.MakeButton("房子试探（点两次）", 168);
             _houseProbeButton.Click += OnHouseProbeClick;
-            Controls.Add(_houseProbeButton);
+            if (_developerMode) { Controls.Add(_houseProbeButton); }
 
-            // 「黑幕试探」（2026-10-12 新增，`[S6-3]` 全图视野用）：全项目**第三个**会往游戏里写试探值的按钮。
-            // 为什么需要：「采集报告『七』」给出的候选只是"**像**黑幕"，不是"**是**黑幕" ——
-            // 唯一可靠的判定是往那一小片写 0、看游戏画面上的黑幕是否真的散开一块，然后立刻还原。
-            // 目标写在一行配置里（`config\shroud-probe.txt`），同样**点两次**才真写；
-            // 按住期间反复写（防"游戏自己把黑幕画回来"），收尾无条件还原 + 回读确认（见 `ShroudProbe`）。
-            _shroudProbeButton = UiFactory.MakeButton("黑幕试探（点两次）", 168);
-            _shroudProbeButton.Click += OnShroudProbeClick;
-            Controls.Add(_shroudProbeButton);
+            // 「黑幕试探」（2026-10-12 新增，[S6-3] 全图视野用）已于 2026-10-23 从界面移除：
+            // 用户决定不做联机模式，且全图视野的定位始终没有成功，交付版不提供该功能。
+            // 保留源码里的 ShroudProbe 与其自检断言，供将来继续排查；但不再给玩家一个
+            // "点了会往游戏里写 0"的入口 —— 对不懂代码的玩家来说，这种按钮只有风险没有收益。
 
             _harvestStatus = MakeHintLabel();
             _harvestStatus.Text = "采集期间你只需要在游戏里正常玩：选几个单位、造点东西、让单位挨点打。程序自己记录。";
-            Controls.Add(_harvestStatus);
+            if (_developerMode) { Controls.Add(_harvestStatus); }
 
             // 每秒刷新一次状态文字。用界面线程的 Timer，避免后台线程碰控件。
-            _harvestTimer = new Timer();
-            _harvestTimer.Interval = 1000;
-            _harvestTimer.Tick += OnHarvestTick;
+            // 定时器只在开发者模式下创建：玩家版没有对应按钮，不该在后台空转。
+            if (_developerMode)
+            {
+                _harvestTimer = new Timer();
+                _harvestTimer.Interval = 1000;
+                _harvestTimer.Tick += OnHarvestTick;
 
-            // 电力试探的收尾轮询（试探在后台线程跑约 4 秒；这里每 400ms 看一次结果好了没有）。
-            _powerProbeTimer = new Timer();
-            _powerProbeTimer.Interval = 400;
-            _powerProbeTimer.Tick += OnPowerProbeTick;
+                // 电力试探的收尾轮询（试探在后台线程跑约 4 秒；这里每 400ms 看一次结果好了没有）。
+                _powerProbeTimer = new Timer();
+                _powerProbeTimer.Interval = 400;
+                _powerProbeTimer.Tick += OnPowerProbeTick;
 
-            // 房子试探的收尾轮询（后台线程里写值、盯 3 秒、还原，一共约 3 秒）。
-            _houseProbeTimer = new Timer();
-            _houseProbeTimer.Interval = 400;
-            _houseProbeTimer.Tick += OnHouseProbeTick;
-
-            // 黑幕试探的收尾轮询（后台线程里按住约 3.5 秒、还原、回读确认）。
-            _shroudProbeTimer = new Timer();
-            _shroudProbeTimer.Interval = 400;
-            _shroudProbeTimer.Tick += OnShroudProbeTick;
+                // 房子试探的收尾轮询（后台线程里写值、盯 3 秒、还原，一共约 3 秒）。
+                _houseProbeTimer = new Timer();
+                _houseProbeTimer.Interval = 400;
+                _houseProbeTimer.Tick += OnHouseProbeTick;
+            }
 
             _output = new TextBox();
             _output.Multiline = true;
@@ -313,13 +320,19 @@ namespace MoTrainer.Ui.Pages
                 left, rightLimit) + 6;
             y = LayoutHint(_hintTop, y, rightLimit - left) + 14;
 
-            // 注意：**新加的按钮必须同时加进这一行**，否则它会停在默认位置、
-            // 压住标题 —— 自检里那条"四档宽度下控件互不重叠"当场就抓到过（2026-10-12 加黑幕试探时）。
-            y = LayoutButtonRow(y,
-                new Control[] { _shroudButton, _harvestButton, _powerProbeButton, _powerScoutButton,
-                    _houseProbeButton, _shroudProbeButton },
-                left, rightLimit) + 6;
-            y = LayoutHint(_harvestStatus, y, rightLimit - left) + 14;
+            // 第二组（开发期工具）：只在 `--dev` 模式下存在。
+            // 玩家版不显示这些按钮 —— 其中三个会真的往游戏内存写试探值，
+            // 对"不会看日志、不会判断结果"的玩家只有风险没有收益。
+            if (_developerMode)
+            {
+                // 注意：**新加的按钮必须同时加进这一行**，否则它会停在默认位置、
+                // 压住标题 —— 自检里那条"四档宽度下控件互不重叠"当场就抓到过（2026-10-12 加黑幕试探时）。
+                y = LayoutButtonRow(y,
+                    new Control[] { _shroudButton, _harvestButton, _powerProbeButton, _powerScoutButton,
+                        _houseProbeButton },
+                    left, rightLimit) + 6;
+                y = LayoutHint(_harvestStatus, y, rightLimit - left) + 14;
+            }
 
             int boxHeight = ClientSize.Height - y - 20;
             // 空间不够时**不硬撑**：从前写死 120 的下限，内容一高就把页面顶出竖向滚动条，
@@ -1589,12 +1602,6 @@ namespace MoTrainer.Ui.Pages
         private readonly Timer _houseProbeTimer;
         private HouseProbeSpec _houseProbePending;      // 第 1 次点击解析出的目标，等第 2 次确认才真写
 
-        // ---- 黑幕试探（[S6-3] 全图视野，2026-10-12）----
-        private System.Threading.Thread _shroudProbeThread;
-        private ShroudProbeResult _shroudProbeResult;
-        private readonly Timer _shroudProbeTimer;
-        private ShroudProbeSpec _shroudProbePending;    // 第 1 次点击（只读侦查）解析出的目标
-
         /// <summary>
         /// 「电力试探」（`[S4-3]` B 方案）：判定建筑对象上的候选字段是不是**电力产出的来源**。
         ///
@@ -1742,122 +1749,13 @@ namespace MoTrainer.Ui.Pages
             return System.IO.Path.Combine(System.IO.Path.Combine(baseDirectory, "config"), "house-probe.txt");
         }
 
-        // ============================================================ 黑幕试探（[S6-3] 全图视野）
-
-        /// <summary>
-        /// 「黑幕试探」：判定采集报告「七」给出的候选**是不是真的黑幕数据**。
-        ///
-        /// 做法与「房子试探」同一套路：**点两次才真写**（第一次只读侦查：念出地址、那一小片的构成、
-        /// 能不能写；第二次才动），收尾**无条件还原 + 回读逐字节确认**。
-        /// 不同之处：按住期间**每 200 毫秒重写一次** —— "游戏会不会把黑幕自己画回来"正是待验证的事之一，
-        /// 只写一次的话，那种情况在屏幕上看起来和"地址不对"一模一样，白白浪费一次机会。
-        ///
-        /// 判定要靠**人看屏幕**：那 3.5 秒里，地图上有没有一小块黑幕散开？程序替不了这一步。
-        /// </summary>
-        private void OnShroudProbeClick(object sender, EventArgs e)
-        {
-            StringBuilder text = new StringBuilder();
-            text.AppendLine("=== 黑幕试探（往一小片内存写 0，约 3.5 秒后自动还原）===");
-            text.AppendLine();
-
-            if (_shroudProbeThread != null && _shroudProbeThread.IsAlive)
-            {
-                text.AppendLine("上一次试探还在进行（约 3.5 秒），请稍候。");
-                SetOutput(text.ToString());
-                return;
-            }
-
-            if (_shroudProbePending == null)
-            {
-                ShroudProbeSpec spec;
-                string error;
-                if (!ShroudProbe.TryLoadTarget(ConfigFolderPath(), out spec, out error))
-                {
-                    text.AppendLine("还不能试探：" + error);
-                    text.AppendLine();
-                    text.AppendLine("目标来自**采集报告「七、找黑幕数据」**：把排在最前面的候选地址");
-                    text.AppendLine("（以及你想试多长，建议 4096）写成一行，例如：`0x29B00000 4096`。");
-                    SetOutput(text.ToString());
-                    return;
-                }
-
-                _shroudProbePending = spec;
-                text.AppendLine("**第一次点击只做说明，不会写任何东西。** 确认下面这些之后，再点一次才真写：");
-                text.AppendLine();
-                text.AppendLine("  准备写：" + spec.Describe());
-                if (_target != null && _target.IsReady)
-                {
-                    text.Append(ShroudProbe.Scout(_target.Memory, spec).Describe());
-                }
-                else
-                {
-                    text.AppendLine("  （游戏没连上，读不到现场情况 —— 先启动游戏、确认状态条显示「已连接」）");
-                }
-                text.AppendLine();
-                text.AppendLine("  怎么用：**先在游戏里把地图上那块地方移到画面里**（黑幕还在的位置），再点第二次；");
-                text.AppendLine("  然后盯住画面看那 3.5 秒：**有没有一小块黑幕散开了？**");
-                text.AppendLine("  写的是**数据**（不是代码）：不注入、不改游戏文件；地址不对时程序会拒绝写并说明原因。");
-                text.AppendLine("  **试探期间请不要关闭程序。**");
-                SetOutput(text.ToString());
-                return;
-            }
-
-            ShroudProbeSpec pending = _shroudProbePending;
-            _shroudProbePending = null;
-
-            if (_target == null || !_target.IsReady)
-            {
-                text.AppendLine("游戏未连接 —— 先启动游戏、确认状态条显示「已连接」。");
-                SetOutput(text.ToString());
-                return;
-            }
-
-            MemoryIO memory = _target.Memory;
-            text.AppendLine("正在写…（约 3.5 秒）**现在看游戏画面：那一小块黑幕有没有散开？**");
-            SetOutput(text.ToString());
-
-            _shroudProbeResult = null;
-            _shroudProbeButton.Enabled = false;
-            _shroudProbeThread = new System.Threading.Thread(delegate()
-            {
-                ShroudProbeResult probe;
-                try { probe = ShroudProbe.Run(memory, pending); }
-                catch (Exception ex)
-                {
-                    probe = new ShroudProbeResult();
-                    probe.Note = ex.GetType().Name + ": " + ex.Message;
-                }
-                _shroudProbeResult = probe;     // 引用赋值：界面线程读到的要么是 null 要么是完整结果
-            });
-            _shroudProbeThread.IsBackground = true;
-            _shroudProbeThread.Start();
-            _shroudProbeTimer.Start();
-        }
-
-        private void OnShroudProbeTick(object sender, EventArgs e)
-        {
-            if (_shroudProbeResult == null) { return; }
-            _shroudProbeTimer.Stop();
-            _shroudProbeButton.Enabled = true;
-
-            ShroudProbeResult probe = _shroudProbeResult;
-            _shroudProbeResult = null;
-
-            StringBuilder text = new StringBuilder();
-            text.AppendLine("=== 黑幕试探结果 ===");
-            text.AppendLine();
-            text.Append(probe.Describe());
-            text.AppendLine();
-            text.AppendLine("请告诉我：**刚才那 3.5 秒里，地图上有没有一小块黑幕散开？**");
-            text.AppendLine("（散开了 = 这个地址就是黑幕；没反应 = 换个候选再试，否定一个候选同样是结论。）");
-            SetOutput(text.ToString());
-
-            string[] lines = text.ToString().Split('\n');
-            for (int i = 0; i < lines.Length; i++)
-            {
-                Logger.Info("Advanced", "黑幕试探：" + lines[i].TrimEnd('\r'));
-            }
-        }
+        // ============================================================ 黑幕试探（已从界面移除）
+        //
+        // 2026-10-23：用户决定不做联机模式，且全图视野（S6-3）始终没有定位成功，
+        // 交付版不提供该功能。此处原有一个「黑幕试探（点两次）」按钮：会往候选地址写 0、
+        // 盯 3.5 秒看游戏画面上的黑幕是否散开，然后还原。它只服务于开发期的地址排查，
+        // 对玩家没有用处，且属于"会真实写游戏内存"的高风险入口，故从交付界面移除。
+        // 底层实现 `Calibration\ShroudProbe.cs` 与其自检断言保留，将来若重启 S6-3 可直接复用。
 
         /// <summary>`<exe目录>\config` —— 试探目标都写在那一行配置里（换目标不用重编译）。</summary>
         private string ConfigFolderPath()

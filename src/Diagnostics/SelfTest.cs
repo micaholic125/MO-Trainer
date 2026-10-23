@@ -1051,7 +1051,7 @@ namespace MoTrainer.Diagnostics
                 Check("未校准项被正确判定",
                     !loaded.HasSelection && !loaded.HasTechnoArray
                     && loaded.CalibratedItemCount() == 1
-                    && loaded.MissingItems().Count == 4,
+                    && loaded.MissingItems().Count == 3,
                     "已校准 " + loaded.CalibratedItemCount() + " 项，待校准 " + loaded.MissingItems().Count + " 项");
 
                 string reportPath = store.WriteReport(loaded, null, "自检样本环境", new string[] { "自检样本明细行" });
@@ -1074,7 +1074,7 @@ namespace MoTrainer.Diagnostics
 
                 CalibrationProfile blank = new CalibrationProfile();
                 Check("空配置的未校准列表完整",
-                    !blank.IsCalibratedAtAll && blank.MissingItems().Count == 5, blank.Describe());
+                    !blank.IsCalibratedAtAll && blank.MissingItems().Count == 4, blank.Describe());
             }
             catch (Exception ex)
             {
@@ -3671,6 +3671,7 @@ namespace MoTrainer.Diagnostics
 
             TechnoScene scene = null;
             AdvancedPage page = null;
+            AdvancedPage playerPage = null;
             try
             {
                 scene = TechnoScene.Create(self);
@@ -3685,7 +3686,7 @@ namespace MoTrainer.Diagnostics
                 SyntheticTarget target = new SyntheticTarget(
                     io, scene.ModuleBase, TechnoScene.FakeModuleSize, heap, pointer);
 
-                page = new AdvancedPage(target, new CalibrationProfile(), new ProfileStore(null));
+                page = new AdvancedPage(target, new CalibrationProfile(), new ProfileStore(null), true);
 
                 // 四档宽度：560（很窄，第一排按钮必须换行）/ 820（用户常规窗口的内容区）/
                 // 1400（中宽）/ 2380（用户最大化时的内容区，真机日志里就是这个数）
@@ -3755,6 +3756,59 @@ namespace MoTrainer.Diagnostics
                     !boxOutside && minBoxHeight >= 100,
                     string.Format(CultureInfo.InvariantCulture,
                         "最小高度 {0}｜越界={1}", minBoxHeight, boxOutside));
+
+                // ---------- 交付版（非 --dev）必须**看不到**写入型调试按钮 ----------
+                // 2026-10-23 新增。这些按钮里有三个会真的往游戏内存写试探值；
+                // 玩家版若露出来，就等于给了玩家一个"看不懂、又可能改坏游戏状态"的入口。
+                // 判据用**控件文字包含**，而不是按钮字段是否为 null —— 字段可以存在（源码保留），
+                // 只要没挂到页面上即可。
+                playerPage = new AdvancedPage(target, new CalibrationProfile(), new ProfileStore(null), false);
+                playerPage.Size = new Size(820, 484);
+                playerPage.PerformLayout();
+
+                string[] hidden = new string[]
+                {
+                    "全图视野", "电力试探", "电力侦查", "房子试探", "开始采集"
+                };
+                int leaked = 0;
+                string leakedText = "";
+                for (int i = 0; i < playerPage.Controls.Count; i++)
+                {
+                    string text = playerPage.Controls[i].Text;
+                    if (string.IsNullOrEmpty(text)) { continue; }
+                    for (int k = 0; k < hidden.Length; k++)
+                    {
+                        if (text.IndexOf(hidden[k], StringComparison.Ordinal) >= 0)
+                        {
+                            leaked++;
+                            leakedText = text;
+                        }
+                    }
+                }
+                Check("高级功能页：交付版不显示任何写入型调试按钮（--dev 才显示）",
+                    leaked == 0,
+                    leaked == 0 ? "0 个泄漏" : "仍显示 " + leaked + " 个，例如「" + leakedText + "」");
+
+                string[] playerTools = new string[]
+                {
+                    "自动查找总名单", "预演：秒杀敌人（不写入）", "标记友军（不会杀）"
+                };
+                bool[] found = new bool[playerTools.Length];
+                for (int i = 0; i < playerPage.Controls.Count; i++)
+                {
+                    string text = playerPage.Controls[i].Text;
+                    if (string.IsNullOrEmpty(text)) { continue; }
+                    for (int k = 0; k < playerTools.Length; k++)
+                    {
+                        // 只记"有没有"，不记"出现几次" —— 提示文字里也会提到按钮名
+                        if (text.IndexOf(playerTools[k], StringComparison.Ordinal) >= 0) { found[k] = true; }
+                    }
+                }
+                int present = 0;
+                for (int k = 0; k < found.Length; k++) { if (found[k]) { present++; } }
+                Check("高级功能页：交付版仍保留玩家需要的三个工具（查找总名单 / 预演 / 标记友军）",
+                    present == playerTools.Length,
+                    string.Format(CultureInfo.InvariantCulture, "找到 {0}/{1} 个", present, playerTools.Length));
             }
             catch (Exception ex)
             {
@@ -3763,6 +3817,7 @@ namespace MoTrainer.Diagnostics
             finally
             {
                 if (page != null) { try { page.Dispose(); } catch (Exception) { } }
+                if (playerPage != null) { try { playerPage.Dispose(); } catch (Exception) { } }
                 if (scene != null) { scene.Dispose(); }
                 self.Dispose();
             }

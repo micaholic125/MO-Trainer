@@ -39,7 +39,7 @@ namespace MoTrainer.Ui.Controls
 
             _baseLabel = MakeLabel("基址 —", Theme.Text1);
             _calibLabel = MakeLabel("校准 未校准", Theme.Text1);
-            _modeLabel = MakeLabel("模式 单人", Theme.Text1);
+            _modeLabel = MakeLabel("单人 / 自建局域网", Theme.Text1);
 
             _flow.Controls.Add(_dot);
             _flow.Controls.Add(_stateLabel);

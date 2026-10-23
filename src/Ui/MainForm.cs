@@ -221,19 +221,12 @@ namespace MoTrainer.Ui
             // 「高级功能」从占位页换成真实页面：第一阶段只提供**只读**的全局对象扫描，
             // 用来验证"全对象数组"到底找没找对。秒杀/建造/视野三个开关要等这一步确认后开放 ——
             // 数组地址是错的却放出可点开关，后果是往随机内存写值。
-            _advancedPage = new AdvancedPage(_target, _profile, _profileStore);
+            _advancedPage = new AdvancedPage(_target, _profile, _profileStore, IsDeveloperMode());
             AddPage("高级功能", _advancedPage);
 
-            AddPage("联机模式", new PlaceholderPage(
-                "联机模式", "S7",
-                "三种运行模式与同步风险分级",
-                new string[]
-                {
-                    "单人模式：全部功能开放",
-                    "局域网友好模式：默认只开放低风险项",
-                    "全员同步模式（实验性）：房主统一广播开关与数值",
-                    "注意：公网 CnCNet 联机禁止使用本工具"
-                }));
+            // 「联机模式」占位页于 2026-10-23 移除：用户决定不做 S7（联机有 bug）。
+            // 不保留一个永远点不动的空页面 —— 交付给玩家的版本里不该出现"承诺了却没有"的入口。
+            // 局域网使用时的风险提示仍在功能卡片的知情确认与「关于」页里。
 
             _calibratePage = new CalibratePage(_attach, _memory, _profileStore, _profile);
             _calibratePage.CalibrationCompleted += OnCalibrationCompleted;
@@ -250,9 +243,10 @@ namespace MoTrainer.Ui
                 "版本与使用须知",
                 new string[]
                 {
-                    "MO Trainer v0.1 开发版 · 目标游戏：Mental Omega 3.3.6",
+                    "MO Trainer v1.0 · 目标游戏：Mental Omega 3.3.6",
+                    "功能：金钱 / 电力 / 选中单位无敌 / 秒杀敌人 / 瞬间建造",
                     "适用场景：单人战役 / 遭遇战打 AI / 自建局域网对局",
-                    "禁止用于公网 CnCNet 对战",
+                    "禁止用于公网 CnCNet 对战；局域网对局中开启高风险功能可能掉线",
                     "本工具只读写游戏内存，不修改任何游戏文件",
                     // 构建时间：程序会被反复重建，这一行用来确认"手里这份是不是最新的"。
                     // （"跑到旧版本"真的发生过，见 Util\BuildInfo.cs 的注释）
@@ -320,6 +314,23 @@ namespace MoTrainer.Ui
         }
 
         // ============================================================ 功能登记
+
+        /// <summary>
+        /// 是否以**开发者模式**启动（命令行带 `--dev`）。
+        ///
+        /// 2026-10-23（S8 交付）新增：把「高级功能」页里那些"会往游戏内存写试探值"的
+        /// 调试按钮从玩家版界面隐藏。它们只服务于地址排查，玩家点了没有收益；
+        /// 留着则是又一个"点了会发生意外"的入口。开发期需要时加 `--dev` 启动即可看到。
+        /// </summary>
+        private static bool IsDeveloperMode()
+        {
+            string[] args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (string.Equals(args[i], "--dev", StringComparison.OrdinalIgnoreCase)) { return true; }
+            }
+            return false;
+        }
 
         /// <summary>
         /// 登记全部功能项。这里同时定下每项的**同步风险等级与理由**，
@@ -887,7 +898,7 @@ namespace MoTrainer.Ui
                 : "基址 —";
 
             string calibrationText = _profile.IsCalibratedAtAll
-                ? string.Format(CultureInfo.InvariantCulture, "校准 {0}/5 项", _profile.CalibratedItemCount())
+                ? string.Format(CultureInfo.InvariantCulture, "校准 {0}/4 项", _profile.CalibratedItemCount())
                 : "校准 未校准";
 
             // 环境（游戏版本）检查：附加成功后做一次；不一致就在状态条上直接写出来 ——
@@ -896,7 +907,7 @@ namespace MoTrainer.Ui
             if (_environmentBlock.Length > 0) { calibrationText += "｜⚠ 游戏版本不符"; }
 
             _statusStrip.UpdateStatus(
-                stateText, Theme.StateColor(state), baseText, calibrationText, "模式 单人");
+                stateText, Theme.StateColor(state), baseText, calibrationText, "单人 / 自建局域网");
 
             // 选中探测的"对象头必须是模块内类型表"这条硬校验，依赖的是静态字段。
             // 页面是在**修改器启动时**构造的，那一刻游戏往往还没连上（基址为 0）——

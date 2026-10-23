@@ -221,8 +221,8 @@ namespace MoTrainer.Ui.Pages
 
             _subtitle.Text = _engine.IsRunning
                 ? string.Format(CultureInfo.InvariantCulture,
-                    "v0.2 开发版 · 锁定线程运行中（30Hz）· 可用功能 {0}/{1} 项", usable, expected)
-                : "v0.2 开发版 · 锁定线程未运行";
+                    "v1.0 · 锁定线程运行中（30Hz）· 可用功能 {0}/{1} 项", usable, expected)
+                : "v1.0 · 锁定线程未运行";
 
             if (usable == 0)
             {

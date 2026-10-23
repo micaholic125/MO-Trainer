@@ -377,7 +377,10 @@ namespace MoTrainer.Calibration
 
         public bool IsCalibratedAtAll
         {
-            get { return HasMoney || HasPowerOutput || HasPowerDrain || HasSelection || HasTechnoArray || HasMapShroud; }
+            // 「黑幕」不计入：全图视野（S6-3）至今没有定位成功，交付版不提供该功能。
+            // 用户 2026-10-17 决定把它从玩家可见的校准清单里拿掉，避免玩家去校准一个
+            // 交付版里根本用不上的字段。字段本身仍保留在 profile 里，供将来继续排查。
+            get { return HasMoney || HasPowerOutput || HasPowerDrain || HasSelection || HasTechnoArray; }
         }
 
         /// <summary>列出尚未校准的项，用于界面提示"还差什么"。</summary>
@@ -388,7 +391,7 @@ namespace MoTrainer.Calibration
             if (!HasPowerOutput && !HasPowerDrain) { missing.Add("电力"); }
             if (!HasSelection) { missing.Add("选中单位列表"); }
             if (!HasTechnoArray) { missing.Add("单位对象数组"); }
-            if (!HasMapShroud) { missing.Add("地图黑幕数据"); }
+            // 不列「地图黑幕数据」：全图视野未交付（S6-3 未定论），见 IsCalibratedAtAll 的注释。
             return missing;
         }
 
@@ -399,7 +402,6 @@ namespace MoTrainer.Calibration
             if (HasPowerOutput || HasPowerDrain) { count++; }
             if (HasSelection) { count++; }
             if (HasTechnoArray) { count++; }
-            if (HasMapShroud) { count++; }
             return count;
         }
 
@@ -560,13 +562,13 @@ namespace MoTrainer.Calibration
         {
             StringBuilder builder = new StringBuilder();
             builder.AppendFormat(CultureInfo.InvariantCulture,
-                "已校准 {0} 项｜金钱={1}｜电力={2}｜选中={3}｜对象数组={4}｜黑幕={5}",
+                "已校准 {0} 项｜金钱={1}｜电力={2}｜选中={3}｜对象数组={4}",
                 CalibratedItemCount(),
                 HasMoney ? "有" : "无",
                 (HasPowerOutput || HasPowerDrain) ? "有" : "无",
                 HasSelection ? "有" : "无",
-                HasTechnoArray ? "有" : "无",
-                HasMapShroud ? "有" : "无");
+                HasTechnoArray ? "有" : "无");
+            // 不写「黑幕」：该字段只对未交付的全图视野有意义，见 IsCalibratedAtAll 的注释。
 
             List<string> missing = MissingItems();
             if (missing.Count > 0)

@@ -70,7 +70,7 @@ namespace MoTrainer.Ui.Pages
             sub.AutoSize = true;
             sub.Font = Theme.Body;
             sub.ForeColor = Theme.Text2;
-            sub.Text = "v0.2 开发版 · 阶段 S4：核心功能与锁定引擎（功能开关在「功能开关」页）";
+            sub.Text = "v1.0 · 连接状态与内存内核自检";
             sub.Margin = new Padding(0, 0, 0, 6);
             root.Controls.Add(sub, 0, 1);
 
@@ -144,12 +144,16 @@ namespace MoTrainer.Ui.Pages
 
             string[] lines = new string[]
             {
-                "S0 项目基建                          已完成",
-                "S1 编译链路与内存内核                已完成",
-                "S2 扫描与配置持久化                  已完成",
-                "S3 校准向导                          已完成（金钱 / 电力已真机定位）",
-                "S4 核心功能与锁定引擎                进行中（功能开关已可用）",
-                "S5~S8 高级功能 · 联机 · 交付           未开始"
+                "S0  项目基建 · 已完成",
+                "S1  编译链路与内存内核 · 已完成",
+                "S2  扫描与配置持久化 · 已完成",
+                "S3  校准向导 · 已完成",
+                "S4  核心功能与锁定引擎 · 已完成",
+                "S5  单位校准 · 已完成（选中无敌）",
+                "S5b 界面与热键 · 已完成",
+                "S6  扩展三项 · 已完成（秒杀 / 瞬间建造）",
+                "S7  联机模式 · 已取消",
+                "S8  交付 · 进行中"
             };
             planCard.Height = 34 + 6 + lines.Length * 21 + 14;
 
@@ -159,7 +163,7 @@ namespace MoTrainer.Ui.Pages
                 Label line = new Label();
                 line.AutoSize = true;
                 line.Font = Theme.Body;
-                line.ForeColor = i == 4 ? Theme.PrimaryLight : Theme.Text1;
+                line.ForeColor = i == lines.Length - 1 ? Theme.PrimaryLight : Theme.Text1;
                 line.Text = lines[i];
                 line.Location = new Point(Theme.CardPadding + 6, ly);
                 planCard.Controls.Add(line);
