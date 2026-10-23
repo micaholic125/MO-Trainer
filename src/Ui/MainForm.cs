@@ -238,20 +238,11 @@ namespace MoTrainer.Ui
             _unitPage.CalibrationChanged += delegate { OnCalibrationCompleted(); };
             AddPage("单位校准", _unitPage);
 
-            AddPage("关于", new PlaceholderPage(
-                "关于", "—",
-                "版本与使用须知",
-                new string[]
-                {
-                    "MO Trainer v1.0 · 目标游戏：Mental Omega 3.3.6",
-                    "功能：金钱 / 电力 / 选中单位无敌 / 秒杀敌人 / 瞬间建造",
-                    "适用场景：单人战役 / 遭遇战打 AI / 自建局域网对局",
-                    "禁止用于公网 CnCNet 对战；局域网对局中开启高风险功能可能掉线",
-                    "本工具只读写游戏内存，不修改任何游戏文件",
-                    // 构建时间：程序会被反复重建，这一行用来确认"手里这份是不是最新的"。
-                    // （"跑到旧版本"真的发生过，见 Util\BuildInfo.cs 的注释）
-                    "构建时间：" + BuildInfo.Text
-                }));
+            // 「关于」不再用占位页：它现在要承载「作者的话」的固定入口。
+            // 启动弹窗可以被用户勾选"不再显示"，但那段留言必须有一个随时找得到的地方。
+            AboutPage aboutPage = new AboutPage();
+            aboutPage.AuthorNoteRequested += OnAuthorNoteRequested;
+            AddPage("关于", aboutPage);
 
             // `--smoke`：发布前"真启动一次"用的探针，启动后自己退出。
             //
@@ -259,7 +250,7 @@ namespace MoTrainer.Ui
             // `requireAdministrator`，构建脚本的 Stop-Process 会被拒绝 ——
             // 结果是**我的测试在用户桌面上留下一个关不掉的窗口**（用户当场质疑
             // "我没有开修改器啊"）。让它自己退出，测试就不会污染用户环境。
-            if (Array.IndexOf(Environment.GetCommandLineArgs(), "--smoke") >= 0)
+            if (HasCommandLineFlag("--smoke"))
             {
                 Timer smoke = new Timer();
                 smoke.Interval = 4000;
@@ -324,10 +315,16 @@ namespace MoTrainer.Ui
         /// </summary>
         private static bool IsDeveloperMode()
         {
+            return HasCommandLineFlag("--dev");
+        }
+
+        /// <summary>命令行里是否带某个开关（大小写不敏感）。冒烟测试与开发者模式共用。</summary>
+        private static bool HasCommandLineFlag(string flag)
+        {
             string[] args = Environment.GetCommandLineArgs();
             for (int i = 0; i < args.Length; i++)
             {
-                if (string.Equals(args[i], "--dev", StringComparison.OrdinalIgnoreCase)) { return true; }
+                if (string.Equals(args[i], flag, StringComparison.OrdinalIgnoreCase)) { return true; }
             }
             return false;
         }
@@ -642,6 +639,64 @@ namespace MoTrainer.Ui
             // 曾经把它放在构造函数里，那时 IsHandleCreated 还是 false，
             // 热键被静默跳过，表现就是"按了没反应、日志里也查不到原因"。
             if (_registeredHotkeys.Count == 0) { RegisterHotkeys(); }
+        }
+
+        // ============================================================ 作者的话
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+
+            // 冒烟测试（--smoke）必须能在 4 秒后自己退出；一个模态弹窗会把那条路堵死，
+            // 于是"发布前真启动一次"就变成了"桌面上留一个关不掉的窗口"（项目吃过这个亏）。
+            if (HasCommandLineFlag("--smoke"))
+            {
+                Logger.Info("MainForm", "作者的话：冒烟模式，跳过启动弹窗");
+                return;
+            }
+
+            if (_settings.SuppressAuthorNote)
+            {
+                Logger.Info("MainForm", "作者的话：用户已勾选「不再弹窗显示」，启动时不弹");
+                return;
+            }
+
+            ShowAuthorNote("启动");
+        }
+
+        private void OnAuthorNoteRequested(object sender, EventArgs e)
+        {
+            // 从「关于」页打开时，勾选框照旧反映当前设置：
+            // 用户可以在这里取消"不再弹窗"，下次启动就会重新出现。
+            ShowAuthorNote("关于页");
+        }
+
+        /// <summary>
+        /// 显示「作者的话」，并把勾选框的选择落盘。
+        ///
+        /// 点右上角 X 与点「确认」等价：这个窗口只有一个"知道了"的动作，
+        /// 没有需要撤销的操作，勾选框状态照常生效。
+        /// </summary>
+        private void ShowAuthorNote(string source)
+        {
+            bool before = _settings.SuppressAuthorNote;
+            using (AuthorNoteDialog dialog = new AuthorNoteDialog(before))
+            {
+                dialog.ShowDialog(this);
+
+                bool after = dialog.SuppressChecked;
+                if (after != before)
+                {
+                    _settings.SuppressAuthorNote = after;
+                    _settings.Save(_settings.PathIn(_profileStore.ConfigFolder));
+                    Logger.Info("MainForm", "作者的话：用户" + (after ? "勾选" : "取消")
+                        + "了「不再弹窗显示」（来自" + source + "）");
+                }
+                else
+                {
+                    Logger.Info("MainForm", "作者的话：已关闭，不再弹窗的设置未变（来自" + source + "）");
+                }
+            }
         }
 
         private void AddPage(string navText, Control page)

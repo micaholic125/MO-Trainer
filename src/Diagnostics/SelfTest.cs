@@ -10,6 +10,7 @@ using System.Threading;
 using MoTrainer.Calibration;
 using MoTrainer.Cheats;
 using MoTrainer.Core;
+using MoTrainer.Ui;
 using MoTrainer.Ui.Controls;
 using MoTrainer.Ui.Pages;   // 页面排版自检要真造出「高级功能」页来量控件位置
 using MoTrainer.Util;
@@ -178,6 +179,12 @@ namespace MoTrainer.Diagnostics
             // 它坏了玩家只会以为工具坏了，必须自己盯着。
             Section("20. 全局热键（[S5b] 注册与分发必须同一份名单）");
             CheckHotkeys();
+
+            // 启动弹窗是玩家看到的**第一屏**，而且里面写着作者的联系方式；
+            // 文字被改错、勾选框失效、或者"勾掉以后再也找不回来"，都属于很难被日志发现的失误。
+            // 这里把正文、入口和设置的往返都钉死（不弹窗，避免打断正在跑游戏的用户）。
+            Section("21. 作者的话（启动弹窗与关于页入口）");
+            CheckAuthorNote();
 
             Write("");
             Write("=================================================");
@@ -1699,6 +1706,7 @@ namespace MoTrainer.Diagnostics
                 settings.SetEnabled(CheatId.Money, true);
                 settings.SetValue(CheatId.PowerOutput, 30000);
                 settings.SetEnabled(CheatId.PowerOutput, false);
+                settings.SuppressAuthorNote = true;
 
                 string path = settings.PathIn(tempRoot);
                 Check("运行设置可以保存", settings.Save(path) && File.Exists(path), path);
@@ -1712,6 +1720,8 @@ namespace MoTrainer.Diagnostics
                     && reloaded.GetValue(CheatId.PowerOutput, 0) == 30000
                     && !reloaded.GetEnabled(CheatId.PowerOutput),
                     reloaded.Describe());
+                Check("作者的话：勾选「不再弹窗显示」后，下次启动能从设置里还原",
+                    reloaded.SuppressAuthorNote, "suppress=" + reloaded.SuppressAuthorNote);
 
                 // 配置坏掉不该让程序起不来
                 File.WriteAllText(path, "{ 这不是合法 JSON ", new UTF8Encoding(true));
@@ -1722,6 +1732,17 @@ namespace MoTrainer.Diagnostics
                 TrainerSettings missing = new TrainerSettings();
                 Check("运行设置文件缺失时安全忽略",
                     !missing.Load(Path.Combine(tempRoot, "nope.json")), "ok");
+
+                // 旧版 trainer.json 里没有 authorNote 节点（真实交付目录里那份就是如此）。
+                // 升级后第一次打开时**必须继续弹**，不能被当成"用户已经选了不再弹"。
+                string legacyPath = Path.Combine(tempRoot, "legacy.json");
+                File.WriteAllText(legacyPath,
+                    "{\"version\":1,\"features\":{}}", new UTF8Encoding(false));
+                TrainerSettings legacy = new TrainerSettings();
+                bool legacyLoaded = legacy.Load(legacyPath);
+                Check("作者的话：旧版设置文件（没有这一项）按「还会弹」处理",
+                    legacyLoaded && !legacy.SuppressAuthorNote,
+                    "loaded=" + legacyLoaded + " suppress=" + legacy.SuppressAuthorNote);
 
                 // ---- 关窗时该记什么（2026-10-12：金钱那条设计从未生效过，本轮修） ----
                 //
@@ -1759,6 +1780,13 @@ namespace MoTrainer.Diagnostics
                 back2.Load(exitPath2);
                 Check("关窗记录：关窗那一刻金钱是关的 → 下次启动不会自己开",
                     !back2.GetEnabled(CheatId.Money), back2.Describe());
+
+                // 关窗时重写的是"功能开关"，不该顺手把作者留言的偏好冲掉
+                TrainerSettings exit3 = new TrainerSettings();
+                exit3.SuppressAuthorNote = true;
+                exit3.CaptureExitState(false);
+                Check("作者的话：关窗记录不会把「不再弹窗」的选择冲掉",
+                    exit3.SuppressAuthorNote, "suppress=" + exit3.SuppressAuthorNote);
             }
             catch (Exception ex)
             {
@@ -3016,6 +3044,102 @@ namespace MoTrainer.Diagnostics
                 if (all[i].Label == label) { return CheatNames.Key(all[i].Feature); }
             }
             return "(无)";
+        }
+
+        /// <summary>
+        /// 「作者的话」启动弹窗与「关于」页入口（2026-10-23 用户新增）。
+        ///
+        /// 只造控件、**不显示窗口**：自检经常在用户已经开好游戏时运行，
+        /// 弹一个窗口抢焦点就是平白打断人家。这里验证的是"字对不对、控件在不在、
+        /// 勾选框状态是否跟着设置走"，版式则交给发布前的截图核对。
+        /// </summary>
+        private static void CheckAuthorNote()
+        {
+            AuthorNoteDialog suppressed = null;
+            AuthorNoteDialog normal = null;
+            AboutPage about = null;
+            try
+            {
+                string text = AuthorNoteDialog.NoteText;
+                string[] required = new string[]
+                {
+                    "作者的话：",
+                    "局域网联机最终未能制作并交付",
+                    "2622307388@qq.com",
+                    "抖音号67664177780",
+                    "github",
+                    "开源"
+                };
+                int missing = 0;
+                string missingText = "";
+                for (int i = 0; i < required.Length; i++)
+                {
+                    if (text.IndexOf(required[i], StringComparison.Ordinal) < 0)
+                    {
+                        missing++;
+                        missingText = required[i];
+                    }
+                }
+                Check("作者的话：正文包含作者给出的联系方式和项目说明（逐字保留，不许润色掉）",
+                    missing == 0,
+                    missing == 0
+                        ? text.Length + " 字"
+                        : "缺少「" + missingText + "」");
+
+                suppressed = new AuthorNoteDialog(true);
+                normal = new AuthorNoteDialog(false);
+
+                bool controlsPresent = ContainsControlText(suppressed, AuthorNoteDialog.NoteText)
+                    && ContainsControlText(suppressed, "确认")
+                    && ContainsControlText(suppressed, "不再弹窗显示");
+
+                Check("作者的话：正文、右下角「确认」与「不再弹窗显示」勾选框都在",
+                    controlsPresent && suppressed.Text == "作者的话",
+                    "标题「" + suppressed.Text + "」｜控件齐=" + controlsPresent);
+
+                Check("作者的话：打开时勾选框如实反映当前设置（不会再自动改掉用户的选择）",
+                    suppressed.SuppressChecked && !normal.SuppressChecked,
+                    "已选不再弹=" + suppressed.SuppressChecked
+                        + "｜未选=" + normal.SuppressChecked);
+
+                // 防止"窗口缩成一条"这类版式事故：正文宽 620 逻辑像素 + 左右各 24 内边距。
+                Check("作者的话：窗口按内容撑开（正文不会被切掉）",
+                    suppressed.ClientSize.Width >= 620 && suppressed.ClientSize.Height >= 120,
+                    suppressed.ClientSize.Width + "x" + suppressed.ClientSize.Height);
+
+                about = new AboutPage();
+                Button entry = about.AuthorNoteButton;
+                Check("关于页：有「作者的话」按钮（勾掉启动弹窗后，留言仍然找得回来）",
+                    entry != null && entry.Text == "作者的话",
+                    entry == null ? "没有这个按钮" : "按钮「" + entry.Text + "」");
+
+                Check("关于页：版本、五项功能与构建时间仍然齐全",
+                    ContainsControlText(about, "·  MO Trainer v1.0 · 目标游戏：Mental Omega 3.3.6")
+                    && ContainsControlText(about, "·  功能：金钱 / 电力 / 选中单位无敌 / 秒杀敌人 / 瞬间建造"),
+                    "ok");
+            }
+            catch (Exception ex)
+            {
+                Check("作者的话", false, ex.GetType().Name + ": " + ex.Message);
+            }
+            finally
+            {
+                if (suppressed != null) { try { suppressed.Dispose(); } catch (Exception) { } }
+                if (normal != null) { try { normal.Dispose(); } catch (Exception) { } }
+                if (about != null) { try { about.Dispose(); } catch (Exception) { } }
+            }
+        }
+
+        /// <summary>控件树里有没有哪个控件的文字与给定值完全相同（用于验证"界面上真的有这句话"）。</summary>
+        private static bool ContainsControlText(Control parent, string text)
+        {
+            for (int i = 0; i < parent.Controls.Count; i++)
+            {
+                Control child = parent.Controls[i];
+                if (string.Equals(child.Text, text, StringComparison.Ordinal)) { return true; }
+                if (ContainsControlText(child, text)) { return true; }
+            }
+            return false;
         }
 
         private static void Check(string name, bool ok, string detail)

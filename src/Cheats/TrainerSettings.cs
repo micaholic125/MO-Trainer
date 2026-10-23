@@ -21,6 +21,21 @@ namespace MoTrainer.Cheats
         private readonly Dictionary<CheatId, uint> _values = new Dictionary<CheatId, uint>();
         private readonly Dictionary<CheatId, bool> _enabled = new Dictionary<CheatId, bool>();
 
+        /// <summary>
+        /// 「作者的话」弹窗是否已被用户勾选"不再显示"（2026-10-23）。
+        ///
+        /// 与功能开关存在同一个文件里：它同样是"用户的选择"，不是校准事实。
+        /// 旧版 trainer.json 没有这一项时按 false 处理 —— 也就是**继续弹**，
+        /// 这正是升级后第一次打开该有的行为。
+        /// </summary>
+        private bool _suppressAuthorNote;
+
+        public bool SuppressAuthorNote
+        {
+            get { return _suppressAuthorNote; }
+            set { _suppressAuthorNote = value; }
+        }
+
         // ---------------- 读写 ----------------
 
         public uint GetValue(CheatId id, uint fallback)
@@ -103,6 +118,15 @@ namespace MoTrainer.Cheats
                     return false;
                 }
 
+                // 先读「作者的话」的偏好：即使 features 节点坏了，这一项也应当尽量保留，
+                // 不该让一个与功能无关的字段跟着一起被丢掉。
+                JsonValue authorNote = json.Get("authorNote");
+                if (authorNote != null && authorNote.Kind == JsonKind.Object)
+                {
+                    JsonValue suppress = authorNote.Get("suppress");
+                    if (suppress != null) { _suppressAuthorNote = suppress.AsBool(false); }
+                }
+
                 JsonValue features = json.Get("features");
                 if (features == null || features.Kind != JsonKind.Object)
                 {
@@ -152,6 +176,12 @@ namespace MoTrainer.Cheats
 
                 JsonValue root = JsonValue.NewObject();
                 root.Set("version", CurrentVersion);
+
+                // 始终写出来（哪怕是 false）：排查"怎么又弹了/怎么不弹了"时，
+                // 配置文件里能直接看到当前选择，不必靠回忆。
+                JsonValue authorNote = JsonValue.NewObject();
+                authorNote.Set("suppress", _suppressAuthorNote);
+                root.Set("authorNote", authorNote);
 
                 JsonValue features = JsonValue.NewObject();
                 CheatId[] all = (CheatId[])Enum.GetValues(typeof(CheatId));
