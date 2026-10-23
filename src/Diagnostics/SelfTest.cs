@@ -7027,6 +7027,42 @@ namespace MoTrainer.Diagnostics
                     cheap.Wrote && cheap.ElapsedAfter < cheapTotalTicks,
                     "推到 " + cheap.ElapsedAfter + " 拍，这东西总共 " + cheapTotalTicks
                         + " 拍（每拍只扣 1 块）");
+
+                // ---- 2026-10-23 新增：流水线槽位里的浮点常量只是"像指针" ----
+                //
+                // 真机日志（10-19 一天 1929 条、10-23 用户实测仍在刷）抓到：只要瞬间建造在跑，
+                // 每 3 秒就有一条 `ReadProcessMemory 失败 @0x3F800000`。它来自
+                // FindProductionTargets 的"这一格指过去读不读得出来"试探 —— 0x3F800000
+                // 是浮点 1.0，不是指针，**读失败是预期结果**，不该记成错误。
+                //
+                // 做法：流水线窗口全清零（没有真在造的东西），只在**最后一格**放一个
+                // "像指针但读不到"的值。这样"探它"就是整次扫描的最后一次读取，
+                // 连续失败计数不会被后面的成功读取清零，断言才量得准。
+                for (uint off = InstantBuild.ProductionWindowFirst; off <= InstantBuild.ProductionWindowLast; off += 4)
+                {
+                    io.WriteUInt32(house + off, 0);
+                }
+
+                uint bogus = 0x3F800000;          // 浮点 1.0 的位型（真机上就躺在这段窗口里）
+                if (io.ReadBytesQuiet(bogus, 4) != null)
+                {
+                    bogus = 0x0BAD0000;           // 极少数情况下这个地址恰好可读 —— 换一个同样读不到的
+                }
+                if (io.ReadBytesQuiet(bogus, 4) != null)
+                {
+                    WarnItem("瞬间建造", "合成场景里找不到\"像指针但读不到\"的地址，跳过这一条");
+                }
+                else
+                {
+                    io.WriteUInt32(house + InstantBuild.ProductionWindowLast, bogus);
+                    uint sync;
+                    io.ReadUInt32(house + InstantBuild.ProductionWindowLast, out sync);   // 一次成功读取，把计数清零
+                    int failuresBefore = io.ConsecutiveFailures;
+                    InstantBuild.Peek(io, house, moduleBase, moduleSize, producingClass);
+                    Check("瞬间建造：流水线槽位里的浮点常量不是指针 —— 试探失败不记错误、不刷日志",
+                        io.ConsecutiveFailures == failuresBefore,
+                        "连续失败 " + failuresBefore + " → " + io.ConsecutiveFailures);
+                }
             }
             catch (Exception ex)
             {

@@ -318,8 +318,13 @@ namespace MoTrainer.Cheats
                 // （`0x3F800000`），它的数值"像一个指针"，但其实什么都没指着。少了这一关，
                 // 玩家**什么都没造**的时候卡片上会蹦出"读不到 0x3F800000 的头部"——
                 // 看着像工具坏了，其实只是没东西在造。留着这一关，那种情况会如实说"现在没有东西在造"。
-                uint header;
-                if (!memory.ReadUInt32(pointer, out header)) { continue; }
+                //
+                // **这一读必须走"安静读取"（2026-10-23 真机日志抓到）**：失败在这里是
+                // **预期结果**，不是异常。走普通读取的话，每探一次就在日志里写一条
+                // `ReadProcessMemory 失败 @0x3F800000`（10-19 一天 1929 条、10-15 一天 5607 条），
+                // 把真正的错误整片淹掉；还会把 `ConsecutiveFailures` 顶起来，让"连续失败"
+                // 这个信号失去意义。自检里有断言守着"探这一格不算错误、也不写日志"。
+                if (memory.ReadBytesQuiet(pointer, 4) == null) { continue; }
                 plausible.Add(pointer);
             }
 
