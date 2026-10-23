@@ -75,12 +75,23 @@
 - **缺必要校准数据时，功能必须拒绝执行并说明缺什么**。不允许"开关能点、程序悄悄什么都不做"——这是最招用户骂的失败模式。
 
 ### 4.3 编译器约束（很重要）
-> 这一节是给写代码的 AI 看的：本机只有老编译器，用错语法会**编译失败**。你不需要记这些名字。
+> 这一节是给写代码的 AI 看的：**当前**仍用老编译器，用错语法会**编译失败**。你不需要记这些名字。
 
-- 编译器：`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`（本机无 Visual Studio）。
+> **工具链计划（2026-10-23 用户决定）**：以后全部改用**完整版 Visual Studio**；目标框架定为 **.NET Framework 4.8**
+> （保持现有的 WinForms / 内存读写写法，不做 .NET 8 迁移——那需要另开专项）。
+> **切换尚未开始**：`.sln` / `.csproj` 与 `build.ps1` 都还没改。**在切换并验证通过之前，下面四条仍然全部有效**，
+> 不要提前使用 C# 6+ 语法。
+
+- 编译器：`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`（本机目前未装 Visual Studio，也没有 .NET Framework 4.8 开发包）。
 - **该编译器只支持 C# 5 语法**。禁止使用：字符串插值 `$""`、表达式体成员 `=>`、`nameof`、`?.`、`out var`、属性初始化器、`using static`、异常筛选器 `when`。
 - 所有 `.cs` 源文件为 UTF-8，编译时**必须**带 `/codepage:65001`，否则中文字符串会乱码。
 - 所有 `.ps1` / `.bat` 内的提示文案**一律用英文 ASCII**，避免 PowerShell 5.1 无 BOM 读取导致的编码问题。
+
+> **换 VS 时再做（不要提前）**：
+> ① 建 `MO-Trainer.sln` + 主程序/自检两个 `.csproj`（`net48`、`x64`、`CodePage=65001`、`LangVersion=7.3`）；
+> ② 把 `build.ps1` 改成调用 VS 的 MSBuild，保留 `-Test` / `-RunTest` / `-Check` / `-Clean` 语义；
+> ③ 在 VS 里编译，并跑自检（441 项基准）与 `--smoke` 冒烟；
+> ④ 验证通过后，才删除上面的 C# 5 限制，并把 §5 的命令改为 VS/MSBuild。
 
 ### 4.4 数据与隐私红线
 - 配置、日志、校准报告**一律写入工具自身目录**（`<exe目录>\logs\`、`<exe目录>\config\`、`<exe目录>\reports\`）。
@@ -122,6 +133,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File d:\AIWORK\XLZJ\build.ps1 -Ch
 # 反复跑自检，发现回归就停下（开发期用，见 tools\README.md）
 powershell -NoProfile -ExecutionPolicy Bypass -File d:\AIWORK\XLZJ\tools\selfcheck-loop.ps1
 ```
+
+> **当前仍以本节的 `build.ps1` 为准**：VS 工程与 MSBuild 切换尚未开始（见 §4.3 的工具链计划）。
 
 > - **修改器正在运行时 exe 会被锁住**：`build.ps1` 的做法是**先把正在运行的实例关掉，再发布到同一路径**
 >   （`-NoKill` 改为拒绝并报错）。校准数据在每次保存时已落盘 `dist\config\profile.json`，关窗口不丢东西。
@@ -180,7 +193,7 @@ Write-Output ("self_exited=" + $p.HasExited)   # 期望 True
 | 显示器 | **2560×1600 且开了 DPI 缩放** → 本机（96 DPI）**复现不出显示类问题** |
 | 启动方式 | 用户从 MO 客户端（CnCNet）启动 |
 | 规则文件 | `INI` 子目录里**没有** `rulesmo.ini` / `artmo.ini`（打包在 `.mix` 里）→ **字段语义只能靠运行时自证，不能靠读 INI** |
-| 本机工具链 | git 2.55、dotnet SDK 6.0.428（备用编译器）、无 Visual Studio |
+| 本机工具链 | git 2.55、dotnet SDK 6.0.428（备用编译器）；**未装 Visual Studio（计划安装完整版）、未装 .NET Framework 4.8 开发包** |
 
 ### 已排查过、与本项目无关的一件事
 
