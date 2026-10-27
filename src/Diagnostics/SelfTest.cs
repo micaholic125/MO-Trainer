@@ -3068,7 +3068,7 @@ namespace MoTrainer.Diagnostics
                     "2622307388@qq.com",
                     "抖音号67664177780",
                     "github",
-                    "开源"
+                    "该项目已经开源了"
                 };
                 int missing = 0;
                 string missingText = "";
@@ -3116,6 +3116,12 @@ namespace MoTrainer.Diagnostics
                 Check("关于页：版本、五项功能与构建时间仍然齐全",
                     ContainsControlText(about, "·  MO Trainer v1.0 · 目标游戏：Mental Omega 3.3.6")
                     && ContainsControlText(about, "·  功能：金钱 / 电力 / 选中单位无敌 / 秒杀敌人 / 瞬间建造"),
+                    "ok");
+
+                // 2026-10-27：项目已开源，关于页必须让玩家找得到协议名称，
+                // 否则"作者的话里说开源了"与"程序里查不到依据"就对不上。
+                Check("关于页：显示开源协议（GPL-3.0）",
+                    ContainsControlText(about, "·  开源协议：GNU GPL-3.0（许可证全文见仓库 LICENSE 文件）"),
                     "ok");
             }
             catch (Exception ex)
