@@ -1,5 +1,8 @@
 ﻿{
   "version": 1,
+  "authorNote": {
+    "suppress": false
+  },
   "features": {
     "money": {
       "enabled": false,

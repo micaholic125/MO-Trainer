@@ -14,7 +14,7 @@
 - **零第三方依赖**：只用到 Windows 自带的 .NET Framework，不需要另装运行库。
 - **删除整个文件夹 = 完全卸载**，不残留。
 
-> 目前的最新发布是 **v1.0.3**，见 [Releases](https://github.com/micaholic125/MO-Trainer/releases)。
+> 目前的最新发布是 **v1.0.4**，见 [Releases](https://github.com/micaholic125/MO-Trainer/releases)。
 
 ---
 
@@ -175,7 +175,10 @@ dist/config/    预校准数据与程序配置
 
 ## 许可证
 
-本项目以 **GNU General Public License v3.0** 发布，全文见 [LICENSE](LICENSE)。
+本项目以 **GNU General Public License v3.0（GPL-3.0）** 发布，许可证全文见 [LICENSE](LICENSE)。
+
+Copyright (C) 2026 micaholic125。版权声明与「允许使用更新版本」的授权表述见
+[COPYRIGHT.md](COPYRIGHT.md)。
 
 你可以自由使用、修改、分发本项目；如果分发修改后的版本，必须以同样的协议开源，
 并保留版权声明。本程序**不提供任何担保**。
